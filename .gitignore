@@ -1,0 +1,16 @@
+node_modules/
+.pnpm-store/
+dist/
+.DS_Store
+.env
+.env.*
+!.env.example
+data/
+artifacts/
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+coverage/
+playwright-report/
+test-results/

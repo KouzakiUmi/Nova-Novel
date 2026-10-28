@@ -1,0 +1,16 @@
+{
+  "name": "nova-novel",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@11.28.5",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "dev": "pnpm --parallel --filter @nova-novel/shared --filter @nova-novel/server --filter @nova-novel/web dev",
+    "build": "pnpm -r build",
+    "start": "pnpm --filter @nova-novel/server start",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test"
+  }
+}
