@@ -102,10 +102,11 @@ export class GuidedWorkflowService {
       const result = await this.pi.generate({ task: receipt.task, request, systemContext: "" });
       const latest = this.get(session.sessionId);
       if ((latest.revision ?? 0) !== (session.revision ?? 0)) {
-        this.store.finishGeneration(receipt.task.taskId, { output: "guide", text: result.text, sessionId: result.sessionId }, result.completeness);
+        // 迟到结果整体归档，保留引擎给出的失败原因，不剥离产物元数据。
+        this.store.finishGeneration(receipt.task.taskId, { ...result, output: "guide" }, result.completeness);
         return latest;
       }
-      if (result.completeness !== "complete" || !result.text.trim()) throw new DomainError(502, "WORKFLOW_GUIDE_INCOMPLETE", "工作流提案尚未完整生成");
+      if (result.completeness !== "complete" || !result.text.trim()) throw new DomainError(502, "WORKFLOW_GUIDE_INCOMPLETE", result.error ?? "工作流提案尚未完整生成");
       if (mode === "question") {
         const question = parseGuideQuestion(result.text, stepId);
         session.questions[stepId] = question; session.pending = question;

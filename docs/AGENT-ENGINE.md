@@ -85,6 +85,8 @@ Pi 目录给出 provider/model 元数据，Nova 另为每个可单 API Key 使�
 
 `TaskRoute` 由 `kind`、`provider/modelId`、`thinkingLevel` 组成。默认思考强度：ideas `low`、rehearsal `low`、scene `medium`、polish `low`、consistency `high`、guide `low`；实际取值不超过模型支持的档位（非推理模型为 `off`）。任务没有配置模型时，退回第一个可用模型。完全没有可用模型时，连接状态为 `unconfigured`，生成返回明确的“请先在设置中添加模型”错误；写作、保存和版本功能不受影响。
 
+全流程 AI 协助子任务默认**复用现有 6 类路由槽位**，不增加用户的模型配置负担：`element_design`（角色/世界观/秘密快速共创）与 `note_incubate`（便签孵化）复用 `ideas`；`element_design`（问答引导模式）、`arc_assist`（人物弧线推演与诊断）与 `plot_ideate`（局部情节推演）复用 `guide`；`extract_ledger`（正文反向抽取元素与状态事件）复用 `consistency`。
+
 ## 5. 会话与执行
 
 - 每次生成都用 `createAgentSession` 新建会话：`resourceLoader` 为应用自建（无扩展、技能、提示模板、上下文文件），系统提示为小说专用提示；`noTools: "builtin"` 加 `tools: ["novel_*"]` 与 `customTools`（只读小说工具）。SDK 1.4.0 的 `noTools: "all"` 同时禁用自定义工具，因此使用显式小说工具白名单；`SettingsManager.inMemory`，关闭压缩，自动重试最多 1 次；会话文件写入 `<data>/agent/sessions/<projectId>/`。
@@ -174,3 +176,60 @@ JSON 解析失败时，任务失败并保留原始产物，不把原文硬塞进
 ## 11. 人工审阅与退回说明
 
 人工节点默认提供 `accept / revise / reject`。`POST /api/workflow-runs/:id/decision` 除 `todoId / answer / inputHash` 外可携带 `reviewNote`；退回修改说明随 `DecisionRecord` 持久化。`agent.generate` 新增可选 `decision` 输入，连接后可读取该说明，未连接时行为不变。接受提交仍必须通过真实人工决定、同源 candidate/draft、文本哈希和 decisionId 校验；退回或拒绝不会提交正文。
+
+## 12. 全流程 AI 创作助手扩展契约（补充设计）
+
+> 本节定义角色/世界观共创、人物弧线推演、全周期局部情节推演、便签孵化与正文反向抽取的引擎及接口契约。所有任务均在进程内 Pi SDK 独立会话中运行，只声明 9 个 `novel_*` 只读工具，默认复用既有 6 类 `TaskRoute` 槽位。
+
+### 12.1 角色与世界观设定共创（`element_design` · 双模式）
+
+支持 `character`、`location`、`organization`、`rule`、`item`、`secret` 六类元素的 AI 协助构思，提供两种可切换模式：
+
+1. **快速卡片共创模式（默认，复用 `ideas` 路由）**：
+   - 输入：`{ projectId, type?, targetEntityId?, prompt, roleHint?, relatedEntityIds? }`。
+   - 模型输出：JSON `{ cards: ElementDesignCard[] }`（2–3 张在动机、代价或冲突方向上有实质差异的方案卡；宿主解析不接受 `candidates` 字段名）。
+2. **一步步问答引导模式（复用 `guide` 路由，`element_guide_sessions`）**：
+   - 由宿主状态机按元素类型推进 2–3 道结构化选择题（例如角色：`驱动力与欲望 → 核心弱点或秘密 → 与既有角色的关系张力 → 方案卡提案`；世界观规则：`核心机制 → 触发代价与限制 → 引发的社会/剧情困境 → 方案卡提案`）。
+   - 每轮只生成一道选择题 JSON（含 2–4 个具体选项，支持自定义回答、跳过与返回上一步复用缓存），最后一步生成 `{ cards: ElementDesignCard[] }`。
+
+`ElementDesignCard` 按类型包含可独立勾选、跨卡借用与手改的结构化字段：
+- 通用字段：`proposalId`、`name`、`aliases[]`、`summary`、`differenceNote`、`proposedFacts[]`（`{ predicate, value, semanticType }`；`value` 可为文本或 `{ entityName }` 引用）。
+- `character` 专属：`arc`（`{ motivation, goal, conflict, epiphany }`），采用时可同步写入 `character_arcs`。
+- `rule` / `location` / `organization` / `item` 专属：`constraints[]`（限制与代价）、`sensoryDetails[]`（场景感官细节）、`storyHooks[]`（潜在剧情冲突钩子）。
+- `secret` 专属：`truth`（`world_fact`）、`falseBelief`（表面假象/误信 `belief`）、`initialHolders[]`（写入 `known_by` 事件与边界事实，从 storyOrder 1 起对相应视角可见）、`revealCondition`（写入 `revealed` 事件与边界事实，对全部视角可见）。知识边界只有 `known_by`/`revealed` **事实**才会被检索消费，事件仅作时间线展示。
+
+| 方法与路径 | 作用 |
+| --- | --- |
+| `POST /api/assist/element-design` | 快速模式：直接生成 2–3 张元素设定方案卡并归档为 `candidate` 产物 |
+| `POST /api/element-guide/sessions` | 引导模式：创建或恢复元素共创引导会话并生成当前步骤 |
+| `POST /api/element-guide/sessions/:id/answer` | 保存选项、自定义回答或跳过并推进下一步 |
+| `POST /api/element-guide/sessions/:id/back` | 返回上一步并恢复缓存问题，不重复调用模型 |
+| `POST /api/assist/element-design/apply` | 采用选定方案（前端按「生成批次 artifactId + proposalId」生成确定性 `acceptanceId`），在同一 SQLite 事务中创建/更新元素（重名命中时合并到既有实体，保留原简介与来源）、`character_arcs` 与 `kw_facts`（`author_setting`）；方案卡的手改与跨卡借用由前端在提交前编辑，服务端不做独立 PATCH 持久化 |
+
+### 12.2 人物弧线推演与进度诊断（`arc_assist` · 复用 `guide` 路由）
+
+- **补全模式（`mode: "propose"`）**：针对已有角色简介或出场正文，生成 2 组不同走向的 `{ motivation, goal, conflict, epiphany, notes }` 弧线方案供作者选择或混搭。
+- **对照诊断模式（`mode: "diagnose"`）**：对比角色在 `character_arcs` 中的预期计划与知识库中已发生的 `world_events` / 已写场景，输出结构化诊断 JSON `{ progressSummary, unfulfilledConflicts[], nextDilemmaProposals[] }`，作者可将两难建议一键转为便签或下一场计划。
+
+### 12.3 全周期局部情节推演（`plot_ideate` · 复用 `guide` 路由）
+
+在故事画布与写作页场景卡提供 4 种局部推演模式，均输出结构化场景提案 JSON `{ proposals: SceneProposalCard[] }`，产物保存为 `candidate`：
+
+| `mode` | 输入上下文 | 产出与采用行为 |
+| --- | --- | --- |
+| `next_scene` | 基准 `sceneId`（含正文与可选复盘结论） | 生成 2–3 张承接前场的下一场计划卡；采用后经 `ChangeSet.sceneAdditions` 插入到基准场景之后 |
+| `bridge_scenes` | `fromSceneId`、`toSceneId` | 分析两场之间的状态与因果缺口，生成 1–2 场过渡场景提案并插入中间 |
+| `scene_brainstorm` | `sceneId`、锁定的已知字段、目标字段（`goal` / `conflict` / `summary`） | 针对单个缺失或卡壳的场景卡字段生成 3 个实质差异方案；采用后通过场景 CAS 更新 |
+| `chapter_breakdown` | `chapterId`、章节构想摘要 | 将单章构想拆解为 2–4 场连续场景提案，支持逐场编辑与子集采用 |
+
+### 12.4 创作便签 AI 孵化器（`note_incubate` · 复用 `ideas` 路由）
+
+- `POST /api/notes/incubate`：接收 `{ noteIds: string[], targetKind: "character" | "world" | "scenes", hint? }`。
+- 宿主读取所选便签标题、内容与标签，调用模型整合生成对应类型的结构化提案（复用 `ElementDesignCard[]` 或 `SceneProposalCard[]`）。
+- 便签在采用前仍不进入正文、事实或 RAG；作者显式采用孵化提案后，对应便签状态更新为 `linked` 并绑定生成的元素或场景 ID。
+
+### 12.5 正文反向抽取与时态账本同步（`extract_ledger` · 复用 `consistency` 路由）
+
+- `POST /api/assist/extract-ledger`：针对指定 `sceneId`（或章节内已采用正文），扫描并输出 JSON `{ newElements[], factProposals[], eventProposals[] }`，每项必须携带正文原句 `quote`。
+- **宿主防幻觉校验**：宿主在目标场景当前修订的正文段落中精确核对 `quote`，计算确定性 `evidenceId`；若 `quote` 在正文中不存在，则拒绝作为有效证据入库。
+- `POST /api/assist/extract-ledger/apply`：作者在审阅单中确认后，元素、事实（`manuscript` 来源 + `evidenceId`）与状态事件在同一 SQLite 事务中写入；为关联元素推进修订时，证据与事实/事件引用同步重绑到新修订，并重建该修订索引，保证入库事实立即进入检索与一致性检查。

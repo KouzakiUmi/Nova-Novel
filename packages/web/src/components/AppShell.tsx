@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
   Archive,
   BookOpenText,
@@ -16,7 +16,8 @@ import {
 } from "lucide-react";
 import type { WorkspaceSnapshot } from "@nova-novel/shared";
 import { countWords } from "@nova-novel/shared";
-import { IconConstellation, IconCore, IconFacet, IconFolio, IconLens, IconOrbit, IconQuill, IconSpark, NovaMark, type IconProps } from "./icons";
+import { IconConstellation, IconCore, IconFacet, IconFolio, IconLens, IconNote, IconOrbit, IconQuill, IconSpark, NovaMark, type IconProps } from "./icons";
+import { useDialogKeyboard } from "./useDialogKeyboard";
 
 export type ViewId = "start" | "write" | "story" | "elements" | "context" | "notes" | "workflow" | "revisions" | "settings";
 export type SaveStatus = "saved" | "dirty" | "saving" | "error";
@@ -27,7 +28,7 @@ const navigation: Array<{ id: ViewId; label: string; hint: string; icon: (props:
   { id: "story", label: "故事", hint: "剧情与时间线", icon: IconConstellation },
   { id: "elements", label: "元素", hint: "人物、物品与规则", icon: IconFacet },
   { id: "context", label: "资料", hint: "证据与检索", icon: IconLens },
-  { id: "notes", label: "便签", hint: "想法与笔记", icon: IconSpark },
+  { id: "notes", label: "便签", hint: "想法与笔记", icon: IconNote },
   { id: "workflow", label: "工作流", hint: "编排与运行", icon: IconOrbit },
   { id: "revisions", label: "修订", hint: "版本与恢复", icon: IconFolio },
   { id: "settings", label: "模型与服务", hint: "Provider、模型与任务分配", icon: IconCore },
@@ -50,9 +51,13 @@ interface AppShellProps {
 export function AppShell({ snapshot, view, onViewChange, focusMode, onFocusMode, onOpenStart, onOpenScene, onProjectChange, onManageProjects, saveStatus, children }: AppShellProps) {
   const [commandOpen, setCommandOpen] = useState(false);
   const [commandQuery, setCommandQuery] = useState("");
+  const commandRef = useRef<HTMLElement>(null);
+  useDialogKeyboard(commandRef, () => setCommandOpen(false), commandOpen);
 
   useEffect(() => {
     const handleKey = (event: KeyboardEvent) => {
+      // 组合输入期间的 Escape 用于取消候选，不应关闭面板或触发快捷键。
+      if (event.isComposing || event.keyCode === 229) return;
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
         event.preventDefault();
         setCommandOpen((open) => !open);
@@ -131,7 +136,7 @@ export function AppShell({ snapshot, view, onViewChange, focusMode, onFocusMode,
 
       {commandOpen && (
         <div className="modal-backdrop" role="presentation" onMouseDown={() => setCommandOpen(false)}>
-          <section className="command-palette" role="dialog" aria-modal="true" aria-label="搜索与跳转" onMouseDown={(event) => event.stopPropagation()}>
+          <section ref={commandRef} className="command-palette" role="dialog" aria-modal="true" aria-label="搜索与跳转" onMouseDown={(event) => event.stopPropagation()}>
             <div className="command-input"><Search size={18} /><input autoFocus value={commandQuery} onChange={(event) => setCommandQuery(event.target.value)} placeholder="搜索场景、元素，或输入要去的功能…" /><button className="icon-button" onClick={() => setCommandOpen(false)} aria-label="关闭"><X size={17} /></button></div>
             <p className="command-label">快速前往</p>
             {navigation.filter((item) => `${item.label}${item.hint}`.includes(commandQuery)).map((item) => (

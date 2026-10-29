@@ -1,27 +1,42 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "../lib/api";
 import { Check, RotateCcw, Type } from "lucide-react";
 import { applyAppearance, DEFAULT_APPEARANCE, readAppearance, type AppearanceSettings } from "../lib/appearance";
 import { Badge } from "./UI";
 
+let appearanceQueue: Promise<unknown> = Promise.resolve();
+
 export function AppearanceView() {
   const [settings, setSettings] = useState<AppearanceSettings>(() => readAppearance());
+  const settingsRef = useRef(settings);
+  const sequence = useRef(0);
+  const [saveState, setSaveState] = useState<"loading" | "saving" | "saved" | "error">("loading");
+  const [error, setError] = useState("");
   useEffect(() => {
     let active = true;
-    void api.appearance().then(saved => { if (active) { setSettings(saved); applyAppearance(saved); } }).catch(() => undefined);
+    void appearanceQueue.then(() => api.appearance(), () => api.appearance()).then(saved => { if (active && sequence.current === 0) { settingsRef.current = saved; setSettings(saved); applyAppearance(saved); setSaveState("saved"); } }).catch(cause => { if (active && sequence.current === 0) { setSaveState("error"); setError(cause instanceof Error ? cause.message : "未能读取已保存的外观设置"); } });
     return () => { active = false; };
   }, []);
+  const persist = (next: AppearanceSettings) => {
+    const seq = ++sequence.current;
+    setSaveState("saving"); setError("");
+    const task = appearanceQueue.then(() => api.saveAppearance(next), () => api.saveAppearance(next));
+    appearanceQueue = task;
+    void task.then(() => { if (seq === sequence.current) setSaveState("saved"); }).catch(cause => { if (seq === sequence.current) { setSaveState("error"); setError(cause instanceof Error ? cause.message : "外观尚未保存"); } });
+  };
   const update = (patch: Partial<AppearanceSettings>) => {
-    const next = { ...settings, ...patch };
-    setSettings(next); applyAppearance(next); void api.saveAppearance(next).catch(() => undefined);
+    const next = { ...settingsRef.current, ...patch };
+    settingsRef.current = next;
+    setSettings(next); applyAppearance(next); persist(next);
   };
   return (
     <div className="settings-page page-scroll appearance-page">
-      <header className="page-toolbar"><div><p className="eyebrow">TYPE & READING</p><h1>界面与字体</h1><p>选择适合长时间写作和阅读的字体。默认使用应用内置字体，离线也能保持一致。</p></div><Badge tone="green"><Check size={12} />本机即时生效</Badge></header>
+      <header className="page-toolbar"><div><p className="eyebrow">TYPE & READING</p><h1>界面与字体</h1><p>选择适合长时间写作和阅读的字体。默认使用应用内置字体，离线也能保持一致。</p></div><Badge tone={saveState === "saved" ? "green" : "amber"}><Check size={12} />{saveState === "saved" ? "已保存在本机" : saveState === "error" ? "当前预览 · 尚未保存" : saveState === "loading" ? "正在读取设置" : "当前预览 · 保存中"}</Badge></header>
+      {error && <p className="inline-note error" role="alert">{error} · 当前预览已保留。<button className="button ghost small" onClick={() => persist(settingsRef.current)}>重试保存</button></p>}
       <div className="appearance-layout">
         <main>
           <section className="settings-section appearance-section">
-            <div className="settings-section-head"><div><h2>字体选择</h2><p>界面与正文分开设置。修改会保存在这台设备上，不影响作品内容。</p></div><button className="button ghost small" onClick={() => update({ ...DEFAULT_APPEARANCE })}><RotateCcw size={13} />恢复默认</button></div>
+            <div className="settings-section-head"><div><h2>字体选择</h2><p>界面与正文分开设置。修改即时预览，保存成功后会在这台设备上保留，不影响作品内容。</p></div><button className="button ghost small" onClick={() => update({ ...DEFAULT_APPEARANCE })}><RotateCcw size={13} />恢复默认</button></div>
             <div className="appearance-fields">
               <label className="field-label"><span>界面字体</span><select aria-label="界面字体" value={settings.uiFont} onChange={event => update({ uiFont: event.target.value as AppearanceSettings["uiFont"] })}><option value="builtin">内置无衬线（默认）</option><option value="system">跟随系统</option></select><small>Inter + Noto Sans CJK，适合导航、按钮和设置项。</small></label>
               <label className="field-label"><span>正文字体</span><select aria-label="正文字体" value={settings.manuscriptFont} onChange={event => update({ manuscriptFont: event.target.value as AppearanceSettings["manuscriptFont"] })}><option value="builtin">内置宋体（默认）</option><option value="wenkai">文楷（阅读）</option><option value="system">跟随系统</option></select><small>Noto Serif CJK，适合小说正文、候选和证据阅读。</small></label>

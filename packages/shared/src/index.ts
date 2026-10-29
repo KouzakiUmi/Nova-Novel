@@ -616,7 +616,180 @@ export interface WorkspaceSnapshot {
   tasks: AgentTask[];
   guide?: GuidedSession;
   workflowGuide?: WorkflowGuideSession;
+  elementGuide?: ElementGuideSession;
   connection: PiConnection;
+}
+
+/* ---- 全流程 AI 创作助手补充类型 ------------------------------------------ */
+
+export interface ElementDesignFactProposal {
+  predicate: string;
+  value: string | { entityName: string; entityId?: Id };
+  semanticType: FactAssertion["semanticType"];
+}
+
+export interface ElementDesignArcProposal {
+  motivation: string;
+  goal: string;
+  conflict: string;
+  epiphany: string;
+  notes: string;
+}
+
+export interface ElementDesignWorldProposal {
+  constraints: string[];
+  sensoryDetails: string[];
+  storyHooks: string[];
+}
+
+export interface ElementDesignSecretProposal {
+  truth: string;
+  falseBelief: string;
+  initialHolders: string[];
+  revealCondition: string;
+}
+
+export interface ElementDesignCard {
+  proposalId: Id;
+  type: Entity["type"];
+  name: string;
+  aliases: string[];
+  summary: string;
+  differenceNote: string;
+  proposedFacts: ElementDesignFactProposal[];
+  arc?: ElementDesignArcProposal;
+  world?: ElementDesignWorldProposal;
+  secret?: ElementDesignSecretProposal;
+}
+
+export interface ElementGuideSession {
+  sessionId: Id;
+  projectId: Id;
+  branchId: Id;
+  baseRevisionId: Id;
+  type: Entity["type"];
+  targetEntityId?: Id;
+  prompt?: string;
+  roleHint?: string;
+  relatedEntityIds: Id[];
+  status: "active" | "ready" | "applied" | "cancelled";
+  revision?: number;
+  stepIndex: number;
+  answers: GuidedAnswer[];
+  questions: Record<string, GuidedQuestion>;
+  pending?: GuidedQuestion;
+  proposal?: ElementDesignCard[];
+  appliedEntityId?: Id;
+  createdAt: ISODateTime;
+  updatedAt: ISODateTime;
+}
+
+export interface ArcAssistProposal {
+  proposalId: Id;
+  label: string;
+  differenceNote: string;
+  motivation: string;
+  goal: string;
+  conflict: string;
+  epiphany: string;
+  notes: string;
+}
+
+export interface ArcDilemmaProposal {
+  title: string;
+  conflict: string;
+  choiceA: string;
+  choiceB: string;
+}
+
+export interface ArcDiagnosisReport {
+  progressSummary: string;
+  unfulfilledConflicts: string[];
+  nextDilemmaProposals: ArcDilemmaProposal[];
+}
+
+export type PlotIdeateMode = "next_scene" | "bridge_scenes" | "scene_brainstorm" | "chapter_breakdown";
+
+export interface SceneProposalCard {
+  proposalId: Id;
+  title: string;
+  goal: string;
+  conflict: string;
+  summary: string;
+  pov?: string;
+  storyTime?: string;
+  differenceNote?: string;
+}
+
+export interface SceneFieldOption {
+  optionId: Id;
+  label: string;
+  value: string;
+  rationale: string;
+}
+
+export interface PlotIdeateResult {
+  artifactId: Id;
+  taskId: Id;
+  mode: PlotIdeateMode;
+  scenes?: SceneProposalCard[];
+  fieldTarget?: "goal" | "conflict" | "summary";
+  fieldOptions?: SceneFieldOption[];
+}
+
+export type NoteIncubateTarget = "character" | "world" | "scenes";
+
+export interface NoteIncubateResult {
+  artifactId: Id;
+  taskId: Id;
+  noteIds: Id[];
+  targetKind: NoteIncubateTarget;
+  elementCards?: ElementDesignCard[];
+  sceneCards?: SceneProposalCard[];
+}
+
+export interface ExtractedElementProposal {
+  proposalId: Id;
+  type: Entity["type"];
+  name: string;
+  aliases: string[];
+  summary: string;
+  quote: string;
+  evidenceId: Id;
+}
+
+export interface ExtractedFactProposal {
+  proposalId: Id;
+  subjectName: string;
+  subjectId?: Id;
+  predicate: string;
+  value: string;
+  semanticType: FactAssertion["semanticType"];
+  quote: string;
+  evidenceId: Id;
+}
+
+export interface ExtractedEventProposal {
+  proposalId: Id;
+  subjectName: string;
+  subjectId?: Id;
+  kind: string;
+  fromValue?: string;
+  toValue: string;
+  storyTime?: string;
+  quote: string;
+  evidenceId: Id;
+}
+
+export interface ExtractedLedgerBundle {
+  artifactId: Id;
+  taskId: Id;
+  sceneId: Id;
+  revisionId: Id;
+  newElements: ExtractedElementProposal[];
+  factProposals: ExtractedFactProposal[];
+  eventProposals: ExtractedEventProposal[];
+  filteredOutCount: number;
 }
 
 export interface WorkflowGuideSession {

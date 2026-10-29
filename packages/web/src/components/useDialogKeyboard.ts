@@ -14,6 +14,7 @@ export function useDialogKeyboard<T extends HTMLElement>(ref: RefObject<T | null
     if (initial === dialog) dialog.tabIndex = -1;
     initial.focus();
     const handleKey = (event: KeyboardEvent) => {
+      if (event.isComposing || event.keyCode === 229) return;
       if (event.key === "Escape") {
         event.preventDefault(); event.stopPropagation(); closeRef.current(); return;
       }

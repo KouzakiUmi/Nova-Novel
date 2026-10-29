@@ -125,7 +125,7 @@ function seedKeyExample(kb: SqliteKnowledgeService): {
   kb.addFact({
     projectId: PROJECT, subjectId: key, predicate: "possessor", value: { entityId: shenyan },
     semanticType: "belief", reviewState: "confirmed", sourceKind: "manuscript",
-    routeId: ROUTE, holderId: linwu, validFromOrder: 2,
+    routeId: ROUTE, holderId: linwu, validFromOrder: 2, evidenceIds: [s03],
   });
   kb.addFact({
     projectId: PROJECT, subjectId: key, predicate: "quantity",
@@ -398,6 +398,9 @@ test("两字人名与别名精确检索：沈砚 / 小砚 / 钥匙", () => {
   const resolved = kb.resolveEntityByName(PROJECT, ROUTE, "小砚");
   assert.ok(resolved);
   assert.equal(resolved!.entityId, ids.shenyan);
+  kb.indexScene(sceneOf({ sceneId: "scene_alias", body: "小砚独自守在桥边。", storyTime: "day 0", narrationOrder: 1 }), REVISION);
+  const aliasBundle = kb.queryContext(baseQuery({ query: "小砚", storyOrder: 3 }));
+  assert.ok(aliasBundle.evidence.some((e) => e.sceneId === "scene_alias" && e.quote.includes("小砚")), "别名必须召回包含该别名的正文，不能只靠无关事实的证据凑数");
 });
 
 test("indexScene：采用正文写入派生 FTS 与证据，不改写权威事实", () => {
@@ -463,4 +466,308 @@ test("seedExampleKnowledge：幂等灌入黄铜钥匙示例并可检索", () => 
   assert.ok(kb.listFacts(PROJECT).length > 0);
   assert.equal(kb.listEvents(PROJECT).length, 3);
   assert.ok(kb.listEvents(PROJECT).every((event) => event.projectId === PROJECT));
+});
+
+for (const predicate of ["known_by", "revealed"]) {
+  test(`秘密 ${predicate}：只在生效区间可见，过去、到期与未知时点不泄漏`, () => {
+    const kb = newService();
+    const secret = kb.addEntity({ projectId: PROJECT, type: "secret", name: "密钥身份", routeId: ROUTE, sourceKind: "author_setting", reviewState: "confirmed" });
+    kb.addFact({ projectId: PROJECT, subjectId: secret, predicate: "identity", value: "守门人", semanticType: "world_fact", reviewState: "confirmed", sourceKind: "author_setting", routeId: ROUTE });
+    const permission = { projectId: PROJECT, subjectId: secret, predicate, value: { entityId: "pov" }, semanticType: "world_fact" as const, reviewState: "confirmed" as const, sourceKind: "author_setting" as const, routeId: ROUTE };
+    // 故意先插入更晚的区间，避免实现退回无序 LIMIT 1。
+    kb.addFact({ ...permission, validFromOrder: 40, validToOrder: 50 });
+    kb.addFact({ ...permission, validFromOrder: 10, validToOrder: 20 });
+    kb.indexScene(sceneOf({ sceneId: "secret_source", body: "密钥身份是守门人。", storyTime: "day 0", narrationOrder: 1 }), REVISION);
+    kb.addPlan({ projectId: PROJECT, revisionId: REVISION, routeId: ROUTE, text: "密钥身份指向守门人。" });
+    for (const order of [1, 9, 20, 30, undefined]) {
+      const bundle = kb.queryContext(baseQuery({ query: "密钥身份", povEntityId: "pov", ...(order === undefined ? {} : { storyOrder: order }) }));
+      assert.equal(bundle.facts.filter((f) => f.subjectId === secret).length, 0, `时点 ${order} 不应包含秘密事实`);
+      assert.equal(bundle.evidence.length, 0, `时点 ${order} 不应包含秘密证据`);
+      assert.equal(bundle.selectedPlans.length, 0, `时点 ${order} 不应包含秘密计划`);
+    }
+    for (const storyOrder of [10, 19, 40]) {
+      const bundle = kb.queryContext(baseQuery({ query: "密钥身份", povEntityId: "pov", storyOrder }));
+      assert.ok(bundle.facts.some((f) => f.subjectId === secret && f.predicate === "identity"));
+      assert.equal(bundle.evidence.length, 1);
+      assert.equal(bundle.selectedPlans.length, 1);
+    }
+    const target = sceneOf({ sceneId: "secret_target", pov: "pov", storyTime: "day 0" });
+    kb.registerScene({ projectId: PROJECT, revisionId: REVISION, sceneId: target.sceneId, routeId: ROUTE, storyOrder: 1, bodyHash: "target" });
+    assert.ok(kb.checkConsistency(target, "密钥身份是守门人。").some((issue) => issue.severity === "conflict" && issue.title.includes("秘密")));
+    kb.registerScene({ projectId: PROJECT, revisionId: REVISION, sceneId: target.sceneId, routeId: ROUTE, storyOrder: 10, bodyHash: "target" });
+    assert.ok(!kb.checkConsistency(target, "密钥身份是守门人。").some((issue) => issue.severity === "conflict"));
+    assert.ok(kb.queryContext(baseQuery({ purpose: "planning" })).facts.some((f) => f.subjectId === secret && f.predicate === "identity"));
+  });
+}
+
+test("一致性检查使用冻结修订的场景时点，不借用其他修订的未来时间", () => {
+  const kb = newService();
+  const secret = kb.addEntity({ projectId: PROJECT, type: "secret", name: "失踪秘密", routeId: ROUTE, sourceKind: "author_setting", reviewState: "confirmed" });
+  kb.addFact({ projectId: PROJECT, subjectId: secret, predicate: "known_by", value: { entityId: "pov" }, semanticType: "world_fact", reviewState: "confirmed", sourceKind: "author_setting", routeId: ROUTE, validFromOrder: 10 });
+  kb.registerScene({ projectId: PROJECT, revisionId: REVISION, sceneId: "target", routeId: ROUTE, storyOrder: 1, bodyHash: "past" });
+  kb.registerScene({ projectId: PROJECT, revisionId: OTHER_REVISION, sceneId: "target", routeId: ROUTE, storyOrder: 10, bodyHash: "future" });
+  const target = sceneOf({ sceneId: "target", pov: "pov" });
+  assert.ok(kb.checkConsistency(target, "他道出失踪秘密。").some((i) => i.severity === "conflict" && i.title.includes("秘密")));
+  assert.ok(!kb.checkConsistency({ ...target, baseRevisionId: OTHER_REVISION }, "他道出失踪秘密。").some((i) => i.severity === "conflict"));
+});
+
+test("一致性检查不以叙述顺序填充未知故事时点来放行秘密", () => {
+  const kb = newService();
+  const secret = kb.addEntity({ projectId: PROJECT, type: "secret", name: "家族秘密", routeId: ROUTE, sourceKind: "author_setting", reviewState: "confirmed" });
+  kb.addFact({ projectId: PROJECT, subjectId: secret, predicate: "known_by", value: { entityId: "pov" }, semanticType: "world_fact", reviewState: "confirmed", sourceKind: "author_setting", routeId: ROUTE, validFromOrder: 10 });
+  const target = sceneOf({ sceneId: "untimed_target", pov: "pov", narrationOrder: 30 });
+  delete target.storyTime;
+  const issues = kb.checkConsistency(target, "他道出家族秘密。");
+  assert.ok(issues.some((i) => i.severity === "unknown" && i.title.includes("秘密")));
+  assert.ok(!issues.some((i) => i.severity === "conflict"), "时点未知不能断言视角已知或尚未获知");
+});
+
+test("未知故事时点的物品状态与来源返回排除计数和 unknown，不回放未来遗失造成硬冲突", () => {
+  const db = createDatabase();
+  const kb = new SqliteKnowledgeService(db);
+  const key = kb.addEntity({ projectId: PROJECT, type: "item", name: "钥匙", routeId: ROUTE, sourceKind: "author_setting", reviewState: "confirmed" });
+  const coin = kb.addEntity({ projectId: PROJECT, type: "item", name: "铜钱", routeId: ROUTE, sourceKind: "author_setting", reviewState: "confirmed" });
+  kb.addFact({ projectId: PROJECT, subjectId: key, predicate: "possessor", value: "林雾", semanticType: "world_fact", reviewState: "confirmed", sourceKind: "author_setting", routeId: ROUTE });
+  kb.addFact({ projectId: PROJECT, subjectId: key, predicate: "location", value: "仓库", semanticType: "world_fact", reviewState: "confirmed", sourceKind: "author_setting", routeId: ROUTE, validFromOrder: 1, validToOrder: 10 });
+  kb.addEvent({ projectId: PROJECT, subjectId: key, kind: "item.transfer_possession", routeId: ROUTE, storyOrder: 1, toValue: "沈砚", reviewState: "confirmed" });
+  kb.addEvent({ projectId: PROJECT, subjectId: key, kind: "item.lost", routeId: ROUTE, storyOrder: 2, location: "河底", reviewState: "confirmed" });
+  kb.indexScene(sceneOf({ sceneId: "coin_source", body: "铜钱数量未明。", storyTime: "day 1" }), REVISION);
+  const row = db.prepare("SELECT evidence_id FROM kw_evidence WHERE scene_id = 'coin_source'").get() as { evidence_id: string };
+  kb.addFact({ projectId: PROJECT, subjectId: coin, predicate: "quantity", value: { value: null, unit: "枚" }, semanticType: "world_fact", reviewState: "confirmed", sourceKind: "manuscript", routeId: ROUTE, evidenceIds: [row.evidence_id] });
+  const state = kb.getWorldState(PROJECT, ROUTE, undefined, REVISION);
+  assert.equal(state.entries.find((e) => e.subjectId === key)?.timeUnknown, true);
+  assert.equal(state.entries.find((e) => e.subjectId === key)?.possessor, "林雾", "不能在未知时点回放未来的转交或遗失");
+  assert.equal(state.entries.find((e) => e.subjectId === key)?.location, null);
+  assert.equal(state.entries.find((e) => e.subjectId === coin)?.timeUnknown, true);
+  assert.equal(state.excluded.find((e) => e.reason === "fact_story_order_unknown")?.count, 2);
+  assert.equal(state.excluded.find((e) => e.reason === "evidence_story_order_unknown")?.count, 1);
+  assert.equal(state.excluded.find((e) => e.reason === "event_story_order_unknown")?.count, 2);
+  const target = sceneOf({ sceneId: "untimed_item_target", narrationOrder: 30 });
+  delete target.storyTime;
+  const issues = kb.checkConsistency(target, "他掏出钥匙，又数出 3 枚铜钱。");
+  assert.equal(issues.filter((i) => i.severity === "unknown").length, 2);
+  assert.ok(issues.every((i) => i.severity !== "conflict"));
+  assert.ok(issues.some((i) => i.detail.includes("事实 2 条、证据 1 条、事件 2 条")));
+  assert.ok(kb.checkConsistency({ ...target, storyTime: "day 2" }, "他掏出钥匙。").some((i) => i.severity === "conflict"), "已知发生在遗失之后时仍必须报告原有硬冲突");
+});
+
+test("故事时点未知时显式计数排除时限设定与有时点证据，不伪装资料不存在", () => {
+  const kb = newService();
+  kb.indexScene(sceneOf({ sceneId: "timed_sources", body: "资料记载了第一件事。\n\n资料记载了第二件事。", storyTime: "day 1" }), REVISION);
+  const timeless = kb.addFact({ projectId: PROJECT, subjectId: "item", predicate: "owner", value: "作者设定", semanticType: "world_fact", reviewState: "confirmed", sourceKind: "author_setting", routeId: ROUTE });
+  const timed = kb.addFact({ projectId: PROJECT, subjectId: "item", predicate: "location", value: "仓库", semanticType: "world_fact", reviewState: "confirmed", sourceKind: "author_setting", routeId: ROUTE, validFromOrder: 1, validToOrder: 20 });
+  const bundle = kb.queryContext(baseQuery({ query: "资料" }));
+  assert.ok(bundle.facts.some((f) => f.factId === timeless));
+  assert.ok(!bundle.facts.some((f) => f.factId === timed));
+  assert.equal(bundle.evidence.length, 0);
+  assert.equal(bundle.excluded.find((e) => e.reason === "fact_story_order_unknown")?.count, 1);
+  assert.equal(bundle.excluded.find((e) => e.reason === "evidence_story_order_unknown")?.count, 2);
+  const knownTime = kb.queryContext(baseQuery({ query: "资料", storyOrder: 2000 }));
+  assert.equal(knownTime.evidence.length, 2);
+});
+
+test("秘密获知记录不能由失效修订的正文证据授权", () => {
+  const db = createDatabase();
+  const kb = new SqliteKnowledgeService(db);
+  const secret = kb.addEntity({ projectId: PROJECT, type: "secret", name: "信件秘密", routeId: ROUTE, sourceKind: "author_setting", reviewState: "confirmed" });
+  kb.indexScene(sceneOf({ sceneId: "knowledge_source", body: "角色读到了信件秘密。", storyTime: "day 0" }), REVISION);
+  const row = db.prepare("SELECT evidence_id FROM kw_evidence WHERE scene_id = 'knowledge_source'").get() as { evidence_id: string };
+  kb.addFact({ projectId: PROJECT, subjectId: secret, predicate: "known_by", value: { entityId: "pov" }, semanticType: "world_fact", reviewState: "confirmed", sourceKind: "manuscript", routeId: ROUTE, evidenceIds: [row.evidence_id], validFromOrder: 10 });
+  kb.addFact({ projectId: PROJECT, subjectId: secret, predicate: "identity", value: "信中真相", semanticType: "world_fact", reviewState: "confirmed", sourceKind: "author_setting", routeId: ROUTE });
+  kb.addPlan({ projectId: PROJECT, revisionId: REVISION, routeId: ROUTE, text: "回应信件秘密。" });
+  const query = baseQuery({ query: "信件秘密", storyOrder: 10, povEntityId: "pov" });
+  assert.ok(kb.queryContext(query).facts.some((f) => f.predicate === "identity"));
+  db.prepare("DELETE FROM kw_scene_refs WHERE scene_id = 'knowledge_source'").run();
+  const stale = kb.queryContext(query);
+  assert.equal(stale.facts.filter((f) => f.subjectId === secret).length, 0);
+  assert.equal(stale.evidence.length, 0);
+  assert.equal(stale.selectedPlans.length, 0);
+});
+
+test("正文来源事实没有有效证据时排除并计数，作者设定不依赖正文锚点", () => {
+  const kb = newService();
+  const source = { projectId: PROJECT, subjectId: "item", predicate: "location", value: "仓库", semanticType: "world_fact" as const, reviewState: "confirmed" as const, routeId: ROUTE };
+  const unsupported = kb.addFact({ ...source, sourceKind: "manuscript" });
+  const setting = kb.addFact({ ...source, sourceKind: "author_setting" });
+  const bundle = kb.queryContext(baseQuery({ storyOrder: 10 }));
+  assert.ok(!bundle.facts.some((f) => f.factId === unsupported));
+  assert.ok(bundle.facts.some((f) => f.factId === setting));
+  assert.equal(bundle.excluded.find((e) => e.reason === "fact_source_not_in_revision")?.count, 1);
+  assert.equal(kb.getWorldState(PROJECT, ROUTE, 10, REVISION).entries.find((e) => e.subjectId === "item")?.location, "仓库");
+});
+
+test("正文事实随修订、场景、内容哈希与时点校验，一致性检查不采信失效来源", () => {
+  const db = createDatabase();
+  const kb = new SqliteKnowledgeService(db);
+  const item = kb.addEntity({ projectId: PROJECT, type: "item", name: "信物", routeId: ROUTE, sourceKind: "author_setting", reviewState: "confirmed" });
+  const sourceScene = sceneOf({ sceneId: "fact_source", body: "信物的数量未明。", storyTime: "day 1" });
+  kb.indexScene(sourceScene, REVISION);
+  const row = db.prepare("SELECT evidence_id FROM kw_evidence WHERE scene_id = ?").get(sourceScene.sceneId) as { evidence_id: string };
+  const factId = kb.addFact({ projectId: PROJECT, subjectId: item, predicate: "quantity", value: { value: null, unit: "枚" }, semanticType: "world_fact", reviewState: "confirmed", sourceKind: "manuscript", routeId: ROUTE, evidenceIds: ["missing_evidence", row.evidence_id] });
+  const query = baseQuery({ storyOrder: 2000, narrationOrder: 11 });
+  assert.ok(kb.queryContext(query).facts.some((f) => f.factId === factId), "至少一条有效证据即可支持事实");
+  assert.equal(kb.getWorldState(PROJECT, ROUTE, 2000, REVISION).entries.find((e) => e.subjectId === item)?.quantity?.known, false);
+  const target = sceneOf({ sceneId: "fact_target", storyTime: "day 1 01:00" });
+  assert.ok(kb.checkConsistency(target, "他数出 3 枚信物。").some((i) => i.severity === "unknown" && i.title.includes("数量")));
+  const assertExcluded = (overrides: Partial<ContextQuery> = {}) => {
+    const bundle = kb.queryContext({ ...query, ...overrides });
+    assert.ok(!bundle.facts.some((f) => f.factId === factId));
+    assert.equal(bundle.excluded.find((e) => e.reason === "fact_source_not_in_revision")?.count, 1);
+  };
+  assertExcluded({ revisionId: OTHER_REVISION });
+  assertExcluded({ storyOrder: 1000 });
+  assertExcluded({ narrationOrder: 5 });
+  db.prepare("DELETE FROM kw_scene_refs WHERE revision_id = ? AND scene_id = ?").run(REVISION, sourceScene.sceneId);
+  assertExcluded();
+  assert.ok(!kb.getWorldState(PROJECT, ROUTE, 2000, REVISION).entries.some((e) => e.subjectId === item));
+  assert.ok(!kb.checkConsistency(target, "他数出 3 枚信物。").some((i) => i.title.includes("数量")));
+  kb.indexScene(sourceScene, REVISION);
+  db.prepare("UPDATE kw_evidence SET quote = ? WHERE evidence_id = ?").run("已被篡改", row.evidence_id);
+  assertExcluded();
+  assert.ok(!kb.getWorldState(PROJECT, ROUTE, 2000, REVISION).entries.some((e) => e.subjectId === item));
+  kb.indexScene(sourceScene, REVISION);
+  db.prepare("DELETE FROM kw_evidence WHERE evidence_id = ?").run(row.evidence_id);
+  assertExcluded();
+});
+
+for (const mismatch of ["route", "project", "candidate", "selected_plan", "author_setting", "ref_route", "ref_project"] as const) {
+  test(`事实证据通道拒绝 ${mismatch} 归属或来源不符，并计入 source_missing`, () => {
+    const kb = newService();
+    const evidence = kb.addEvidence({ projectId: mismatch === "project" ? "other_project" : PROJECT, sourceRevisionId: REVISION, sceneId: "source_scene", quote: "不应返回的内容", sourceKind: mismatch === "candidate" || mismatch === "selected_plan" || mismatch === "author_setting" ? mismatch : "manuscript", routeId: mismatch === "route" ? OTHER_ROUTE : ROUTE, storyOrder: 1 });
+    kb.registerScene({ projectId: mismatch === "ref_project" ? "other_project" : PROJECT, revisionId: REVISION, sceneId: "source_scene", routeId: mismatch === "ref_route" ? OTHER_ROUTE : ROUTE, bodyHash: "body" });
+    const args = { projectId: PROJECT, subjectId: "item", predicate: "location", value: "仓库", semanticType: "world_fact" as const, reviewState: "confirmed" as const, routeId: ROUTE, evidenceIds: [evidence] };
+    const setting = kb.addFact({ ...args, sourceKind: "author_setting" });
+    const extracted = kb.addFact({ ...args, sourceKind: "manuscript" });
+    const bundle = kb.queryContext(baseQuery({ storyOrder: 2 }));
+    assert.ok(bundle.facts.some((f) => f.factId === setting));
+    assert.ok(!bundle.facts.some((f) => f.factId === extracted));
+    assert.equal(bundle.evidence.length, 0);
+    assert.equal(bundle.excluded.find((e) => e.reason === "evidence_source_missing")?.count, 1);
+    assert.equal(bundle.excluded.find((e) => e.reason === "fact_source_not_in_revision")?.count, 1);
+    assert.deepEqual(kb.getWorldState(PROJECT, ROUTE, 2, REVISION).entries.find((e) => e.subjectId === "item")?.evidenceQuotes, []);
+  });
+}
+
+test("indexScene 失败回滚证据、FTS 与场景引用，并保留外层 SAVEPOINT", () => {
+  const db = createDatabase();
+  const kb = new SqliteKnowledgeService(db);
+  const oldScene = sceneOf({ body: "旧正文仍可检索。", storyTime: "day 0" });
+  kb.beginRevisionIndex(PROJECT, REVISION, [oldScene.sceneId]);
+  kb.indexScene(oldScene, REVISION);
+  const snapshot = () => ({ evidence: db.prepare("SELECT * FROM kw_evidence ORDER BY evidence_id").all(), fts: db.prepare("SELECT * FROM kw_fts ORDER BY ref_id").all(), refs: db.prepare("SELECT * FROM kw_scene_refs ORDER BY scene_id").all() });
+  const before = snapshot();
+  db.exec("CREATE TRIGGER fail_scene_index BEFORE INSERT ON kw_evidence WHEN NEW.quote = '故障段' BEGIN SELECT RAISE(ABORT, 'scene index fault'); END");
+  db.exec("SAVEPOINT outer_write");
+  assert.throws(() => kb.indexScene({ ...oldScene, body: "已写入的第一段。\n\n故障段" }, REVISION), /scene index fault/);
+  assert.deepEqual(snapshot(), before, "第二段失败后必须恢复旧证据、旧 FTS 与旧场景哈希");
+  assert.equal(kb.getIndexStatus(PROJECT, REVISION).state, "error");
+  const failed = kb.queryContext(baseQuery({ query: "旧正文", storyOrder: 1 }));
+  assert.ok(failed.evidence.some((e) => e.quote === oldScene.body));
+  assert.notEqual(failed.indexState.keywordRevisionId, REVISION);
+  assert.ok(failed.excluded.some((e) => e.reason === "keyword_index_error"));
+  kb.addPlan({ projectId: PROJECT, revisionId: REVISION, routeId: ROUTE, text: "外层事务继续写入。" });
+  db.exec("RELEASE SAVEPOINT outer_write");
+  db.exec("DROP TRIGGER fail_scene_index");
+  kb.indexScene({ ...oldScene, body: "恢复后正文。" }, REVISION);
+  assert.equal(kb.getIndexStatus(PROJECT, REVISION).state, "ready");
+});
+
+test("FTS 写入失败也回滚当前场全部新证据，不留下只有证据的半成品", () => {
+  const db = createDatabase();
+  let failFts = false;
+  const tracked: SqliteDatabase = {
+    exec: (sql) => db.exec(sql),
+    prepare: (sql) => {
+      const statement = db.prepare(sql);
+      return {
+        get: (...params) => statement.get(...params),
+        all: (...params) => statement.all(...params),
+        run: (...params) => {
+          if (failFts && sql.includes("INSERT INTO kw_fts") && params.includes(tokenizeForFts("故障段"))) throw new Error("FTS write fault");
+          return statement.run(...params);
+        },
+      };
+    },
+  };
+  const kb = new SqliteKnowledgeService(tracked);
+  const scene = sceneOf({ body: "原正文。", storyTime: "day 0" });
+  kb.indexScene(scene, REVISION);
+  const before = { evidence: db.prepare("SELECT * FROM kw_evidence").all(), fts: db.prepare("SELECT * FROM kw_fts").all(), refs: db.prepare("SELECT * FROM kw_scene_refs").all() };
+  failFts = true;
+  assert.throws(() => kb.indexScene({ ...scene, body: "第一段。\n\n故障段" }, REVISION), /FTS write fault/);
+  assert.deepEqual({ evidence: db.prepare("SELECT * FROM kw_evidence").all(), fts: db.prepare("SELECT * FROM kw_fts").all(), refs: db.prepare("SELECT * FROM kw_scene_refs").all() }, before);
+  assert.equal(kb.getIndexStatus(PROJECT, REVISION).state, "error");
+});
+
+test("修订索引状态只有完整场景清单全部成功才 ready，pending/error 保留旧修订", () => {
+  const db = createDatabase();
+  const kb = new SqliteKnowledgeService(db);
+  const first = sceneOf({ sceneId: "first", body: "第一场", storyTime: "day 0" });
+  const second = sceneOf({ sceneId: "second", body: "第二场", storyTime: "day 0" });
+  kb.indexScene(first, REVISION);
+  assert.equal(kb.getIndexStatus(PROJECT, REVISION).state, "pending", "逐场成功不代表修订完整");
+  kb.beginRevisionIndex(PROJECT, REVISION, [first.sceneId, second.sceneId]);
+  kb.indexScene(first, REVISION);
+  assert.notEqual(kb.queryContext(baseQuery()).indexState.keywordRevisionId, REVISION);
+  kb.indexScene(second, REVISION);
+  assert.deepEqual(kb.getIndexStatus(PROJECT, REVISION), { state: "ready", keywordRevisionId: REVISION });
+  assert.equal(kb.queryContext(baseQuery()).indexState.keywordRevisionId, REVISION);
+  kb.beginRevisionIndex(PROJECT, OTHER_REVISION, [first.sceneId, second.sceneId]);
+  kb.indexScene(first, OTHER_REVISION);
+  const pending = kb.queryContext(baseQuery({ revisionId: OTHER_REVISION }));
+  assert.equal(pending.indexState.keywordRevisionId, REVISION);
+  assert.ok(pending.excluded.some((e) => e.reason === "keyword_index_pending"));
+  db.exec("CREATE TRIGGER fail_second_scene BEFORE INSERT ON kw_evidence WHEN NEW.scene_id = 'second' BEGIN SELECT RAISE(ABORT, 'second fault'); END");
+  assert.throws(() => kb.indexScene(second, OTHER_REVISION), /second fault/);
+  const failed = kb.queryContext(baseQuery({ revisionId: OTHER_REVISION }));
+  assert.equal(failed.indexState.keywordRevisionId, REVISION);
+  assert.ok(failed.excluded.some((e) => e.reason === "keyword_index_error"));
+  const restarted = new SqliteKnowledgeService(db);
+  assert.equal(restarted.getIndexStatus(PROJECT, REVISION).state, "pending", "重启后没有完整性证明，不沿用进程内 ready");
+});
+
+test("外层回滚或 FTS 丢失后不沿用内存中的完整索引声明", () => {
+  const db = createDatabase();
+  const kb = new SqliteKnowledgeService(db);
+  const scene = sceneOf({ body: "临时正文。", storyTime: "day 0" });
+  kb.beginRevisionIndex(PROJECT, REVISION, [scene.sceneId]);
+  db.exec("SAVEPOINT outer_write");
+  kb.indexScene(scene, REVISION);
+  assert.equal(kb.getIndexStatus(PROJECT, REVISION).state, "ready");
+  db.exec("ROLLBACK TO SAVEPOINT outer_write; RELEASE SAVEPOINT outer_write");
+  assert.equal(kb.getIndexStatus(PROJECT, REVISION).state, "pending");
+  assert.notEqual(kb.queryContext(baseQuery()).indexState.keywordRevisionId, REVISION);
+  kb.indexScene(scene, REVISION);
+  db.exec("DELETE FROM kw_fts");
+  assert.equal(kb.getIndexStatus(PROJECT, REVISION).state, "pending");
+  kb.rebuildSearchIndex();
+  assert.equal(kb.getIndexStatus(PROJECT, REVISION).state, "ready");
+});
+
+test("分段索引一次加载实体别名，SQL 数量不随段落乘实体数放大且匹配顺序稳定", () => {
+  const db = createDatabase();
+  const statements: string[] = [];
+  const tracked: SqliteDatabase = { exec: (sql) => db.exec(sql), prepare: (sql) => { statements.push(sql); return db.prepare(sql); } };
+  const kb = new SqliteKnowledgeService(tracked);
+  const character = kb.addEntity({ entityId: "z_character", projectId: PROJECT, type: "character", name: "沈砚", routeId: ROUTE, sourceKind: "author_setting", reviewState: "confirmed" });
+  kb.addAlias(PROJECT, character, "小砚");
+  const item = kb.addEntity({ entityId: "a_item", projectId: PROJECT, type: "item", name: "钥匙", routeId: ROUTE, sourceKind: "author_setting", reviewState: "confirmed" });
+  const secret = kb.addEntity({ projectId: PROJECT, type: "secret", name: "暗号", routeId: ROUTE, sourceKind: "author_setting", reviewState: "confirmed" });
+  for (let i = 0; i < 40; i += 1) {
+    const id = kb.addEntity({ projectId: PROJECT, type: "item", name: `物件${i}`, routeId: ROUTE, sourceKind: "author_setting", reviewState: "confirmed" });
+    kb.addAlias(PROJECT, id, "");
+  }
+  kb.addEntity({ projectId: PROJECT, type: "character", name: "小砚", routeId: OTHER_ROUTE, sourceKind: "author_setting", reviewState: "confirmed" });
+  statements.length = 0;
+  kb.indexScene(sceneOf({ body: Array.from({ length: 12 }, (_, i) => `小砚拿着钥匙，记住暗号，第${i}段。`).join("\n\n") }), REVISION);
+  const reads = statements.filter((sql) => /^\s*SELECT/.test(sql));
+  assert.equal(reads.filter((sql) => sql.includes("FROM kw_entities")).length, 1);
+  assert.equal(reads.filter((sql) => sql.includes("FROM kw_aliases")).length, 0);
+  assert.equal(reads.length, 3, "只有实体别名 JOIN、场景时间与旧证据三个读取，不按段或实体查询别名");
+  const rows = db.prepare("SELECT entity_refs, secret_refs FROM kw_evidence WHERE source_revision_id = ?").all(REVISION) as Array<{ entity_refs: string; secret_refs: string }>;
+  assert.equal(rows.length, 12);
+  for (const row of rows) {
+    assert.deepEqual(JSON.parse(row.entity_refs), [character, item, secret], "保留实体插入顺序、别名命中与非空约束，隔离其他路线");
+    assert.deepEqual(JSON.parse(row.secret_refs), [secret]);
+  }
 });

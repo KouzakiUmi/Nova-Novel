@@ -2,7 +2,7 @@ import type Database from "better-sqlite3";
 import {
   countWords, type AgentTask, type AuthoringSelection, type Branch, type CardRef, type ChangeSet,
   type AuthorNote, type Chapter, type StructureChange, type SceneAnnotation, type CharacterArcProfile, type AuthoringEvent,
-  type ContextBundle, type Evidence, type GenerationReceipt, type GenerationRequest, type IdeaCard,
+  type ContextBundle, type Evidence, type FactAssertion, type GenerationReceipt, type GenerationRequest, type IdeaCard,
   type IdeaCardFields, type Project, type ProposalBatch, type Revision, type Scene, type SelectionAction,
   type StoryRoute,
 } from "@nova-novel/shared";
@@ -52,7 +52,7 @@ export interface ArtifactRecord<T = unknown> {
   completeness: "complete" | "partial";
 }
 
-const INTERACTION_KINDS = new Set(["suggestion-open", "candidate-presented", "candidate-dismiss", "candidate-accept", "candidate-revise", "candidate-reject", "review-open", "review-dismiss", "review-decided", "note-promoted", "scene-structure-saved", "scene-plan-saved"]);
+const INTERACTION_KINDS = new Set(["suggestion-open", "candidate-presented", "candidate-dismiss", "candidate-accept", "candidate-revise", "candidate-reject", "review-open", "review-dismiss", "review-decided", "note-promoted", "scene-structure-saved", "scene-plan-saved", "element-created", "element-updated", "element-fact-added", "element-event-added", "assist-applied"]);
 
 /** Owns the single writable connection; callers must not open competing writers. */
 export class DomainStore {
@@ -373,6 +373,30 @@ export class DomainStore {
       this.db.prepare("INSERT INTO scene_revisions(scene_id,revision_id,blob_id) VALUES(?,?,?)").run(scene.sceneId, revision.revisionId, this.blob(scene));
     }
     this.db.prepare("INSERT INTO domain_outbox(project_id,revision_id,created_at) VALUES(?,?,?)").run(revision.projectId, revision.revisionId, now());
+  }
+  /** 把已确认事实写入知识库（与备份恢复同一套值类型规则），供检索、世界状态与一致性检查使用。 */
+  private syncFact(fact: FactAssertion): void {
+    let valueKind: string;
+    let valueText: string | null = null;
+    let valueEntityId: string | null = null;
+    if (typeof fact.value === "object" && fact.value !== null && "entityId" in fact.value) { valueKind = "entity"; valueEntityId = String(fact.value.entityId); }
+    else if (fact.value === null) valueKind = "null";
+    else if (typeof fact.value === "boolean") { valueKind = "boolean"; valueText = fact.value ? "1" : "0"; }
+    else if (typeof fact.value === "number") { valueKind = "number"; valueText = String(fact.value); }
+    else if (typeof fact.value === "object") { valueKind = "json"; valueText = JSON.stringify(fact.value); }
+    else { valueKind = "text"; valueText = String(fact.value); }
+    const validFrom = fact.validFrom !== undefined && Number.isFinite(Number(fact.validFrom)) ? Number(fact.validFrom) : null;
+    const validTo = fact.validTo !== undefined && Number.isFinite(Number(fact.validTo)) ? Number(fact.validTo) : null;
+    this.db.prepare(
+      `INSERT INTO kw_facts(fact_id,project_id,subject_id,predicate,value_kind,value_text,value_entity_id,semantic_type,review_state,source_kind,route_id,valid_from_order,valid_to_order,holder_id,evidence_ids)
+       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+       ON CONFLICT(fact_id) DO UPDATE SET
+         predicate=excluded.predicate, value_kind=excluded.value_kind, value_text=excluded.value_text,
+         value_entity_id=excluded.value_entity_id, semantic_type=excluded.semantic_type,
+         review_state=excluded.review_state, source_kind=excluded.source_kind, route_id=excluded.route_id,
+         valid_from_order=excluded.valid_from_order, valid_to_order=excluded.valid_to_order,
+         holder_id=excluded.holder_id, evidence_ids=excluded.evidence_ids`,
+    ).run(fact.factId, fact.projectId, fact.subjectId, fact.predicate, valueKind, valueText, valueEntityId, fact.semanticType, fact.reviewState, fact.sourceKind, fact.routeId, validFrom, validTo, fact.holderId ?? null, JSON.stringify(fact.evidenceIds ?? []));
   }
   createProject(input: { title?: string; premise?: string; example?: boolean; body?: string } = {}): Project {
     const title = input.title === undefined ? "未命名作品" : requiredString(input.title, "title", 200);
@@ -863,6 +887,8 @@ export class DomainStore {
       for (const fact of changeset.factChanges) {
         if (fact.projectId !== changeset.projectId || fact.sourceKind === "candidate" || fact.reviewState !== "confirmed" || !this.listRoutes(changeset.projectId).some(route => route.routeId === fact.routeId)) throw new DomainError(400, "INVALID_FACT", "事实须属于此作品路线并已明确确认");
         manifest.facts = [...manifest.facts.filter(item => item.factId !== fact.factId), fact];
+        // 已确认事实必须同步进知识库，否则检索、世界状态与一致性检查都看不到它。
+        this.syncFact(fact);
       }
       for (const node of manifest.storyGraph.nodes) {
         const scene = manifest.scenes.find(item => item.sceneId === node.sceneId);
@@ -902,12 +928,14 @@ export class DomainStore {
     const adopted = this.addScenes({ projectId, branchId: branch.branchId, baseRevisionId: branch.headRevisionId, acceptanceId: `scene_create_${newId("acceptance")}`, ...(chapterId ? { chapterId } : {}), scenes: [{ title: requiredString(title, "场景标题", 200) }] });
     return { revision: adopted.revision, scene: adopted.scenes[0]! };
   }
-  addScenes(input: { projectId: string; branchId?: string; baseRevisionId: string; acceptanceId: string; chapterId?: string; scenes: Array<{ title: string; goal?: string; conflict?: string; summary?: string }> }): { revision: Revision; scenes: Scene[] } {
+  addScenes(input: { projectId: string; branchId?: string; baseRevisionId: string; acceptanceId: string; chapterId?: string; afterSceneId?: string; commitName?: string; scenes: Array<{ title: string; goal?: string; conflict?: string; summary?: string; pov?: string; storyTime?: string }> }): { revision: Revision; scenes: Scene[] } {
     if (!Array.isArray(input.scenes) || input.scenes.length < 1 || input.scenes.length > 20) throw new DomainError(400, "INVALID_INPUT", "一次应采用 1–20 个场景");
     const branch = this.projectBranch(input.projectId, input.branchId);
     const project = this.getProject(input.projectId);
     const manifest = this.getManifest(input.baseRevisionId);
-    const chapter = input.chapterId ? manifest.chapters.find(item => item.chapterId === input.chapterId) : manifest.chapters[0];
+    const afterScene = input.afterSceneId ? manifest.scenes.find(item => item.sceneId === input.afterSceneId) : undefined;
+    if (input.afterSceneId && !afterScene) throw new DomainError(404, "NOT_FOUND", "前置参考场景不在此修订");
+    const chapter = input.chapterId ? manifest.chapters.find(item => item.chapterId === input.chapterId) : afterScene ? manifest.chapters.find(item => item.chapterId === afterScene.chapterId) : manifest.chapters[0];
     if (!chapter) throw new DomainError(400, "INVALID_INPUT", "当前作品没有可用章节");
     const firstOrder = Math.max(0, ...manifest.scenes.map(scene => scene.narrationOrder)) + 1;
     const scenes = input.scenes.map((item, index): Scene => ({
@@ -915,9 +943,23 @@ export class DomainStore {
       title: requiredString(item.title, "场景标题", 200), summary: item.summary ?? "", body: "", status: "planned",
       narrationOrder: firstOrder + index, routeId: project.activeRouteId, entityIds: [], baseRevisionId: "", updatedAt: this.getRevision(input.baseRevisionId).createdAt,
       ...(item.goal !== undefined ? { goal: item.goal } : {}), ...(item.conflict !== undefined ? { conflict: item.conflict } : {}),
+      ...(item.pov !== undefined && item.pov.trim() ? { pov: item.pov.trim() } : {}), ...(item.storyTime !== undefined && item.storyTime.trim() ? { storyTime: item.storyTime.trim() } : {}),
     }));
     const changeset = this.createChangeSet({ projectId: input.projectId, branchId: branch.branchId, baseRevisionId: input.baseRevisionId, acceptanceId: input.acceptanceId, sceneAdditions: scenes });
-    const revision = this.commitChangeSet(changeset.changeSetId, "采用交互大纲");
+    const revision = this.commitChangeSet(changeset.changeSetId, input.commitName ?? "采用交互大纲");
+    if (afterScene) {
+      const currentScenes = this.listScenes(input.projectId, revision.revisionId);
+      const chapterScenes = currentScenes.filter(scene => scene.chapterId === chapter.chapterId && !scenes.some(added => added.sceneId === scene.sceneId)).sort((a, b) => a.narrationOrder - b.narrationOrder);
+      const anchorIndex = chapterScenes.findIndex(scene => scene.sceneId === afterScene.sceneId);
+      if (anchorIndex >= 0) {
+        let rev = revision;
+        for (let i = 0; i < scenes.length; i++) {
+          rev = this.moveScene(scenes[i]!.sceneId, chapter.chapterId, anchorIndex + 2 + i, rev.revisionId);
+        }
+        const ids = new Set(scenes.map(scene => scene.sceneId));
+        return { revision: rev, scenes: this.listScenes(input.projectId, rev.revisionId).filter(scene => ids.has(scene.sceneId)) };
+      }
+    }
     const ids = new Set(scenes.map(scene => scene.sceneId));
     return { revision, scenes: this.listScenes(input.projectId, revision.revisionId).filter(scene => ids.has(scene.sceneId)) };
   }
@@ -1044,6 +1086,7 @@ export class DomainStore {
         : { text: typeof result === "string" ? result : JSON.stringify(result), artifactId: artifact.artifactId };
       record.task.completeness = terminal || record.task.state === "cancelling" ? "partial" : completeness;
       if (!terminal) record.task.state = record.task.state === "cancelling" ? "cancelled" : completeness === "complete" ? "succeeded" : "interrupted";
+      if (record.task.completeness !== "complete" && result && typeof result === "object" && "error" in result && typeof result.error === "string") record.task.error = result.error;
       record.task.updatedAt = now();
       this.db.prepare("UPDATE tasks SET json=? WHERE task_id=?").run(JSON.stringify(record), taskId);
       this.emit("task.finished", record.task);

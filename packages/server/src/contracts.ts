@@ -38,6 +38,48 @@ export interface KnowledgeService {
   queryContext(query: ContextQuery): ContextBundle;
   checkConsistency(scene: Scene, candidateText: string): ConsistencyIssue[];
   indexScene(scene: Scene, revisionId: string): void;
+  /** 由宿主声明某修订的完整场景清单，只有全部索引成功该修订才算可检索。 */
+  beginRevisionIndex?(projectId: string, revisionId: string, sceneIds: readonly string[]): void;
+  getIndexStatus?(projectId: string, revisionId: string): { state: "pending" | "error" | "ready"; keywordRevisionId: string };
+  /** 从权威修订正文重建派生证据与 FTS，用于索引损坏后的恢复。 */
+  rebuildRevisionIndex?(projectId: string, revisionId: string, scenes: readonly Scene[]): { state: "pending" | "error" | "ready"; keywordRevisionId: string };
+  /** 作者录入元素与别名；entityId 已存在时按 upsert 更新。 */
+  addEntity?(args: { entityId?: string; projectId: string; type: Entity["type"]; name: string; summary?: string; routeId: string; sourceKind: Entity["sourceKind"]; reviewState: Entity["reviewState"]; unique?: boolean }): string;
+  addAlias?(projectId: string, entityId: string, alias: string, kind?: "name" | "alias"): void;
+  /** 删除元素的别名记录（不影响实体名本身）。 */
+  removeAlias?(projectId: string, entityId: string, alias: string): void;
+  /** 作者或审阅确认录入属性/关系事实；factId 已存在时按 upsert 更新。 */
+  addFact?(args: {
+    factId?: string;
+    projectId: string;
+    subjectId: string;
+    predicate: string;
+    value: FactAssertion["value"];
+    semanticType: FactAssertion["semanticType"];
+    reviewState: FactAssertion["reviewState"];
+    sourceKind: FactAssertion["sourceKind"];
+    routeId: string;
+    validFromOrder?: number;
+    validToOrder?: number;
+    holderId?: string;
+    evidenceIds?: string[];
+  }): string;
+  /** 作者或审阅确认录入状态变化与秘密知情/揭示事件；eventId 已存在时按 upsert 更新。 */
+  addEvent?(args: {
+    eventId?: string;
+    projectId: string;
+    kind: string;
+    sceneId?: string;
+    routeId: string;
+    storyTime?: string;
+    storyOrder?: number;
+    subjectId: string;
+    fromValue?: string;
+    toValue?: string;
+    location?: string;
+    reviewState: WorldEvent["reviewState"];
+    evidenceIds?: string[];
+  }): string;
 }
 
 export interface WorkflowService {
@@ -57,6 +99,8 @@ export interface PiGenerationInput {
 export interface PiGenerationResult {
   text: string;
   completeness: "complete" | "partial";
+  failureReason?: "timeout" | "provider_error" | "tool_error" | "cancelled" | "truncated" | "empty_output" | "incomplete_response" | "context_overflow" | "invalid_output";
+  error?: string;
   sessionId?: string;
   leafId?: string;
   output?: GenerationResultPayload["output"];

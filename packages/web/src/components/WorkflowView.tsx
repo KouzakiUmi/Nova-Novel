@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Background, Controls, ReactFlow } from "@xyflow/react";
 import type { Scene, WorkflowDefinition, WorkflowNode, WorkflowRun, WorkspaceSnapshot } from "@nova-novel/shared";
 import { ArrowRight, Check, CheckCircle2, CircleAlert, CircleDashed, Clock3, FileInput, GitCompareArrows, UserRound, LibraryBig, ListChecks, LoaderCircle, Play, Search, ShieldCheck, Square, Workflow, WandSparkles, X } from "lucide-react";
 import { Badge } from "./UI";
 import { IconOrbit } from "./icons";
 import { api } from "../lib/api";
+import { useDialogKeyboard } from "./useDialogKeyboard";
 
 interface WorkflowViewProps {
   snapshot: WorkspaceSnapshot;
@@ -192,9 +193,11 @@ function ReviewDialog({ run, definition, onClose, onDecide }: { run: WorkflowRun
     void onDecide(option, reviewNote.trim() || undefined).catch((cause: unknown) => setFailed(cause instanceof Error ? cause.message : "决定未提交")).finally(() => setDeciding(null));
   };
   const close = () => { void api.recordInteraction({ projectId: run.projectId, kind: "review-dismiss" }).catch(() => undefined); onClose(); };
+  const dialogRef = useRef<HTMLElement>(null);
+  useDialogKeyboard(dialogRef, close);
   return (
     <div className="modal-backdrop" role="presentation" onMouseDown={close}>
-      <section className="review-dialog" role="dialog" aria-modal="true" aria-label="审阅工作流产物" onMouseDown={(event) => event.stopPropagation()}>
+      <section ref={dialogRef} className="review-dialog" role="dialog" aria-modal="true" aria-label="审阅工作流产物" onMouseDown={(event) => event.stopPropagation()}>
         <header><div><p className="eyebrow">AUTHOR REVIEW · {nodeName}</p><h3>{pending.question}</h3></div><button className="icon-button" onClick={close} aria-label="关闭"><X size={16} /></button></header>
         <div className="review-body">
           <div className="review-summary"><Badge tone="green">{nodeName}</Badge><span>基础修订 · {run.baseRevisionId.slice(0, 12)}</span><span>{issues.filter(issue => issue.severity === "conflict").length} 个冲突 · {issues.filter(issue => issue.severity === "unknown").length} 个未知</span></div>

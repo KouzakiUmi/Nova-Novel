@@ -80,6 +80,7 @@ export interface WorldStateSnapshot {
   routeId: string;
   storyOrder: number | null;
   entries: WorldStateEntry[];
+  excluded: Array<{ reason: string; count: number }>;
 }
 
 interface EntityRow {
@@ -343,15 +344,19 @@ export function buildFtsQuery(input: string): string {
   return groups.join(" AND ");
 }
 
-/** 启发式：把 "day 2 09:00" / "第2天" 之类的故事时间折算为可比较的 story order。 */
+/** 启发式：把 "day 2 09:00" / "第2天" / 纯数字序号 "2" 之类的故事时间折算为可比较的 story order。 */
 export function parseStoryOrderFromTime(storyTime: string | undefined): number | undefined {
   if (!storyTime) return undefined;
   const dayMatch = /(?:day\s*|第\s*)(\d{1,4})/i.exec(storyTime);
   const timeMatch = /(\d{1,2}):(\d{2})/.exec(storyTime);
   const day = dayMatch?.[1] !== undefined ? Number(dayMatch[1]) : null;
+  if (day === null && timeMatch === null) {
+    // 作者可直接填故事时点序号（如 "1"、"2"）：按序号原值生效，不静默退化为 1。
+    const plain = /^\s*(\d{1,4})\s*$/.exec(storyTime);
+    return plain ? Number(plain[1]) : undefined;
+  }
   const hours = timeMatch?.[1] !== undefined ? Number(timeMatch[1]) : 0;
   const minutes = timeMatch?.[2] !== undefined ? Number(timeMatch[2]) : 0;
-  if (day === null && timeMatch === null) return undefined;
   return (day ?? 0) * 1440 + hours * 60 + minutes;
 }
 
@@ -439,10 +444,29 @@ export interface RegisterSceneArgs {
   bodyHash: string;
 }
 
-type EvidenceCheck = "ok" | "source_missing" | "out_of_story_order" | "out_of_narration_order" | "secret_hidden";
+type EvidenceCheck = "ok" | "source_missing" | "story_order_unknown" | "out_of_story_order" | "out_of_narration_order" | "secret_hidden";
+
+interface MentionEntry {
+  entityId: string;
+  aliases: string[];
+  secret: boolean;
+}
+
+interface RevisionIndexProgress {
+  expected: Set<string> | null;
+  completed: Map<string, { bodyHash: string; evidenceIds: string[] }>;
+  failed: Set<string>;
+}
+
+export interface KeywordIndexStatus {
+  state: "pending" | "error" | "ready";
+  keywordRevisionId: string;
+}
 
 export class SqliteKnowledgeService implements KnowledgeService {
   private readonly db: SqliteDatabase;
+  private readonly revisionIndexes = new Map<string, Map<string, RevisionIndexProgress>>();
+  private readonly lastKeywordRevisions = new Map<string, string>();
 
   constructor(db: SqliteDatabase) {
     this.db = db;
@@ -489,6 +513,10 @@ export class SqliteKnowledgeService implements KnowledgeService {
 
   addAlias(projectId: string, entityId: string, alias: string, kind: "name" | "alias" = "alias"): void {
     this.run("INSERT OR IGNORE INTO kw_aliases (project_id, entity_id, alias, kind) VALUES (?, ?, ?, ?)", projectId, entityId, alias, kind);
+  }
+
+  removeAlias(projectId: string, entityId: string, alias: string): void {
+    this.run("DELETE FROM kw_aliases WHERE project_id = ? AND entity_id = ? AND alias = ?", projectId, entityId, alias);
   }
 
   addFact(args: AddFactArgs): string {
@@ -552,9 +580,13 @@ export class SqliteKnowledgeService implements KnowledgeService {
   }
 
   addEvidence(args: AddEvidenceArgs): string {
+    return this.writeEvidence(args, this.loadMentions(args.projectId, args.routeId));
+  }
+
+  private writeEvidence(args: AddEvidenceArgs, mentions: MentionEntry[]): string {
     const evidenceId = args.evidenceId ?? newId("evd");
-    const entityRefs = this.resolveMentionIds(args.projectId, args.routeId, args.quote);
-    const secretRefs = this.filterSecretIds(args.projectId, entityRefs);
+    const entityRefs = this.matchMentions(mentions, args.quote);
+    const secretRefs = mentions.filter((entry) => entry.secret && entityRefs.includes(entry.entityId)).map((entry) => entry.entityId);
     this.run(
       `INSERT INTO kw_evidence (evidence_id, project_id, source_revision_id, scene_id, block_id, quote, content_hash,
          source_kind, route_id, narration_order, story_order, entity_refs, secret_refs)
@@ -605,11 +637,84 @@ export class SqliteKnowledgeService implements KnowledgeService {
 
   // ---------- 采用正文派生索引 ----------
 
+  /** 调用方须传入权威修订的完整场景清单；未声明清单的逐场索引不能证明修订完整。 */
+  beginRevisionIndex(projectId: string, revisionId: string, sceneIds: readonly string[]): void {
+    const indexes = this.revisionIndexes.get(projectId) ?? new Map<string, RevisionIndexProgress>();
+    indexes.set(revisionId, { expected: new Set(sceneIds), completed: new Map(), failed: new Set() });
+    this.revisionIndexes.set(projectId, indexes);
+  }
+
+  getIndexStatus(projectId: string, revisionId: string): KeywordIndexStatus {
+    const progress = this.revisionIndexes.get(projectId)?.get(revisionId);
+    let state: KeywordIndexStatus["state"] = progress?.failed.size ? "error" : "pending";
+    if (progress?.expected !== null && progress?.expected !== undefined && state !== "error") {
+      const refs = this.all<SceneRefRow>("SELECT * FROM kw_scene_refs WHERE project_id = ? AND revision_id = ?", projectId, revisionId);
+      const rows = this.all<{ evidence_id: string; scene_id: string; route_id: string }>(
+        "SELECT evidence_id, scene_id, route_id FROM kw_evidence WHERE project_id = ? AND source_revision_id = ? AND source_kind = 'manuscript'", projectId, revisionId,
+      );
+      const indexed = new Map<string, string[]>();
+      for (const row of this.all<{ ref_id: string; route_id: string }>("SELECT ref_id, route_id FROM kw_fts WHERE project_id = ? AND ref_type = 'evidence'", projectId)) {
+        const routes = indexed.get(row.ref_id) ?? [];
+        routes.push(row.route_id);
+        indexed.set(row.ref_id, routes);
+      }
+      const refsByScene = new Map(refs.map((ref) => [ref.scene_id, ref]));
+      const rowsByScene = new Map<string, typeof rows>();
+      for (const row of rows) {
+        const sceneRows = rowsByScene.get(row.scene_id) ?? [];
+        sceneRows.push(row);
+        rowsByScene.set(row.scene_id, sceneRows);
+      }
+      const complete = refs.length === progress.expected.size && rows.every((row) => progress.expected?.has(row.scene_id)) && [...progress.expected].every((sceneId) => {
+        const saved = progress.completed.get(sceneId);
+        if (!saved) return false;
+        const ref = refsByScene.get(sceneId);
+        if (!ref || ref.body_hash !== saved.bodyHash) return false;
+        const sceneRows = rowsByScene.get(sceneId) ?? [];
+        const ids = new Set(saved.evidenceIds);
+        return sceneRows.length === ids.size && sceneRows.every((row) => row.route_id === ref.route_id && ids.has(row.evidence_id) && indexed.get(row.evidence_id)?.length === 1 && indexed.get(row.evidence_id)?.[0] === row.route_id);
+      });
+      if (complete) state = "ready";
+    }
+    if (state === "ready") this.lastKeywordRevisions.set(projectId, revisionId);
+    const previous = this.lastKeywordRevisions.get(projectId);
+    return { state, keywordRevisionId: state === "ready" ? revisionId : previous !== revisionId && previous !== undefined ? previous : `${state}:${revisionId}` };
+  }
+
   /** 把当前采用正文分块写入派生 FTS 与 manuscript 证据；不改写任何权威事实。幂等：重跑替换旧派生行。 */
   indexScene(scene: Scene, revisionId: string): void {
+    const indexes = this.revisionIndexes.get(scene.projectId) ?? new Map<string, RevisionIndexProgress>();
+    const progress = indexes.get(revisionId) ?? { expected: null, completed: new Map<string, { bodyHash: string; evidenceIds: string[] }>(), failed: new Set<string>() };
+    indexes.set(revisionId, progress);
+    this.revisionIndexes.set(scene.projectId, indexes);
+    const savepoint = newId("kw_scene");
+    let opened = false;
+    try {
+      this.db.exec(`SAVEPOINT ${savepoint}`);
+      opened = true;
+      const evidenceIds = this.writeSceneIndex(scene, revisionId);
+      this.db.exec(`RELEASE SAVEPOINT ${savepoint}`);
+      progress.completed.set(scene.sceneId, { bodyHash: sha256(scene.body), evidenceIds });
+      progress.failed.delete(scene.sceneId);
+    } catch (error) {
+      progress.failed.add(scene.sceneId);
+      if (opened) {
+        try {
+          this.db.exec(`ROLLBACK TO SAVEPOINT ${savepoint}`);
+          this.db.exec(`RELEASE SAVEPOINT ${savepoint}`);
+        } catch (rollbackError) {
+          throw new AggregateError([error, rollbackError], "场景索引失败，回滚时发生错误");
+        }
+      }
+      throw error;
+    }
+  }
+
+  private writeSceneIndex(scene: Scene, revisionId: string): string[] {
+    const mentions = this.loadMentions(scene.projectId, scene.routeId);
     const existing = this.get<{ story_order: number | null }>(
-      "SELECT story_order FROM kw_scene_refs WHERE revision_id = ? AND scene_id = ?",
-      revisionId, scene.sceneId,
+      "SELECT story_order FROM kw_scene_refs WHERE project_id = ? AND revision_id = ? AND scene_id = ? AND route_id = ?",
+      scene.projectId, revisionId, scene.sceneId, scene.routeId,
     );
     const storyOrder: number | undefined = existing?.story_order ?? parseStoryOrderFromTime(scene.storyTime);
     this.registerScene({
@@ -625,8 +730,8 @@ export class SqliteKnowledgeService implements KnowledgeService {
       bodyHash: sha256(scene.body),
     });
     const oldRows = this.all<{ evidence_id: string }>(
-      "SELECT evidence_id FROM kw_evidence WHERE scene_id = ? AND source_revision_id = ? AND source_kind = 'manuscript'",
-      scene.sceneId, revisionId,
+      "SELECT evidence_id FROM kw_evidence WHERE project_id = ? AND scene_id = ? AND source_revision_id = ? AND source_kind = 'manuscript'",
+      scene.projectId, scene.sceneId, revisionId,
     );
     for (const row of oldRows) {
       this.run("DELETE FROM kw_fts WHERE rowid IN (SELECT rowid FROM kw_fts WHERE ref_type = 'evidence' AND ref_id = ?)", row.evidence_id);
@@ -634,10 +739,11 @@ export class SqliteKnowledgeService implements KnowledgeService {
     }
     const blocks = scene.body.split(/\n{2,}/).map((b) => b.trim()).filter((b) => b.length > 0);
     const effectiveBlocks = blocks.length > 0 ? blocks : scene.body.trim().length > 0 ? [scene.body.trim()] : [];
+    const evidenceIds: string[] = [];
     let index = 0;
     for (const block of effectiveBlocks) {
       index += 1;
-      this.addEvidence({
+      evidenceIds.push(this.writeEvidence({
         evidenceId: `evidence_${createHash("sha256").update(`${scene.projectId}:${revisionId}:${scene.sceneId}:${scene.sceneId}_b${index}:${block}`).digest("hex").slice(0, 24)}`,
         projectId: scene.projectId,
         sourceRevisionId: revisionId,
@@ -648,8 +754,9 @@ export class SqliteKnowledgeService implements KnowledgeService {
         routeId: scene.routeId,
         narrationOrder: scene.narrationOrder,
         storyOrder,
-      });
+      }, mentions));
     }
+    return evidenceIds;
   }
 
   /** 从 kw_evidence 全量重建派生 FTS（索引可丢弃重建，权威层不受影响）。 */
@@ -662,6 +769,35 @@ export class SqliteKnowledgeService implements KnowledgeService {
         row.evidence_id, row.project_id, row.route_id, tokenizeForFts(row.quote),
       );
     }
+  }
+
+  /**
+   * 从权威修订正文重建派生证据与 FTS，用于索引损坏或丢失后的恢复。
+   * 只清理该作品该修订的派生行，权威事实与历史修订不受影响。
+   */
+  rebuildRevisionIndex(projectId: string, revisionId: string, scenes: readonly Scene[]): KeywordIndexStatus {
+    this.beginRevisionIndex(projectId, revisionId, scenes.map(scene => scene.sceneId));
+    const owned = scenes.filter(scene => scene.projectId === projectId);
+    if (owned.length !== scenes.length) throw new KnowledgeIndexError("修订中的场景不属于此作品");
+    const placeholders = owned.map(() => "?").join(",");
+    if (owned.length > 0) {
+      const staleEvidence = this.all<{ evidence_id: string }>(
+        `SELECT evidence_id FROM kw_evidence WHERE project_id = ? AND source_revision_id = ? AND source_kind = 'manuscript'
+         AND (scene_id IS NULL OR scene_id NOT IN (${placeholders}))`,
+        projectId, revisionId, ...owned.map(scene => scene.sceneId),
+      );
+      for (const row of staleEvidence) this.dropEvidence(row.evidence_id);
+    }
+    for (const scene of owned) {
+      // 逐场已使用 SAVEPOINT；失败场景保持 error，不会留下半成品证据。
+      this.indexScene(scene, revisionId);
+    }
+    return this.getIndexStatus(projectId, revisionId);
+  }
+
+  private dropEvidence(evidenceId: string): void {
+    this.run("DELETE FROM kw_fts WHERE rowid IN (SELECT rowid FROM kw_fts WHERE ref_type = 'evidence' AND ref_id = ?)", evidenceId);
+    this.run("DELETE FROM kw_evidence WHERE evidence_id = ?", evidenceId);
   }
 
   // ---------- 实体与别名 ----------
@@ -771,46 +907,68 @@ export class SqliteKnowledgeService implements KnowledgeService {
 
   // ---------- 提及解析与知识边界 ----------
 
-  private resolveMentionIds(projectId: string, routeId: string, text: string): string[] {
-    const ids: string[] = [];
-    const entities = this.all<EntityRow>("SELECT * FROM kw_entities WHERE project_id = ? AND route_id = ?", projectId, routeId);
-    for (const entity of entities) {
-      const aliases = this.all<{ alias: string }>("SELECT alias FROM kw_aliases WHERE entity_id = ?", entity.entity_id);
-      if (aliases.some((a) => a.alias.length > 0 && text.includes(a.alias))) ids.push(entity.entity_id);
+  private loadMentions(projectId: string, routeId: string): MentionEntry[] {
+    const rows = this.all<{ entity_id: string; type: string; alias: string | null }>(
+      `SELECT e.entity_id, e.type, a.alias FROM kw_entities e LEFT JOIN kw_aliases a ON a.entity_id = e.entity_id
+       WHERE e.project_id = ? AND e.route_id = ? ORDER BY e.rowid, a.alias`, projectId, routeId,
+    );
+    const entries = new Map<string, MentionEntry>();
+    for (const row of rows) {
+      const entry = entries.get(row.entity_id) ?? { entityId: row.entity_id, aliases: [], secret: row.type === "secret" };
+      if (row.alias !== null) entry.aliases.push(row.alias);
+      entries.set(row.entity_id, entry);
     }
-    return ids;
+    return [...entries.values()];
   }
 
-  private filterSecretIds(projectId: string, entityIds: string[]): string[] {
-    if (entityIds.length === 0) return [];
-    const rows = this.all<{ entity_id: string }>(
-      `SELECT entity_id FROM kw_entities WHERE project_id = ? AND type = 'secret' AND entity_id IN (${entityIds.map(() => "?").join(",")})`,
-      projectId, ...entityIds,
+  private matchMentions(entries: MentionEntry[], text: string): string[] {
+    return entries.filter((entry) => entry.aliases.some((alias) => alias.length > 0 && text.includes(alias))).map((entry) => entry.entityId);
+  }
+
+  private resolveMentionIds(projectId: string, routeId: string, text: string): string[] {
+    return this.matchMentions(this.loadMentions(projectId, routeId), text);
+  }
+
+  private factActiveAt(row: FactRow, storyOrder: number | null): boolean {
+    if (storyOrder === null) return row.valid_from_order === null && row.valid_to_order === null;
+    return (row.valid_from_order === null || storyOrder >= row.valid_from_order) &&
+      (row.valid_to_order === null || storyOrder < row.valid_to_order);
+  }
+
+  private evidenceSourceCheck(row: EvidenceRow, projectId: string, routeId: string, revisionId: string | undefined, storyOrder: number | null, narrationOrder: number | null = null): EvidenceCheck {
+    if (row.project_id !== projectId || row.route_id !== routeId || row.source_kind !== "manuscript" || revisionId === undefined || row.source_revision_id !== revisionId || row.scene_id === null) return "source_missing";
+    const ref = this.get<SceneRefRow>(
+      "SELECT * FROM kw_scene_refs WHERE project_id = ? AND route_id = ? AND revision_id = ? AND scene_id = ?", projectId, routeId, revisionId, row.scene_id,
     );
-    return rows.map((r) => r.entity_id);
+    if (!ref || sha256(row.quote) !== row.content_hash) return "source_missing";
+    if (row.story_order !== null && storyOrder === null) return "story_order_unknown";
+    if (row.story_order !== null && storyOrder !== null && row.story_order > storyOrder) return "out_of_story_order";
+    if (narrationOrder !== null && row.narration_order !== null && row.narration_order > narrationOrder) return "out_of_narration_order";
+    return "ok";
+  }
+
+  private factSourceValid(row: FactRow, revisionId: string | undefined, storyOrder: number | null): boolean {
+    if (row.source_kind === "author_setting") return true;
+    if (row.source_kind !== "manuscript") return false;
+    return parseJsonArray(row.evidence_ids).some((id) => {
+      const evidence = this.get<EvidenceRow>("SELECT * FROM kw_evidence WHERE evidence_id = ?", id);
+      return evidence !== undefined && this.evidenceSourceCheck(evidence, row.project_id, row.route_id, revisionId, storyOrder) === "ok";
+    });
   }
 
   private secretVisibleTo(
     projectId: string, routeId: string, secretId: string,
-    pov: string | undefined, storyOrder: number | null, purpose: ContextQuery["purpose"],
+    pov: string | undefined, storyOrder: number | null, purpose: ContextQuery["purpose"], revisionId?: string,
   ): boolean {
     if (purpose === "planning") return true; // 总体规划允许全知设定，由上层标注分区
-    if (pov !== undefined) {
-      const holders = this.all<{ value_entity_id: string }>(
-        `SELECT value_entity_id FROM kw_facts WHERE project_id = ? AND route_id = ? AND subject_id = ?
-         AND predicate = 'known_by' AND semantic_type = 'world_fact' AND review_state = 'confirmed' AND value_entity_id IS NOT NULL`,
-        projectId, routeId, secretId,
-      );
-      if (holders.some((h) => h.value_entity_id === pov)) return true;
-    }
-    const reveal = this.get<{ valid_from_order: number | null }>(
-      `SELECT valid_from_order FROM kw_facts WHERE project_id = ? AND route_id = ? AND subject_id = ?
-       AND predicate = 'revealed' AND semantic_type = 'world_fact' AND review_state = 'confirmed'
-       AND valid_from_order IS NOT NULL LIMIT 1`,
+    const permissions = this.all<FactRow>(
+      `SELECT * FROM kw_facts WHERE project_id = ? AND route_id = ? AND subject_id = ?
+       AND predicate IN ('known_by', 'revealed') AND semantic_type = 'world_fact' AND review_state = 'confirmed'
+       ORDER BY valid_from_order, fact_id`,
       projectId, routeId, secretId,
     );
-    if (reveal?.valid_from_order != null && storyOrder != null && storyOrder >= reveal.valid_from_order) return true;
-    return false;
+    return permissions.some((row) => this.factActiveAt(row, storyOrder) && this.factSourceValid(row, revisionId, storyOrder) &&
+      (row.predicate === "known_by" ? pov !== undefined && row.value_entity_id === pov : storyOrder !== null && row.valid_from_order !== null));
   }
 
   private secretAliases(secretId: string): string[] {
@@ -829,8 +987,8 @@ export class SqliteKnowledgeService implements KnowledgeService {
   private eventAuthoritative(ev: EventRow, revisionId?: string): boolean {
     if (ev.scene_id === null || revisionId === undefined) return true;
     const ref = this.get<SceneRefRow>(
-      "SELECT scene_id FROM kw_scene_refs WHERE revision_id = ? AND scene_id = ?",
-      revisionId, ev.scene_id,
+      "SELECT scene_id FROM kw_scene_refs WHERE project_id = ? AND route_id = ? AND revision_id = ? AND scene_id = ?",
+      ev.project_id, ev.route_id, revisionId, ev.scene_id,
     );
     return ref !== undefined;
   }
@@ -838,21 +996,50 @@ export class SqliteKnowledgeService implements KnowledgeService {
   getWorldState(projectId: string, routeId: string, storyOrder?: number, revisionId?: string): WorldStateSnapshot {
     const order = storyOrder ?? null;
     const subjects = new Set<string>();
+    const unknownSubjects = new Set<string>();
+    const unknownEvidence = new Set<string>();
+    let factSourceMissing = 0;
+    let factStoryUnknown = 0;
     const factRows = this.all<FactRow>(
       "SELECT * FROM kw_facts WHERE project_id = ? AND route_id = ? AND review_state = 'confirmed' AND semantic_type IN ('world_fact', 'belief') AND source_kind != 'selected_plan'",
       projectId, routeId,
-    );
+    ).filter((row) => {
+      if (!this.factSourceValid(row, revisionId, order)) {
+        factSourceMissing += 1;
+        if (order === null && row.source_kind === "manuscript") {
+          let sourceTimeUnknown = false;
+          for (const id of parseJsonArray(row.evidence_ids)) {
+            const evidence = this.get<EvidenceRow>("SELECT * FROM kw_evidence WHERE evidence_id = ?", id);
+            if (evidence && this.evidenceSourceCheck(evidence, projectId, routeId, revisionId, order) === "story_order_unknown") {
+              unknownEvidence.add(id);
+              unknownSubjects.add(row.subject_id);
+              sourceTimeUnknown = true;
+            }
+          }
+          if (sourceTimeUnknown) factStoryUnknown += 1;
+        }
+        return false;
+      }
+      if (order === null && !this.factActiveAt(row, order)) {
+        factStoryUnknown += 1;
+        unknownSubjects.add(row.subject_id);
+      }
+      return true;
+    });
     const eventRows = this.all<EventRow>(
       "SELECT * FROM kw_world_events WHERE project_id = ? AND route_id = ? AND review_state = 'confirmed'",
       projectId, routeId,
     ).filter((e) => this.eventAuthoritative(e, revisionId));
     for (const f of factRows) subjects.add(f.subject_id);
     for (const e of eventRows) subjects.add(e.subject_id);
+    for (const subjectId of unknownSubjects) subjects.add(subjectId);
 
     const evidenceQuote = (evidenceId: string): string | null => {
       const row = this.get<EvidenceRow>("SELECT * FROM kw_evidence WHERE evidence_id = ?", evidenceId);
       if (!row) return null;
-      return sha256(row.quote) === row.content_hash ? row.quote : null;
+      const verdict = this.evidenceSourceCheck(row, projectId, routeId, revisionId, order);
+      if (verdict === "story_order_unknown") unknownEvidence.add(evidenceId);
+      return verdict === "ok" ? row.quote : null;
     };
 
     const entries: WorldStateEntry[] = [];
@@ -865,18 +1052,14 @@ export class SqliteKnowledgeService implements KnowledgeService {
         stateKnown: false,
         indeterminate: false,
         possessorCandidates: [],
-        timeUnknown: false,
+        timeUnknown: unknownSubjects.has(subjectId),
         quantity: null,
         beliefs: [],
         evidenceQuotes: [],
       };
       const applicableFacts = factRows.filter((f) => {
         if (f.subject_id !== subjectId) return false;
-        if (order != null) {
-          if (f.valid_from_order != null && order < f.valid_from_order) return false;
-          if (f.valid_to_order != null && order >= f.valid_to_order) return false;
-        }
-        return true;
+        return this.factActiveAt(f, order);
       });
       for (const fact of applicableFacts) {
         if (fact.semantic_type !== "world_fact") continue;
@@ -901,8 +1084,9 @@ export class SqliteKnowledgeService implements KnowledgeService {
       const subjectEvents = eventRows.filter((e) => e.subject_id === subjectId);
       const possessionEvents = subjectEvents.filter((e) => POSSESSION_EVENTS.has(e.kind));
       if (possessionEvents.some((e) => e.story_order == null)) entry.timeUnknown = true;
+      if (order === null && subjectEvents.length > 0) entry.timeUnknown = true;
       const ordered = subjectEvents
-        .filter((e) => e.story_order != null && (order == null || e.story_order <= order))
+        .filter((e) => e.story_order != null && order !== null && e.story_order <= order)
         .sort((a, b) => (a.story_order ?? 0) - (b.story_order ?? 0));
       let previousOrder: number | null = null;
       let group: EventRow[] = [];
@@ -966,7 +1150,13 @@ export class SqliteKnowledgeService implements KnowledgeService {
       entries.push(entry);
     }
     entries.sort((a, b) => a.subjectId.localeCompare(b.subjectId));
-    return { projectId, routeId, storyOrder: order, entries };
+    const excluded = [
+      { reason: "fact_source_not_in_revision", count: factSourceMissing },
+      { reason: "fact_story_order_unknown", count: factStoryUnknown },
+      { reason: "evidence_story_order_unknown", count: unknownEvidence.size },
+      { reason: "event_story_order_unknown", count: order === null ? eventRows.length : 0 },
+    ].filter((entry) => entry.count > 0);
+    return { projectId, routeId, storyOrder: order, entries, excluded };
   }
 
   private parseQuantity(fact: FactRow): WorldStateQuantity | null {
@@ -997,6 +1187,23 @@ export class SqliteKnowledgeService implements KnowledgeService {
     const storyOrder = query.storyOrder ?? null;
     const narrationOrder = query.narrationOrder ?? null;
     const pov = query.povEntityId;
+    const checkedEvidence = new Map<string, { row: EvidenceRow | undefined; verdict: EvidenceCheck }>();
+    const checkEvidence = (row: EvidenceRow): EvidenceCheck => {
+      const source = this.evidenceSourceCheck(row, query.projectId, query.routeId, query.revisionId, storyOrder, narrationOrder);
+      if (source !== "ok") return source;
+      for (const secretId of parseJsonArray(row.secret_refs)) {
+        if (!this.secretVisibleTo(query.projectId, query.routeId, secretId, pov, storyOrder, query.purpose, query.revisionId)) return "secret_hidden";
+      }
+      return "ok";
+    };
+    const readEvidence = (id: string) => {
+      const cached = checkedEvidence.get(id);
+      if (cached) return cached;
+      const row = this.get<EvidenceRow>("SELECT * FROM kw_evidence WHERE evidence_id = ?", id);
+      const result = { row, verdict: row ? checkEvidence(row) : "source_missing" as const };
+      checkedEvidence.set(id, result);
+      return result;
+    };
 
     // 结构化：已确认世界事实（计划不进事实；信念按持有者可见）
     const factRows = this.all<FactRow>(
@@ -1007,22 +1214,31 @@ export class SqliteKnowledgeService implements KnowledgeService {
       this.all<{ entity_id: string }>("SELECT entity_id FROM kw_entities WHERE project_id = ? AND type = 'secret'", query.projectId).map((r) => r.entity_id),
     );
     const facts: FactAssertion[] = [];
+    let factSourceMissing = 0;
+    let factStoryUnknown = 0;
     for (const row of factRows) {
       if (row.semantic_type === "plan" || row.semantic_type === "hypothesis") continue;
+      if (!this.factActiveAt(row, storyOrder)) {
+        if (storyOrder === null) factStoryUnknown += 1;
+        continue;
+      }
+      if (row.source_kind !== "author_setting" && (row.source_kind !== "manuscript" || !parseJsonArray(row.evidence_ids).some((id) => readEvidence(id).verdict === "ok"))) {
+        factSourceMissing += 1;
+        if (storyOrder === null && parseJsonArray(row.evidence_ids).some((id) => readEvidence(id).verdict === "story_order_unknown")) factStoryUnknown += 1;
+        continue;
+      }
       const isBeliefLike = row.semantic_type !== "world_fact";
       if (isBeliefLike) {
         const visibleToPov = pov !== undefined && row.holder_id === pov;
         if (!visibleToPov && query.purpose !== "planning") continue;
       }
-      if (secretIds.has(row.subject_id) && !this.secretVisibleTo(query.projectId, query.routeId, row.subject_id, pov, storyOrder, query.purpose)) {
+      if (secretIds.has(row.subject_id) && !this.secretVisibleTo(query.projectId, query.routeId, row.subject_id, pov, storyOrder, query.purpose, query.revisionId)) {
         continue;
-      }
-      if (storyOrder != null) {
-        if (row.valid_from_order != null && storyOrder < row.valid_from_order) continue;
-        if (row.valid_to_order != null && storyOrder >= row.valid_to_order) continue;
       }
       facts.push(this.toFact(row));
     }
+    pushExcluded("fact_source_not_in_revision", factSourceMissing);
+    pushExcluded("fact_story_order_unknown", factStoryUnknown);
 
     // 选定计划：按用途进入；事实核对与读者视角不采信
     const plansVisible = query.purpose === "planning" || query.purpose === "scene_writing";
@@ -1034,7 +1250,7 @@ export class SqliteKnowledgeService implements KnowledgeService {
       );
       for (const plan of planRows) {
         const hiddenSecret = [...secretIds].some((secretId) =>
-          !this.secretVisibleTo(query.projectId, query.routeId, secretId, pov, storyOrder, query.purpose) &&
+          !this.secretVisibleTo(query.projectId, query.routeId, secretId, pov, storyOrder, query.purpose, query.revisionId) &&
           this.secretAliases(secretId).some((alias) => plan.text.includes(alias)),
         );
         if (hiddenSecret) continue; // 选定计划不绕过知识边界
@@ -1072,39 +1288,18 @@ export class SqliteKnowledgeService implements KnowledgeService {
     const evidenceById = new Map<string, Evidence>();
     let sourceMissing = 0;
     let secretHidden = 0;
+    let evidenceStoryUnknown = 0;
     let outOfStory = 0;
     let outOfNarration = 0;
-    const checkEvidence = (row: EvidenceRow): EvidenceCheck => {
-      if (row.source_revision_id !== query.revisionId) return "source_missing";
-      if (row.scene_id !== null) {
-        const ref = this.get<SceneRefRow>(
-          "SELECT * FROM kw_scene_refs WHERE revision_id = ? AND scene_id = ?", query.revisionId, row.scene_id,
-        );
-        if (!ref) return "source_missing"; // 场景已删除或旧稿未清理：索引命中也不返回
-      }
-      if (sha256(row.quote) !== row.content_hash) return "source_missing";
-      if (storyOrder != null && row.story_order != null && row.story_order > storyOrder) return "out_of_story_order";
-      if (narrationOrder != null && row.narration_order != null && row.narration_order > narrationOrder) return "out_of_narration_order";
-      const secretRefs = parseJsonArray(row.secret_refs);
-      for (const secretId of secretRefs) {
-        if (!this.secretVisibleTo(query.projectId, query.routeId, secretId, pov, storyOrder, query.purpose)) return "secret_hidden";
-      }
-      return "ok";
-    };
-    const collectEvidence = (row: EvidenceRow | undefined) => {
-      if (!row) return;
-      if (evidenceById.has(row.evidence_id)) return;
-      const verdict = checkEvidence(row);
-      if (verdict === "ok") evidenceById.set(row.evidence_id, this.toEvidence(row));
-      else if (verdict === "source_missing") sourceMissing += 1;
-      else if (verdict === "secret_hidden") secretHidden += 1;
-      else if (verdict === "out_of_story_order") outOfStory += 1;
-      else outOfNarration += 1;
+    const collectEvidence = (id: string) => {
+      if (evidenceById.has(id)) return;
+      const { row, verdict } = readEvidence(id);
+      if (row && verdict === "ok") evidenceById.set(id, this.toEvidence(row));
     };
 
     for (const fact of facts) {
       for (const evidenceId of fact.evidenceIds) {
-        collectEvidence(this.get<EvidenceRow>("SELECT * FROM kw_evidence WHERE evidence_id = ?", evidenceId));
+        collectEvidence(evidenceId);
       }
     }
 
@@ -1115,14 +1310,22 @@ export class SqliteKnowledgeService implements KnowledgeService {
         ftsQuery, query.projectId, query.routeId,
       );
       for (const hit of hits) {
-        collectEvidence(this.get<EvidenceRow>("SELECT * FROM kw_evidence WHERE evidence_id = ?", hit.ref_id));
+        collectEvidence(hit.ref_id);
       }
     }
     const evidence = [...evidenceById.values()].sort((a, b) =>
       (a.storyOrder ?? Number.MAX_SAFE_INTEGER) - (b.storyOrder ?? Number.MAX_SAFE_INTEGER) ||
       (a.narrationOrder ?? Number.MAX_SAFE_INTEGER) - (b.narrationOrder ?? Number.MAX_SAFE_INTEGER));
 
+    for (const { verdict } of checkedEvidence.values()) {
+      if (verdict === "source_missing") sourceMissing += 1;
+      else if (verdict === "story_order_unknown") evidenceStoryUnknown += 1;
+      else if (verdict === "secret_hidden") secretHidden += 1;
+      else if (verdict === "out_of_story_order") outOfStory += 1;
+      else if (verdict === "out_of_narration_order") outOfNarration += 1;
+    }
     pushExcluded("evidence_source_missing", sourceMissing);
+    pushExcluded("evidence_story_order_unknown", evidenceStoryUnknown);
     pushExcluded("secret_not_visible_to_pov", secretHidden);
     pushExcluded("out_of_story_order_range", outOfStory);
     pushExcluded("out_of_narration_order_range", outOfNarration);
@@ -1130,6 +1333,8 @@ export class SqliteKnowledgeService implements KnowledgeService {
       excluded.push({ reason: "empty_knowledge_base", count: 1 });
     }
 
+    const indexStatus = this.getIndexStatus(query.projectId, query.revisionId);
+    if (indexStatus.state !== "ready") pushExcluded(`keyword_index_${indexStatus.state}`, 1);
     const bundle: ContextBundle = {
       snapshotId: newId("ctxsnap"),
       facts,
@@ -1137,7 +1342,7 @@ export class SqliteKnowledgeService implements KnowledgeService {
       selectedPlans,
       candidates,
       excluded,
-      indexState: { keywordRevisionId: query.revisionId, semanticState: "unconfigured" },
+      indexState: { keywordRevisionId: indexStatus.keywordRevisionId, semanticState: "unconfigured" },
     };
     return bundle;
   }
@@ -1155,10 +1360,10 @@ export class SqliteKnowledgeService implements KnowledgeService {
       const entity = this.getEntityRow(entityId);
       if (!entity) continue;
       if (entity.type === "item") {
-        const state = this.getWorldState(
+        const snapshot = this.getWorldState(
             scene.projectId, scene.routeId, storyOrder ?? undefined, scene.baseRevisionId,
-          )
-          .entries.find((e) => e.subjectId === entityId);
+          );
+        const state = snapshot.entries.find((e) => e.subjectId === entityId);
         if (!state) continue;
         if (state.indeterminate) {
           issues.push({
@@ -1172,11 +1377,13 @@ export class SqliteKnowledgeService implements KnowledgeService {
           continue;
         }
         if (state.timeUnknown) {
+          const count = (reason: string) => snapshot.excluded.find((entry) => entry.reason === reason)?.count ?? 0;
+          const excludedDetail = storyOrder === null ? `因故事时点未知，排除事实 ${count("fact_story_order_unknown")} 条、证据 ${count("evidence_story_order_unknown")} 条、事件 ${count("event_story_order_unknown")} 条。` : "";
           issues.push({
             issueId: newId("issue"),
             severity: "unknown",
-            title: `「${entity.name}」相关事件缺少故事时间或先后关系`,
-            detail: "存在未定时点的事件，无法判定候选正文中的使用是否成立；记为未知，不判错。",
+            title: `「${entity.name}」相关状态缺少可核对的故事时间或先后关系`,
+            detail: `${excludedDetail}无法判定候选正文中的使用是否成立；请补充故事时间或先后关系。`,
             evidence: state.evidenceQuotes,
             certainty: "possible",
           });
@@ -1203,15 +1410,15 @@ export class SqliteKnowledgeService implements KnowledgeService {
           });
         }
       } else if (entity.type === "secret") {
-        const visible = this.secretVisibleTo(scene.projectId, scene.routeId, entityId, scene.pov, storyOrder, "scene_writing");
+        const visible = this.secretVisibleTo(scene.projectId, scene.routeId, entityId, scene.pov, storyOrder, "scene_writing", scene.baseRevisionId);
         if (!visible) {
           issues.push({
             issueId: newId("issue"),
-            severity: "conflict",
-            title: `候选正文引用了该视角尚不知晓的秘密「${entity.name}」`,
-            detail: "POV 未获知该秘密且尚未揭示；写入正文会泄漏知识边界外的信息。",
+            severity: storyOrder === null ? "unknown" : "conflict",
+            title: storyOrder === null ? `秘密「${entity.name}」缺少可核对的故事时点` : `候选正文引用了该视角尚不知晓的秘密「${entity.name}」`,
+            detail: storyOrder === null ? "故事时点未知，无法确认视角是否已获知秘密；请补充故事时间后核对。" : "POV 未获知该秘密且尚未揭示；写入正文会泄漏知识边界外的信息。",
             evidence: [],
-            certainty: "confirmed",
+            certainty: storyOrder === null ? "possible" : "confirmed",
           });
         }
       }
@@ -1247,11 +1454,11 @@ export class SqliteKnowledgeService implements KnowledgeService {
 
   private resolveSceneStoryOrder(scene: Scene): number | null {
     const ref = this.get<{ story_order: number | null }>(
-      "SELECT story_order FROM kw_scene_refs WHERE scene_id = ? AND story_order IS NOT NULL ORDER BY rowid DESC LIMIT 1",
-      scene.sceneId,
+      "SELECT story_order FROM kw_scene_refs WHERE project_id = ? AND route_id = ? AND revision_id = ? AND scene_id = ? AND story_order IS NOT NULL",
+      scene.projectId, scene.routeId, scene.baseRevisionId, scene.sceneId,
     );
     if (ref?.story_order != null) return ref.story_order;
-    return parseStoryOrderFromTime(scene.storyTime) ?? scene.narrationOrder;
+    return parseStoryOrderFromTime(scene.storyTime) ?? null;
   }
 
   // ---------- 示例数据（黄铜钥匙） ----------

@@ -8,7 +8,7 @@ import { DomainError } from "../domain.js";
 import { AgentSettings, secretOf } from "./settings.js";
 import { AgentUsageService } from "./usage.js";
 import type { VolcengineService } from "./volcengine/service.js";
-import { composePrompt, NOVEL_SYSTEM_PROMPT, parseOutput } from "./prompts.js";
+import { checkPromptBudget, NOVEL_SYSTEM_PROMPT, parseOutput } from "./prompts.js";
 import { novelTools, type WorkflowCatalog } from "./tools.js";
 
 export function novelResourceLoader(): ResourceLoader {
@@ -49,8 +49,20 @@ export class EmbeddedAgentHost implements PiHost {
     let timer: NodeJS.Timeout | undefined;
     let sessionId: string | undefined;
     let disposeTools: (() => void) | undefined;
+    let timedOut = false;
+    const partial = (failureReason: NonNullable<PiGenerationResult["failureReason"]>, error: string, text = run.progress.text): PiGenerationResult => ({ output, text, completeness: "partial", failureReason, error: this.settings.redact(error), ...(sessionId ? { sessionId } : {}) });
+    const providerError = (detail: string): string => {
+      const safe = this.settings.redact(detail);
+      if (/context.{0,30}(length|window|limit)|maximum.{0,20}(context|token)|上下文/i.test(safe)) return "模型服务错误：上下文超出服务窗口，请减少资料或选择更大窗口模型后重试";
+      if (/401|unauthori[sz]ed|invalid.{0,20}(api.?key|credential)|authentication/i.test(safe)) return "模型服务错误：鉴权失败（401），请检查 API Key 或重新登录";
+      if (/403|forbidden/i.test(safe)) return "模型服务错误：访问被拒绝（403），请检查模型权限与服务配置";
+      if (/429|rate.?limit|quota|余额|额度/i.test(safe)) return "模型服务错误：请求限流或额度不足（429），请检查额度并稍后重试";
+      if (/content.?filter|safety|moderation/i.test(safe)) return "模型服务错误：内容被服务过滤，请调整本次输入后重试";
+      if (/timeout|timed.?out|超时/i.test(safe)) return "模型服务错误：服务响应超时，请稍后重试或更换服务";
+      return "模型服务错误：请求失败，请检查服务地址、模型配置或稍后重试";
+    };
     try {
-      if (run.cancelled) return { output, text: "", completeness: "partial" };
+      if (run.cancelled) return partial("cancelled", "作者已取消生成，可重新发起任务", "");
       // Keep this runtime/model pair even if provider settings change while the task is in flight.
       const runtime = this.settings.runtime;
       const route = this.settings.route(request.kind);
@@ -62,6 +74,7 @@ export class EmbeddedAgentHost implements PiHost {
       const toolScope = novelTools(this.store, this.knowledge, task.taskId, this.workflowCatalog);
       disposeTools = toolScope.dispose;
       const tools = toolScope.tools;
+      const prompt = checkPromptBudget(request, frozen, toolScope.isVisible, model, tools.map(tool => ({ name: tool.name, description: tool.description, parameters: tool.parameters })));
       const cwd = resolve(this.settings.agentDir, "workspace");
       const sessionDir = resolve(this.settings.agentDir, "sessions", request.projectId);
       mkdirSync(sessionDir, { recursive: true });
@@ -69,42 +82,51 @@ export class EmbeddedAgentHost implements PiHost {
       sessionId = manager.getSessionId();
       const { session } = await createAgentSession({ cwd, agentDir: this.settings.agentDir, model, thinkingLevel: route.thinkingLevel, modelRuntime: runtime, resourceLoader: novelResourceLoader(), noTools: "builtin", tools: ["novel_*"], customTools: tools, sessionManager: manager, settingsManager: SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: true, maxRetries: 1 } }) });
       run.session = session;
-      if (run.cancelled) return { output, text: "", completeness: "partial", sessionId };
+      if (run.cancelled) return partial("cancelled", "作者已取消生成，可重新发起任务", "");
       let settled = false;
       let interrupted = false;
       let toolError = false;
       let stopReason: string | undefined;
+      let errorMessage = "";
+      let finalText = "";
       let currentText = "";
       session.subscribe(event => {
-        if (event.type === "message_start" && event.message.role === "assistant") currentText = "";
+        if (event.type === "message_start" && event.message.role === "assistant") { currentText = ""; finalText = ""; run.progress.text = ""; stopReason = undefined; errorMessage = ""; }
         if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") { currentText += event.assistantMessageEvent.delta; run.progress.text = currentText; }
         if (event.type === "message_end" && event.message.role === "assistant") {
           const authoritative = event.message.content.filter(block => block.type === "text").map(block => block.text).join("\n");
-          if (authoritative) run.progress.text = authoritative;
+          finalText = authoritative;
+          run.progress.text = authoritative;
           stopReason = event.message.stopReason;
+          errorMessage = event.message.errorMessage ?? "";
         }
         if (event.type === "tool_execution_start") run.progress.tools.push(event.toolName);
         if (event.type === "tool_execution_end" && event.isError) toolError = true;
         if (event.type === "agent_settled") { settled = true; interrupted = event.aborted; }
       });
-      timer = setTimeout(() => { run.cancelled = true; void session.abort(); }, 600_000);
-      await session.prompt(composePrompt(request, frozen, toolScope.isVisible));
-      const text = session.getLastAssistantText() || run.progress.text;
-      if (run.cancelled || interrupted || !settled || toolError || ["length", "error", "aborted", "deferred"].includes(stopReason ?? "")) {
-        return { output, text, completeness: "partial", sessionId };
-      }
-      const result = parseOutput(request.kind, text);
+      timer = setTimeout(() => { timedOut = true; void session.abort(); }, 600_000);
+      await session.prompt(prompt);
+      const text = finalText;
+      if (timedOut) return partial("timeout", "生成超时（10 分钟），请减少本次生成范围或更换服务后重试");
+      if (run.cancelled) return partial("cancelled", "作者已取消生成，可重新发起任务");
+      if (toolError) return partial("tool_error", "资料工具调用失败，可能超出任务可见范围；请检查场景与资料范围后重试", text);
+      if (stopReason === "length") return partial("truncated", "模型输出达到长度上限，产物尚未完成；请缩小本次生成范围或调整输出上限后重试", text);
+      if (stopReason === "error") return partial("provider_error", providerError(errorMessage), text);
+      if (!text.trim()) return partial("empty_output", "模型末轮未返回可用正文（思考内容不作为成稿），请重试或更换模型", "");
+      if (interrupted || !settled || stopReason !== "stop") return partial("incomplete_response", "模型回合未正常结束，产物尚未完成；请重试或更换服务", text);
+      const result = parseOutput(request.kind, text, request.input);
       if (result.report && frozen.novel?.scene) {
         const issues = [...localIssues.map(({ severity, title, detail, evidence }) => ({ severity, title, detail, evidence })), ...result.report.issues];
         result.report.issues = issues.filter((issue, index) => issues.findIndex(item => item.title === issue.title && item.detail === issue.detail) === index);
       }
       return { ...result, completeness: "complete", sessionId, ...(manager.getLeafId() ? { leafId: manager.getLeafId()! } : {}) };
     } catch (error) {
-      if (run.cancelled) return { output, text: run.progress.text, completeness: "partial", ...(sessionId ? { sessionId } : {}) };
-      const message = error instanceof DomainError ? error.message : "模型生成失败，请检查服务配置或稍后重试";
-      if (!(error instanceof DomainError)) console.warn("Nova Novel generation failed:", this.settings.redact(error instanceof Error ? `${error.name}: ${error.message}` : String(error)));
-      this.store.preserveFailedOutput(task.taskId, { output, text: run.progress.text, ...(sessionId ? { sessionId } : {}) }, message);
-      throw error instanceof DomainError ? error : new DomainError(502, "AGENT_GENERATION_FAILED", message);
+      if (timedOut) return partial("timeout", "生成超时（10 分钟），请减少本次生成范围或更换服务后重试");
+      if (run.cancelled) return partial("cancelled", "作者已取消生成，可重新发起任务");
+      const message = this.settings.redact(error instanceof DomainError ? error.message : providerError(error instanceof Error ? error.message : String(error)));
+      const failureReason = error instanceof DomainError && error.code === "AGENT_CONTEXT_OVERFLOW" ? "context_overflow" : error instanceof DomainError && error.code === "INVALID_AGENT_OUTPUT" ? "invalid_output" : "provider_error";
+      this.store.preserveFailedOutput(task.taskId, partial(failureReason, message), message);
+      throw new DomainError(error instanceof DomainError ? error.status : 502, error instanceof DomainError ? error.code : "AGENT_GENERATION_FAILED", message);
     } finally {
       if (timer) clearTimeout(timer);
       try { run.session?.dispose(); }

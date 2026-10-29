@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 import { readAppearanceSettings, writeAppearanceSettings } from "./appearance.js";
 import { timingSafeEqual } from "node:crypto";
 import type {
-  ContextQuery, GenerationRequest, IdeaCardFields, SelectionAction, WorkspaceSnapshot, ProviderUpsert, TaskRoute, WorkflowDefinition, SceneAnnotation, AuthoringEvent,
+  ContextQuery, Entity, FactAssertion, GenerationRequest, IdeaCardFields, SelectionAction, WorkspaceSnapshot, ProviderUpsert, TaskRoute, WorkflowDefinition, SceneAnnotation, AuthoringEvent, ElementDesignCard, PlotIdeateMode, SceneProposalCard, NoteIncubateTarget, ExtractedElementProposal, ExtractedFactProposal, ExtractedEventProposal,
 } from "@nova-novel/shared";
 import type { KnowledgeService, PiHost, WorkflowService } from "./contracts.js";
 import { DomainError, EXAMPLE_IDEAS, requiredString, versionNumber } from "./domain.js";
@@ -12,9 +12,10 @@ import { newId, stableHash } from "./utils.js";
 import { parseStoryOrderFromTime } from "./knowledge/index.js";
 import type { GuidedOutlineService } from "./guide.js";
 import type { GuidedWorkflowService } from "./workflow-guide.js";
+import { CreativeAssistService, ElementGuideService } from "./assist.js";
 import { exportBackup, exportMarkdown, parseBackup, parseManuscript } from "./transfer.js";
 
-export interface AppServices { store: DomainStore; knowledge: KnowledgeService; workflow: WorkflowService; pi: PiHost; guide?: GuidedOutlineService; workflowGuide?: GuidedWorkflowService }
+export interface AppServices { store: DomainStore; knowledge: KnowledgeService; workflow: WorkflowService; pi: PiHost; guide?: GuidedOutlineService; workflowGuide?: GuidedWorkflowService; elementGuide?: ElementGuideService; assist?: CreativeAssistService }
 const MAX_BODY_BYTES = 1_048_576;
 type Body = Record<string, unknown>;
 
@@ -83,13 +84,16 @@ function piIdeas(text: string): IdeaCardFields[] {
   });
 }
 
-export function createApp({ store, knowledge, workflow, pi, guide, workflowGuide }: AppServices) {
+export function createApp({ store, knowledge, workflow, pi, guide, workflowGuide, elementGuide: providedElementGuide, assist: providedAssist }: AppServices) {
+  const assist = providedAssist ?? new CreativeAssistService(store.db, store, knowledge, pi);
+  const elementGuide = providedElementGuide ?? new ElementGuideService(store.db, store, knowledge, pi, assist);
   const appearanceDir = pi.settings?.view().dataDir ?? process.env.NOVA_NOVEL_DATA_DIR ?? resolve(process.cwd(), "data");
   function snapshot(projectId?: string): WorkspaceSnapshot {
     const project = store.getProject(projectId);
     const branch = store.getBranch(project.activeBranchId);
     const guided = guide?.current(project.projectId);
     const guidedWorkflow = workflowGuide?.current(project.projectId);
+    const guidedElement = elementGuide?.current(project.projectId);
     return {
       projects: store.listProjects(), archivedProjects: store.listProjects(true).filter(item => item.archivedAt), activeProject: project, branches: store.listBranches(project.projectId), routes: store.listRoutes(project.projectId),
       chapters: store.listChapters(project.projectId, branch.headRevisionId), scenes: store.listScenes(project.projectId, branch.headRevisionId), notes: store.listNotes(project.projectId), annotations: store.listAnnotations(project.projectId), characterArcs: store.listCharacterArcs(project.projectId),
@@ -99,6 +103,7 @@ export function createApp({ store, knowledge, workflow, pi, guide, workflowGuide
       storyGraph: store.getStoryGraph(project.projectId, branch.headRevisionId), tasks: store.listTasks(project.projectId), connection: pi.getConnection(),
       ...(guided ? { guide: guided } : {}),
       ...(guidedWorkflow ? { workflowGuide: guidedWorkflow } : {}),
+      ...(guidedElement ? { elementGuide: guidedElement } : {}),
     };
   }
   function queryFor(request: GenerationRequest): ContextQuery {
@@ -111,7 +116,11 @@ export function createApp({ store, knowledge, workflow, pi, guide, workflowGuide
   }
   function indexRevision(projectId: string, revisionId: string): void {
     // Indexing is derived: a failed rebuild must not undo a durable author save.
-    for (const scene of store.listScenes(projectId, revisionId)) {
+    const scenes = store.listScenes(projectId, revisionId);
+    // 先声明完整清单，索引状态只有在全部场景成功后才会变成 ready。
+    try { knowledge.beginRevisionIndex?.(projectId, revisionId, scenes.map(scene => scene.sceneId)); }
+    catch (error) { console.warn("Nova Novel index begin failed", error instanceof Error ? error.name : "IndexError"); }
+    for (const scene of scenes) {
       try { knowledge.indexScene(scene, revisionId); }
       catch (error) { console.warn("Nova Novel index pending", error instanceof Error ? error.name : "IndexError"); }
     }
@@ -153,6 +162,13 @@ export function createApp({ store, knowledge, workflow, pi, guide, workflowGuide
     if (path === "/api/events" && method === "GET" && url.searchParams.has("projectId")) { json(response, 200, { events: store.listInteractionEvents(requiredString(url.searchParams.get("projectId"), "projectId"), Number(url.searchParams.get("cursor") ?? 0), Number(url.searchParams.get("limit") ?? 200)) }); return; }
     if (path === "/api/events/export" && method === "GET") { const projectId = requiredString(url.searchParams.get("projectId"), "projectId"); response.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Content-Disposition": `attachment; filename="nova-novel-interactions-${projectId}.json"`, "Cache-Control": "no-store" }); response.end(JSON.stringify({ format: "nova-novel-interactions/1", events: store.listAllInteractionEvents(projectId) }, null, 2)); return; }
     if (path === "/api/notes" && method === "GET") { json(response, 200, { notes: store.listNotes(requiredString(url.searchParams.get("projectId"), "projectId")) }); return; }
+    if (path === "/api/knowledge/index-status" && method === "GET") {
+      const projectId = requiredString(url.searchParams.get("projectId"), "projectId");
+      const revisionId = requiredString(url.searchParams.get("revisionId"), "revisionId");
+      store.getProject(projectId);
+      if (!knowledge.getIndexStatus) throw new DomainError(503, "INDEX_STATUS_UNAVAILABLE", "当前知识服务不支持索引状态查询");
+      json(response, 200, knowledge.getIndexStatus(projectId, revisionId)); return;
+    }
     if (path === "/api/annotations" && method === "GET") { json(response, 200, { annotations: store.listAnnotations(requiredString(url.searchParams.get("projectId"), "projectId"), url.searchParams.get("sceneId") ?? undefined) }); return; }
     if (path === "/api/character-arcs" && method === "GET") { const entityId = url.searchParams.get("entityId"); json(response, 200, { arcs: entityId ? [store.getCharacterArc(entityId)] : store.listCharacterArcs(requiredString(url.searchParams.get("projectId"), "projectId")) }); return; }
     if (method === "GET" && path === "/api/agent/settings" && pi.settings) { json(response, 200, pi.settings.view()); return; }
@@ -216,6 +232,280 @@ export function createApp({ store, knowledge, workflow, pi, guide, workflowGuide
     if (path === "/api/annotations" && method === "POST") { const created = store.createAnnotation({ projectId: requiredString(input.projectId, "projectId"), sceneId: requiredString(input.sceneId, "sceneId"), kind: input.kind as "comment" | "question" | "todo", body: requiredString(input.body, "body", 20_000), ...(input.range && typeof input.range === "object" ? { range: input.range as SceneAnnotation["range"] } : {}) }); json(response, 201, { annotation: created }); return; }
     const annotationRoute = path.match(/^\/api\/annotations\/([^/]+)$/);
     if (annotationRoute && method === "PATCH") { json(response, 200, { annotation: store.updateAnnotation(annotationRoute[1]!, { ...(typeof input.body === "string" ? { body: input.body } : {}), ...(typeof input.status === "string" ? { status: input.status as "open" | "resolved" } : {}) }) }); return; }
+    // 作者录入元素：与既有元素同一张表，来源标记为作者设定并默认已确认。
+    if (path === "/api/elements" && method === "POST") {
+      const projectId = requiredString(input.projectId, "projectId");
+      const project = store.getProject(projectId);
+      if (!knowledge.addEntity) throw new DomainError(503, "ELEMENTS_UNAVAILABLE", "当前知识服务不支持元素写入");
+      const type = requiredString(input.type, "type", 40);
+      if (!["character", "item", "location", "organization", "ability", "rule", "event", "secret", "custom"].includes(type)) throw new DomainError(400, "INVALID_INPUT", "元素类型无效");
+      const routeId = typeof input.routeId === "string" ? requiredString(input.routeId, "routeId") : project.activeRouteId;
+      if (!store.listRoutes(projectId).some(route => route.routeId === routeId)) throw new DomainError(400, "SCOPE_MISMATCH", "故事路线不属于此作品");
+      const entityId = knowledge.addEntity({
+        projectId, type: type as Entity["type"], name: requiredString(input.name, "name", 200),
+        summary: typeof input.summary === "string" ? input.summary.slice(0, 20_000) : "",
+        routeId, sourceKind: "author_setting", reviewState: "confirmed",
+        ...(input.unique === true ? { unique: true } : {}),
+      });
+      const aliases = Array.isArray(input.aliases) ? input.aliases.map(alias => requiredString(alias, "alias", 200)).slice(0, 20) : [];
+      for (const alias of aliases) knowledge.addAlias?.(projectId, entityId, alias);
+      store.recordInteraction({ projectId, kind: "element-created", actor: "author", meta: { entityId, type } });
+      json(response, 201, { entity: knowledge.listEntities(projectId).find(item => item.entityId === entityId) }); return;
+    }
+    // 作者修改元素：只接受本作品已有元素，避免写入其他作品或凭空创建。
+    const elementRoute = path.match(/^\/api\/elements\/([^/]+)$/);
+    if (elementRoute && method === "PATCH") {
+      const projectId = requiredString(input.projectId, "projectId");
+      const entityId = decodeURIComponent(elementRoute[1]!);
+      store.getProject(projectId);
+      const existing = knowledge.listEntities(projectId).find(item => item.entityId === entityId);
+      if (!existing) throw new DomainError(404, "NOT_FOUND", "元素不存在或不属于此作品");
+      if (!knowledge.addEntity) throw new DomainError(503, "ELEMENTS_UNAVAILABLE", "当前知识服务不支持元素写入");
+      knowledge.addEntity({
+        entityId, projectId, type: existing.type,
+        name: typeof input.name === "string" ? requiredString(input.name, "name", 200) : existing.name,
+        summary: typeof input.summary === "string" ? input.summary.slice(0, 20_000) : existing.summary,
+        routeId: existing.routeId, sourceKind: existing.sourceKind, reviewState: existing.reviewState,
+      });
+      if (Array.isArray(input.aliases)) {
+        const next = input.aliases.map(alias => requiredString(alias, "alias", 200)).slice(0, 20);
+        for (const alias of next) knowledge.addAlias?.(projectId, entityId, alias);
+        // 全量同步：删除作者已移除的别名（不动与实体名同源的记录）。
+        const removed = existing.aliases.filter(alias => !next.includes(alias));
+        for (const alias of removed) knowledge.removeAlias?.(projectId, entityId, alias);
+      }
+      store.recordInteraction({ projectId, kind: "element-updated", actor: "author", meta: { entityId } });
+      json(response, 200, { entity: knowledge.listEntities(projectId).find(item => item.entityId === entityId) }); return;
+    }
+    const elementFactsRoute = path.match(/^\/api\/elements\/([^/]+)\/facts$/);
+    if (elementFactsRoute && method === "POST") {
+      const projectId = requiredString(input.projectId, "projectId");
+      const entityId = decodeURIComponent(elementFactsRoute[1]!);
+      const project = store.getProject(projectId);
+      const existing = knowledge.listEntities(projectId).find(item => item.entityId === entityId);
+      if (!existing) throw new DomainError(404, "NOT_FOUND", "元素不存在或不属于此作品");
+      if (!knowledge.addFact) throw new DomainError(503, "ELEMENTS_UNAVAILABLE", "当前知识服务不支持事实写入");
+      const predicate = requiredString(input.predicate, "predicate", 100);
+      const semanticTypeRaw = typeof input.semanticType === "string" ? input.semanticType : "world_fact";
+      if (!["world_fact", "belief", "rumor", "deception", "plan", "hypothesis"].includes(semanticTypeRaw)) throw new DomainError(400, "INVALID_INPUT", "语义类型无效");
+      const routeId = typeof input.routeId === "string" ? requiredString(input.routeId, "routeId") : existing.routeId || project.activeRouteId;
+      let value: FactAssertion["value"];
+      if (typeof input.valueEntityId === "string" && input.valueEntityId.trim()) {
+        value = { entityId: requiredString(input.valueEntityId, "valueEntityId", 200) };
+      } else if (input.value && typeof input.value === "object" && !Array.isArray(input.value) && "entityId" in input.value) {
+        value = { entityId: requiredString((input.value as { entityId: unknown }).entityId, "entityId", 200) };
+      } else {
+        value = requiredString(String(input.value ?? ""), "value", 2000);
+      }
+      const validFromOrder = input.validFromOrder !== undefined && Number.isFinite(Number(input.validFromOrder)) ? Number(input.validFromOrder) : undefined;
+      const validToOrder = input.validToOrder !== undefined && Number.isFinite(Number(input.validToOrder)) ? Number(input.validToOrder) : undefined;
+      const factId = knowledge.addFact({
+        ...(typeof input.factId === "string" ? { factId: input.factId } : {}),
+        projectId,
+        subjectId: entityId,
+        predicate,
+        value,
+        semanticType: semanticTypeRaw as FactAssertion["semanticType"],
+        reviewState: "confirmed",
+        sourceKind: "author_setting",
+        routeId,
+        ...(validFromOrder !== undefined ? { validFromOrder } : {}),
+        ...(validToOrder !== undefined ? { validToOrder } : {}),
+        ...(typeof input.holderId === "string" && input.holderId.trim() ? { holderId: input.holderId.trim() } : {}),
+      });
+      store.recordInteraction({ projectId, kind: "element-fact-added", actor: "author", meta: { entityId, factId, predicate } });
+      json(response, 201, { fact: knowledge.listFacts(projectId).find(f => f.factId === factId), snapshot: snapshot(projectId) }); return;
+    }
+    const elementEventsRoute = path.match(/^\/api\/elements\/([^/]+)\/events$/);
+    if (elementEventsRoute && method === "POST") {
+      const projectId = requiredString(input.projectId, "projectId");
+      const entityId = decodeURIComponent(elementEventsRoute[1]!);
+      const project = store.getProject(projectId);
+      const existing = knowledge.listEntities(projectId).find(item => item.entityId === entityId);
+      if (!existing) throw new DomainError(404, "NOT_FOUND", "元素不存在或不属于此作品");
+      if (!knowledge.addEvent) throw new DomainError(503, "ELEMENTS_UNAVAILABLE", "当前知识服务不支持事件写入");
+      const kind = requiredString(input.kind, "kind", 100);
+      const routeId = typeof input.routeId === "string" ? requiredString(input.routeId, "routeId") : existing.routeId || project.activeRouteId;
+      const storyTime = typeof input.storyTime === "string" && input.storyTime.trim() ? input.storyTime.trim().slice(0, 200) : undefined;
+      const storyOrder = input.storyOrder !== undefined && Number.isFinite(Number(input.storyOrder)) ? Number(input.storyOrder) : (parseStoryOrderFromTime(storyTime) ?? 1);
+      // 事件与边界事实同一事务写入：任一步失败整体回滚，不留「有事件无边界」的半成品。
+      const writeEventAndBoundary = store.db.transaction(() => {
+        const eventId = knowledge.addEvent!({
+          ...(typeof input.eventId === "string" ? { eventId: input.eventId } : {}),
+          projectId,
+          kind,
+          ...(typeof input.sceneId === "string" && input.sceneId.trim() ? { sceneId: input.sceneId.trim() } : {}),
+          routeId,
+          ...(storyTime ? { storyTime } : {}),
+          storyOrder,
+          subjectId: entityId,
+          ...(typeof input.fromValue === "string" && input.fromValue.trim() ? { fromValue: input.fromValue.trim().slice(0, 1000) } : {}),
+          toValue: requiredString(input.toValue, "toValue", 1000),
+          ...(typeof input.location === "string" && input.location.trim() ? { location: input.location.trim().slice(0, 200) } : {}),
+          reviewState: "confirmed",
+        });
+        // 秘密的知情/揭示边界要按「查询时点」生效：事件用于时间线展示，
+        // 同时必须写成 known_by/revealed 边界事实，secretVisibleTo 才会消费。
+        if (existing.type === "secret" && (kind === "known_by" || kind === "revealed") && knowledge.addFact) {
+          const entityByName = (ref: string) =>
+            knowledge.listEntities(projectId).find(item => item.entityId === ref || item.name === ref || item.aliases.includes(ref));
+          const boundaryFact: Parameters<NonNullable<typeof knowledge.addFact>>[0] = {
+            projectId,
+            subjectId: entityId,
+            predicate: kind,
+            value: "",
+            semanticType: "world_fact",
+            reviewState: "confirmed",
+            sourceKind: "author_setting",
+            routeId,
+            validFromOrder: storyOrder,
+          };
+          if (kind === "known_by") {
+            const holder = entityByName(String(input.toValue));
+            boundaryFact.value = holder ? { entityId: holder.entityId } : requiredString(String(input.toValue), "toValue", 1000);
+          } else {
+            boundaryFact.value = requiredString(String(input.toValue), "toValue", 1000);
+          }
+          knowledge.addFact(boundaryFact);
+        }
+        return eventId;
+      });
+      const eventId = writeEventAndBoundary();
+      store.recordInteraction({ projectId, kind: "element-event-added", actor: "author", meta: { entityId, eventId, kind } });
+      json(response, 201, { event: knowledge.listEvents(projectId).find(ev => ev.eventId === eventId), snapshot: snapshot(projectId) }); return;
+    }
+    if (path === "/api/assist/element-design" && method === "POST") {
+      const result = await assist.generateElementDesign({
+        projectId: requiredString(input.projectId, "projectId"),
+        ...(typeof input.type === "string" ? { type: input.type as Entity["type"] } : {}),
+        ...(typeof input.targetEntityId === "string" ? { targetEntityId: input.targetEntityId } : {}),
+        prompt: requiredString(input.prompt, "prompt", 4000),
+        ...(typeof input.roleHint === "string" ? { roleHint: input.roleHint } : {}),
+        ...(Array.isArray(input.relatedEntityIds) ? { relatedEntityIds: input.relatedEntityIds.map(id => requiredString(id, "relatedEntityId", 200)) } : {}),
+      });
+      json(response, 200, result); return;
+    }
+    if (path === "/api/assist/element-design/apply" && method === "POST") {
+      const projectId = requiredString(input.projectId, "projectId");
+      const applied = assist.applyElementDesignCard({
+        projectId,
+        card: input.card as ElementDesignCard,
+        ...(typeof input.targetEntityId === "string" ? { targetEntityId: input.targetEntityId } : {}),
+        ...(typeof input.routeId === "string" ? { routeId: input.routeId } : {}),
+        acceptanceId: typeof input.acceptanceId === "string" ? requiredString(input.acceptanceId, "acceptanceId", 200) : newId("elem_apply"),
+      });
+      json(response, 200, { ...applied, snapshot: snapshot(projectId) }); return;
+    }
+    if (path === "/api/element-guide/sessions" && method === "POST") {
+      const session = await elementGuide.create({
+        projectId: requiredString(input.projectId, "projectId"),
+        ...(typeof input.type === "string" ? { type: input.type as Entity["type"] } : {}),
+        ...(typeof input.targetEntityId === "string" ? { targetEntityId: input.targetEntityId } : {}),
+        ...(typeof input.prompt === "string" ? { prompt: input.prompt } : {}),
+        ...(typeof input.roleHint === "string" ? { roleHint: input.roleHint } : {}),
+        ...(Array.isArray(input.relatedEntityIds) ? { relatedEntityIds: input.relatedEntityIds.map(id => requiredString(id, "relatedEntityId", 200)) } : {}),
+        forceNew: input.forceNew === true,
+      });
+      json(response, 201, { session }); return;
+    }
+    const elementGuideRoute = path.match(/^\/api\/element-guide\/sessions\/([^/]+)\/(next|answer|back|cancel|apply|proposal)$/);
+    if (elementGuideRoute) {
+      const sessionId = elementGuideRoute[1]!;
+      const action = elementGuideRoute[2]!;
+      if (method === "PATCH" && action === "proposal") { json(response, 200, { session: elementGuide.updateProposal(sessionId, input.cards) }); return; }
+      if (method === "POST" && action === "next") { json(response, 200, { session: await elementGuide.next(sessionId) }); return; }
+      if (method === "POST" && action === "answer") { json(response, 200, { session: await elementGuide.answer(sessionId, { ...(typeof input.optionId === "string" ? { optionId: input.optionId } : {}), ...(typeof input.custom === "string" ? { custom: input.custom } : {}), skip: input.skip === true }) }); return; }
+      if (method === "POST" && action === "back") { json(response, 200, { session: elementGuide.back(sessionId) }); return; }
+      if (method === "POST" && action === "cancel") { json(response, 200, { session: elementGuide.cancel(sessionId) }); return; }
+      if (method === "POST" && action === "apply") {
+        const applied = elementGuide.apply(sessionId, typeof input.proposalId === "string" ? input.proposalId : undefined, input.card ? input.card as ElementDesignCard : undefined);
+        json(response, 200, { ...applied, snapshot: snapshot(applied.session.projectId) }); return;
+      }
+    }
+    if (path === "/api/assist/arc" && method === "POST") {
+      const mode = input.mode === "diagnose" ? "diagnose" : "propose";
+      const result = await assist.assistCharacterArc({
+        projectId: requiredString(input.projectId, "projectId"),
+        entityId: requiredString(input.entityId, "entityId"),
+        mode,
+        ...(typeof input.prompt === "string" ? { prompt: input.prompt } : {}),
+      });
+      json(response, 200, result); return;
+    }
+    if (path === "/api/assist/plot-ideate" && method === "POST") {
+      const result = await assist.ideatePlot({
+        projectId: requiredString(input.projectId, "projectId"),
+        mode: requiredString(input.mode, "mode", 40) as PlotIdeateMode,
+        ...(typeof input.sceneId === "string" ? { sceneId: input.sceneId } : {}),
+        ...(typeof input.toSceneId === "string" ? { toSceneId: input.toSceneId } : {}),
+        ...(typeof input.chapterId === "string" ? { chapterId: input.chapterId } : {}),
+        ...(typeof input.fieldTarget === "string" ? { fieldTarget: input.fieldTarget as "goal" | "conflict" | "summary" } : {}),
+        ...(typeof input.prompt === "string" ? { prompt: input.prompt } : {}),
+        ...(typeof input.reviewSummary === "string" ? { reviewSummary: input.reviewSummary } : {}),
+      });
+      json(response, 200, result); return;
+    }
+    if (path === "/api/assist/plot-ideate/apply" && method === "POST") {
+      const projectId = requiredString(input.projectId, "projectId");
+      const adopted = assist.applyPlotIdeation({
+        projectId,
+        baseRevisionId: requiredString(input.baseRevisionId, "baseRevisionId"),
+        acceptanceId: typeof input.acceptanceId === "string" ? requiredString(input.acceptanceId, "acceptanceId", 200) : newId("plot_apply"),
+        mode: requiredString(input.mode, "mode", 40) as PlotIdeateMode,
+        ...(typeof input.sceneId === "string" ? { sceneId: input.sceneId } : {}),
+        ...(typeof input.chapterId === "string" ? { chapterId: input.chapterId } : {}),
+        ...(Array.isArray(input.scenes) ? { scenes: input.scenes as SceneProposalCard[] } : {}),
+        ...(typeof input.fieldTarget === "string" ? { fieldTarget: input.fieldTarget as "goal" | "conflict" | "summary" } : {}),
+        ...(typeof input.fieldValue === "string" ? { fieldValue: input.fieldValue } : {}),
+      });
+      indexRevision(projectId, adopted.revision.revisionId);
+      json(response, 200, { ...adopted, snapshot: snapshot(projectId) }); return;
+    }
+    if (path === "/api/notes/incubate" && method === "POST") {
+      const result = await assist.incubateNotes({
+        projectId: requiredString(input.projectId, "projectId"),
+        noteIds: Array.isArray(input.noteIds) ? input.noteIds.map(id => requiredString(id, "noteId", 200)) : [],
+        targetKind: requiredString(input.targetKind, "targetKind", 40) as NoteIncubateTarget,
+        ...(typeof input.prompt === "string" ? { prompt: input.prompt } : {}),
+      });
+      json(response, 200, result); return;
+    }
+    if (path === "/api/notes/incubate/apply" && method === "POST") {
+      const projectId = requiredString(input.projectId, "projectId");
+      const branch = store.getBranch(store.getProject(projectId).activeBranchId);
+      const applied = assist.applyNoteIncubation({
+        projectId,
+        noteIds: Array.isArray(input.noteIds) ? input.noteIds.map(id => requiredString(id, "noteId", 200)) : [],
+        targetKind: requiredString(input.targetKind, "targetKind", 40) as NoteIncubateTarget,
+        baseRevisionId: typeof input.baseRevisionId === "string" ? requiredString(input.baseRevisionId, "baseRevisionId") : branch.headRevisionId,
+        acceptanceId: typeof input.acceptanceId === "string" ? requiredString(input.acceptanceId, "acceptanceId", 200) : newId("incubate_apply"),
+        ...(input.elementCard ? { elementCard: input.elementCard as ElementDesignCard } : {}),
+        ...(Array.isArray(input.sceneCards) ? { sceneCards: input.sceneCards as SceneProposalCard[] } : {}),
+        ...(typeof input.chapterId === "string" ? { chapterId: input.chapterId } : {}),
+      });
+      if (applied.revision) indexRevision(projectId, applied.revision.revisionId);
+      json(response, 200, { ...applied, snapshot: snapshot(projectId) }); return;
+    }
+    if (path === "/api/assist/extract-ledger" && method === "POST") {
+      const result = await assist.extractLedgerFromScene({
+        projectId: requiredString(input.projectId, "projectId"),
+        sceneId: requiredString(input.sceneId, "sceneId"),
+      });
+      json(response, 200, result); return;
+    }
+    if (path === "/api/assist/extract-ledger/apply" && method === "POST") {
+      const projectId = requiredString(input.projectId, "projectId");
+      const applied = assist.applyExtractedLedger({
+        projectId,
+        sceneId: requiredString(input.sceneId, "sceneId"),
+        acceptanceId: typeof input.acceptanceId === "string" ? requiredString(input.acceptanceId, "acceptanceId", 200) : newId("extract_apply"),
+        ...(Array.isArray(input.newElements) ? { newElements: input.newElements as ExtractedElementProposal[] } : {}),
+        ...(Array.isArray(input.factProposals) ? { factProposals: input.factProposals as ExtractedFactProposal[] } : {}),
+        ...(Array.isArray(input.eventProposals) ? { eventProposals: input.eventProposals as ExtractedEventProposal[] } : {}),
+      });
+      if (applied.revision) indexRevision(projectId, applied.revision.revisionId);
+      json(response, 200, { ...applied, snapshot: snapshot(projectId) }); return;
+    }
     if (path === "/api/notes" && method === "POST") { const created = store.createNote({ projectId: requiredString(input.projectId, "projectId"), title: requiredString(input.title, "title", 200), body: typeof input.body === "string" ? input.body : "", ...(typeof input.sceneId === "string" ? { sceneId: input.sceneId } : {}), ...(typeof input.elementId === "string" ? { elementId: input.elementId } : {}), ...(Array.isArray(input.tags) ? { tags: input.tags.map((tag: unknown) => requiredString(tag, "tag", 40)) } : {}) }); json(response, 201, { note: created }); return; }
     const noteRoute = path.match(/^\/api\/notes\/([^/]+)(?:\/(promote))?$/);
     if (noteRoute) {
@@ -310,7 +600,8 @@ export function createApp({ store, knowledge, workflow, pi, guide, workflowGuide
           store.putArtifact("pi_ideas_output", result, receipt.task.taskId, result.completeness);
           if (result.completeness !== "complete") {
             store.finishGeneration(receipt.task.taskId, result, "partial");
-            throw new DomainError(502, "IDEAS_INCOMPLETE", "点子生成尚未完整完成");
+            // 引擎给出具体原因时优先显示，否则保留通用文案。
+            throw new DomainError(502, "IDEAS_INCOMPLETE", result.error ?? "点子生成尚未完整完成");
           }
           fields = result.cards ?? piIdeas(result.text);
         }
@@ -412,6 +703,17 @@ export function createApp({ store, knowledge, workflow, pi, guide, workflowGuide
       const revision = store.commitChangeSet(commit[1]!, optionalString(input.name, "name") ?? "采用修改");
       indexRevision(revision.projectId, revision.revisionId);
       json(response, 200, { revision, snapshot: snapshot(revision.projectId) }); return;
+    }
+    if (path === "/api/knowledge/rebuild" && method === "POST") {
+      // 只接受作品内已有修订 ID，正文一律取权威清单，不接受外部文本。
+      const projectId = requiredString(input.projectId, "projectId");
+      const revisionId = requiredString(input.revisionId, "revisionId");
+      store.getProject(projectId);
+      const revision = store.getRevision(revisionId);
+      if (revision.projectId !== projectId) throw new DomainError(400, "SCOPE_MISMATCH", "修订不属于此作品");
+      if (!knowledge.rebuildRevisionIndex) throw new DomainError(503, "INDEX_REBUILD_UNAVAILABLE", "当前知识服务不支持索引重建");
+      const scenes = store.listScenes(projectId, revisionId);
+      json(response, 200, { revisionId, ...knowledge.rebuildRevisionIndex(projectId, revisionId, scenes) }); return;
     }
     throw new DomainError(404, "NOT_FOUND", "接口不存在");
   }

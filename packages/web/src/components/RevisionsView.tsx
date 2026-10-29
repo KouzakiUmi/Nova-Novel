@@ -37,6 +37,9 @@ export function RevisionsView({ snapshot, onCreateVersion, onRestore, onActivate
   const [selectedId, setSelectedId] = useState(snapshot.revisions[0]?.revisionId ?? "");
   const [versionName, setVersionName] = useState("第一章初稿");
   const [showNewVersion, setShowNewVersion] = useState(false);
+  const [creatingVersion, setCreatingVersion] = useState(false);
+  const [versionError, setVersionError] = useState("");
+  const creatingVersionRef = useRef(false);
   const [mode, setMode] = useState<"versions" | "replay">("versions");
   const [importing, setImporting] = useState(false);
   const [importError, setImportError] = useState("");
@@ -213,14 +216,18 @@ export function RevisionsView({ snapshot, onCreateVersion, onRestore, onActivate
               <button className="button ghost" onClick={() => setShowNewVersion(false)}>取消</button>
               <button
                 className="button primary"
-                disabled={!versionName.trim()}
+                disabled={!versionName.trim() || creatingVersion}
                 onClick={() => {
-                  void onCreateVersion(versionName).then(() => setShowNewVersion(false));
+                  if (creatingVersionRef.current) return;
+                  creatingVersionRef.current = true;
+                  setCreatingVersion(true); setVersionError("");
+                  void onCreateVersion(versionName).then(() => setShowNewVersion(false)).catch(cause => setVersionError(cause instanceof Error ? cause.message : "命名版本尚未保存，请重试")).finally(() => { creatingVersionRef.current = false; setCreatingVersion(false); });
                 }}
               >
                 <Check size={14} />保存命名版本
               </button>
             </div>
+            {versionError && <p className="inline-note error" role="alert">{versionError}</p>}
           </section>
         </div>
       )}

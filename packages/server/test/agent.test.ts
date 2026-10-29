@@ -11,7 +11,7 @@ import { DomainStore } from "../src/store.js";
 import { SqliteKnowledgeService } from "../src/knowledge/index.js";
 import { EmbeddedAgentHost } from "../src/agent/engine.js";
 import { AgentSettings, thinkingLevels, clampThinking } from "../src/agent/settings.js";
-import { parseOutput, composePrompt } from "../src/agent/prompts.js";
+import { parseOutput, composePrompt, checkPromptBudget } from "../src/agent/prompts.js";
 import { novelTools } from "../src/agent/tools.js";
 import { createApp } from "../src/app.js";
 import type { WorkflowService } from "../src/contracts.js";
@@ -36,6 +36,7 @@ async function fixture() {
   let finishReason = "stop";
   let slow = false;
   let failure = false;
+  let thinkingOnly = false;
   const sockets = new Set<ServerResponse>();
   const fake = createServer((request, response) => {
     if (failure) { response.writeHead(401, { "Content-Type": "application/json" }); response.end(JSON.stringify({ error: { message: `invalid api key ${secret}` } })); return; }
@@ -52,10 +53,11 @@ async function fixture() {
       const block = (delta: unknown, finish: string | null = null) => response.write(`data: ${JSON.stringify({ id: "fake-completion", object: "chat.completion.chunk", created: 1, model: "writer", choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`);
       block({ role: "assistant", content: "" });
       if (useTool && !input.messages.some(message => message.role === "tool")) {
+        if (thinkingOnly) block({ content: "我先核对一下收据。" });
         block({ tool_calls: [{ index: 0, id: "call_novel", type: "function", function: toolError ? { name: "novel_get_scene", arguments: '{"sceneId":"outside-task"}' } : { name: "novel_search", arguments: '{"query":"收据"}' } }] });
         block({}, "tool_calls");
       } else {
-        block({ content: answer });
+        block(thinkingOnly ? { reasoning_content: "仅在思考里的续写，不是成稿。" } : { content: answer });
         if (slow) return;
         block({}, finishReason);
       }
@@ -76,7 +78,7 @@ async function fixture() {
   }
   async function configure() { return call("/api/agent/providers", "POST", { providerId: "local-test", name: "本地测试", api: "openai-completions", baseUrl: `http://127.0.0.1:${fakeAddress.port}/v1`, apiKey: secret, models: [{ id: "writer", maxTokens: 1024 }] }); }
   const request = (kind: GenerationRequest["kind"], key = `test-${kind}`): GenerationRequest => ({ projectId: project.projectId, sceneId: scene.sceneId, kind, input: "继续当前场景", idempotencyKey: key, ...(kind === "polish" ? { range: { from: 5, to: 9, baseText: "原来如此" } } : {}) });
-  return { directory, db, store, knowledge, host, project, scene, requests, fakePort: fakeAddress.port, call, configure, request, setAnswer(value: string) { answer = value; }, setTool() { useTool = true; }, setToolError() { useTool = true; toolError = true; }, setLength() { finishReason = "length"; }, setSlow() { slow = true; }, setFailure() { failure = true; }, async close() {
+  return { directory, db, store, knowledge, host, project, scene, requests, fakePort: fakeAddress.port, call, configure, request, setAnswer(value: string) { answer = value; }, setTool() { useTool = true; }, setToolError() { useTool = true; toolError = true; }, setLength() { finishReason = "length"; }, setFinishReason(value: string) { finishReason = value; }, setThinkingOnly() { useTool = true; thinkingOnly = true; }, setSlow() { slow = true; }, setFailure() { failure = true; }, async close() {
     await host.close();
     for (const response of sockets) response.end();
     api.closeAllConnections(); fake.closeAllConnections();
@@ -215,6 +217,7 @@ test("embedded SSE full turn declares only novel tools and persists independent 
     const generated = await f.call("/api/generate", "POST", f.request("scene"));
     const receipt = generated.value as GenerationReceipt;
     assert.equal(receipt.task.state, "succeeded");
+    assert.ok(receipt.task.result && typeof receipt.task.result === "object" && !("failureReason" in receipt.task.result)); assert.equal(receipt.task.error, undefined);
     assert.equal((receipt.task.result as { output: string }).output, "continuation");
     assert.ok((receipt.task.result as { artifactId: string }).artifactId);
     assert.equal(f.requests.length, 2);
@@ -267,6 +270,7 @@ test("cancellation aborts stream and preserves partial text via both cancellatio
       assert.equal(cancelled.value.task.state, "cancelled");
       const receipt = (await generating).value;
       assert.equal(receipt.task.state, "cancelled"); assert.equal(receipt.task.completeness, "partial"); assert.equal(receipt.task.result.text, "写到一半的文字");
+      assert.equal(receipt.task.result.failureReason, "cancelled"); assert.match(receipt.task.error, /作者已取消/);
     }
   } finally { await f.close(); }
 });
@@ -324,8 +328,147 @@ test("length and tool failures retain partial output instead of succeeding", asy
       const receipt = (await f.call("/api/generate", "POST", f.request("scene"))).value;
       assert.equal(receipt.task.state, "interrupted"); assert.equal(receipt.task.completeness, "partial");
       assert.equal(receipt.task.result.text, "门外传来了脚步声。");
+      assert.equal(receipt.task.result.failureReason, failure === "length" ? "truncated" : "tool_error");
+      assert.match(receipt.task.error, failure === "length" ? /长度上限/ : /资料工具调用失败/);
     } finally { await f.close(); }
   }
+});
+
+test("successful tool round followed by thinking-only final turn never reuses its preface", async () => {
+  const f = await fixture();
+  try {
+    await f.configure(); f.setThinkingOnly();
+    const receipt = (await f.call("/api/generate", "POST", f.request("scene"))).value;
+    assert.equal(f.requests.length, 2);
+    assert.ok(f.requests[1]!.messages.some(message => message.role === "tool"));
+    assert.equal(receipt.task.state, "interrupted"); assert.equal(receipt.task.completeness, "partial");
+    assert.equal(receipt.task.result.text, ""); assert.equal(receipt.task.result.failureReason, "empty_output");
+    assert.match(receipt.task.error, /末轮未返回可用正文/);
+    const progress = (await f.call("/api/generate/progress?key=test-scene")).value;
+    assert.equal(progress.text, ""); assert.equal(f.store.getScene(f.scene.sceneId).body, f.scene.body);
+    assert.equal(f.store.getArtifact(receipt.task.result.artifactId).completeness, "partial");
+  } finally { await f.close(); }
+});
+
+test("starting a thinking-only tool follow-up clears live progress from the previous assistant turn", async () => {
+  const f = await fixture();
+  try {
+    await f.configure(); f.setThinkingOnly(); f.setSlow();
+    const generating = f.call("/api/generate", "POST", f.request("scene"));
+    // 第二轮请求到达不等于新回合已经开始：只等 requests.length === 2 会在负载较高时
+    // 读到上一轮尚未清空的进度。这里等到新回合清空文本后再断言。
+    let progress: { text: string; tools: string[] } = { text: "", tools: [] };
+    let cleared = false;
+    for (let i = 0; i < 200; i++) {
+      await new Promise(done => setTimeout(done, 20));
+      progress = (await f.call("/api/generate/progress?key=test-scene")).value;
+      if (f.requests.length === 2 && progress.tools.length && progress.text === "") { cleared = true; break; }
+    }
+    assert.equal(f.requests.length, 2); assert.deepEqual(progress.tools, ["novel_search"]);
+    assert.ok(cleared, "新回合开始后应清空上一轮的实时进度文本，而不是继续显示上一轮前言");
+    assert.equal(progress.text, "");
+    await f.call("/api/generate/cancel", "POST", { idempotencyKey: "test-scene" });
+    assert.equal((await generating).value.task.state, "cancelled");
+  } finally { await f.close(); }
+});
+
+test("whitespace-only final text cannot become a complete continuation", async () => {
+  const f = await fixture();
+  try {
+    await f.configure(); f.setAnswer(" \n\t");
+    const receipt = (await f.call("/api/generate", "POST", f.request("scene"))).value;
+    assert.equal(receipt.task.state, "interrupted"); assert.equal(receipt.task.result.failureReason, "empty_output");
+    assert.equal(receipt.task.result.text, ""); assert.match(receipt.task.error, /未返回可用正文/);
+  } finally { await f.close(); }
+});
+
+test("provider authentication errors expose a redacted actionable task reason", async () => {
+  const f = await fixture();
+  try {
+    await f.configure(); f.setFailure();
+    const receipt = (await f.call("/api/generate", "POST", f.request("scene"))).value;
+    assert.notEqual(receipt.task.state, "succeeded"); assert.equal(receipt.task.completeness, "partial");
+    assert.equal(receipt.task.result.failureReason, "provider_error"); assert.match(receipt.task.error, /鉴权失败.*401/);
+    assert.ok(!JSON.stringify(f.store.getArtifact(receipt.task.result.artifactId)).includes(secret));
+    assert.ok(!receipt.task.error.includes("invalid api key"));
+  } finally { await f.close(); }
+});
+
+test("filtered and unknown provider finish reasons cannot succeed with otherwise valid text", async () => {
+  for (const reason of ["content_filter", "unrecognized_finish"]) {
+    const f = await fixture();
+    try {
+      await f.configure(); f.setFinishReason(reason);
+      const receipt = (await f.call("/api/generate", "POST", f.request("scene"))).value;
+      assert.notEqual(receipt.task.state, "succeeded"); assert.equal(receipt.task.completeness, "partial");
+      assert.equal(receipt.task.result.failureReason, "provider_error");
+      assert.match(receipt.task.error, reason === "content_filter" ? /过滤/ : /模型服务错误/);
+    } finally { await f.close(); }
+  }
+});
+
+test("thrown provider errors keep only safe classified summaries in tasks and artifacts", async t => {
+  const f = await fixture();
+  try {
+    await f.configure();
+    t.mock.method(f.host.settings.runtime, "getModel", () => { throw new Error(`upstream-private-body ${secret}: context length exceeded`); });
+    const receipt = (await f.call("/api/generate", "POST", f.request("scene"))).value;
+    assert.equal(receipt.task.state, "failed"); assert.equal(receipt.task.result.failureReason, "provider_error");
+    assert.match(receipt.task.error, /上下文超出服务窗口.*重试/);
+    const artifact = f.store.getArtifact(receipt.task.result.artifactId);
+    assert.ok(!JSON.stringify(artifact).includes(secret)); assert.ok(!JSON.stringify(artifact).includes("upstream-private-body"));
+    assert.ok(!JSON.stringify(receipt).includes("upstream-private-body"));
+  } finally { await f.close(); }
+});
+
+test("ten-minute generation timeout is distinct from author cancellation", async t => {
+  const f = await fixture();
+  const original = globalThis.setTimeout;
+  let expire: (() => void) | undefined;
+  t.mock.method(globalThis, "setTimeout", (callback: (...args: unknown[]) => void, delay?: number, ...args: unknown[]) => {
+    if (delay === 600_000) expire = () => callback(...args);
+    return original(callback, delay, ...args);
+  });
+  try {
+    await f.configure(); f.setSlow(); f.setAnswer("超时前的半段正文");
+    const generating = f.call("/api/generate", "POST", f.request("scene"));
+    let text = "";
+    for (let i = 0; i < 100 && !text; i++) { await new Promise(done => setTimeout(done, 20)); text = (await f.call("/api/generate/progress?key=test-scene")).value.text; }
+    assert.equal(text, "超时前的半段正文"); assert.ok(expire); expire();
+    const receipt = (await generating).value;
+    assert.equal(receipt.task.state, "interrupted"); assert.equal(receipt.task.result.failureReason, "timeout");
+    assert.equal(receipt.task.result.text, text); assert.match(receipt.task.error, /生成超时（10 分钟）/);
+  } finally { await f.close(); }
+});
+
+test("oversized scene fails before contacting the provider without truncating author text", async () => {
+  const f = await fixture();
+  try {
+    await f.configure();
+    const body = "长篇正文".repeat(15000);
+    f.store.saveScene(f.scene.sceneId, { baseRevisionId: f.store.getBranch(f.project.activeBranchId).headRevisionId, body });
+    const receipt = (await f.call("/api/generate", "POST", f.request("scene"))).value;
+    assert.equal(receipt.task.state, "failed"); assert.equal(receipt.task.result.failureReason, "context_overflow");
+    assert.match(receipt.task.error, /上下文超限.*当前正文/); assert.match(receipt.task.error, /模型窗口 128000/);
+    assert.equal(f.requests.length, 0); assert.equal(f.store.getScene(f.scene.sceneId).body, body);
+  } finally { await f.close(); }
+});
+
+test("prompt budget names oversized evidence and marks an unknown model window conservatively", async () => {
+  const f = await fixture();
+  try {
+    const request = f.request("scene");
+    const branch = f.store.getBranch(f.project.activeBranchId);
+    const context = f.knowledge.queryContext({ projectId: f.project.projectId, branchId: branch.branchId, routeId: f.project.activeRouteId, revisionId: branch.headRevisionId, query: "收据", purpose: "scene_writing" });
+    const receipt = f.store.beginGeneration(request, context);
+    const frozen = f.store.generationContext(receipt.task.taskId);
+    assert.equal(checkPromptBudget(request, frozen, () => true, { contextWindow: 128000, maxTokens: 1024 }, []), composePrompt(request, frozen));
+    assert.ok(frozen.context.evidence.length);
+    frozen.context.evidence[0]!.quote = "证据原文".repeat(5000);
+    assert.throws(() => checkPromptBudget(request, frozen, () => true, { maxTokens: 1024 }, []), /上下文超限.*原文证据.*模型窗口未知，按保守默认 32768/);
+    assert.equal(frozen.novel!.scene!.body, f.scene.body);
+    assert.ok(composePrompt(request, frozen).includes(frozen.context.evidence[0]!.quote));
+  } finally { await f.close(); }
 });
 
 test("tool queries hide unknown secrets and freeze knowledge before later edits", async () => {

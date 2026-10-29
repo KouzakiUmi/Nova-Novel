@@ -22,10 +22,26 @@ import type {
   UsageReportView,
   AuthorNote,
   Chapter,
+  Entity,
   Revision,
   SceneAnnotation,
   CharacterArcProfile,
   AuthoringEvent,
+  ElementDesignCard,
+  ElementGuideSession,
+  ArcAssistProposal,
+  ArcDiagnosisReport,
+  PlotIdeateMode,
+  PlotIdeateResult,
+  SceneProposalCard,
+  NoteIncubateTarget,
+  NoteIncubateResult,
+  ExtractedLedgerBundle,
+  ExtractedElementProposal,
+  ExtractedFactProposal,
+  ExtractedEventProposal,
+  FactAssertion,
+  WorldEvent,
 } from "@nova-novel/shared";
 import type { AppearanceSettings } from "./appearance";
 
@@ -88,6 +104,10 @@ export const api = {
   updateNote: (noteId: string, patch: { title?: string; body?: string; status?: AuthorNote["status"]; sceneId?: string | null; elementId?: string | null; tags?: string[] }) =>
     request<{ note: AuthorNote }>(`/api/notes/${noteId}`, { method: "PATCH", body: JSON.stringify(patch) }),
   archiveNote: (noteId: string) => request<{ note: AuthorNote }>(`/api/notes/${noteId}`, { method: "DELETE" }),
+  createElement: (input: { projectId: string; type: string; name: string; summary?: string; aliases?: string[]; unique?: boolean }) =>
+    request<{ entity: Entity }>("/api/elements", { method: "POST", body: JSON.stringify(input) }),
+  updateElement: (entityId: string, input: { projectId: string; name?: string; summary?: string; aliases?: string[] }) =>
+    request<{ entity: Entity }>(`/api/elements/${encodeURIComponent(entityId)}`, { method: "PATCH", body: JSON.stringify(input) }),
   promoteNote: (noteId: string) => request<{ note: AuthorNote; scene: Scene; revision: Revision; snapshot: WorkspaceSnapshot }>(`/api/notes/${noteId}/promote`, { method: "POST", body: "{}" }),
   listAnnotations: (projectId: string, sceneId?: string) => request<{ annotations: SceneAnnotation[] }>(`/api/annotations?projectId=${encodeURIComponent(projectId)}${sceneId ? `&sceneId=${encodeURIComponent(sceneId)}` : ""}`),
   createAnnotation: (input: { projectId: string; sceneId: string; kind: SceneAnnotation["kind"]; body: string; range?: SceneAnnotation["range"] }) =>
@@ -156,7 +176,15 @@ export const api = {
         status: scene.status,
         ...(scene.goal !== undefined ? { goal: scene.goal } : {}),
         ...(scene.conflict !== undefined ? { conflict: scene.conflict } : {}),
+        ...(scene.pov !== undefined ? { pov: scene.pov } : {}),
+        ...(scene.storyTime !== undefined ? { storyTime: scene.storyTime } : {}),
       }),
+    }),
+  /** 只改结构字段（标题、章节、叙述顺序等），不发送正文与摘要，避免结构操作覆盖正文。 */
+  saveSceneStructure: (scene: Scene, patch: { title?: string; storyTime?: string; pov?: string }) =>
+    request<{ scene: Scene; revisionId: string }>(`/api/scenes/${scene.sceneId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ baseRevisionId: scene.baseRevisionId, ...patch }),
     }),
   queryContext: (query: ContextQuery) =>
     request<ContextBundle>("/api/context/query", {
@@ -265,4 +293,164 @@ export const api = {
     request<{ snapshot: WorkspaceSnapshot }>(`/api/workflow-guide/sessions/${sessionId}/publish`, { method: "POST", body: JSON.stringify({ projectId }) }),
   updateWorkflowGuideProposal: (sessionId: string, definition: WorkflowDefinition) =>
     request<{ session: WorkflowGuideSession }>(`/api/workflow-guide/sessions/${sessionId}/proposal`, { method: "PATCH", body: JSON.stringify({ definition }) }),
+  addElementFact: (
+    entityId: string,
+    input: {
+      projectId: string;
+      predicate: string;
+      value?: string;
+      valueEntityId?: string;
+      semanticType?: FactAssertion["semanticType"];
+      validFromOrder?: number;
+      validToOrder?: number;
+      holderId?: string;
+    },
+  ) =>
+    request<{ fact: FactAssertion; snapshot: WorkspaceSnapshot }>(`/api/elements/${encodeURIComponent(entityId)}/facts`, {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  addElementEvent: (
+    entityId: string,
+    input: {
+      projectId: string;
+      kind: string;
+      sceneId?: string;
+      storyTime?: string;
+      storyOrder?: number;
+      fromValue?: string;
+      toValue: string;
+      location?: string;
+    },
+  ) =>
+    request<{ event: WorldEvent; snapshot: WorkspaceSnapshot }>(`/api/elements/${encodeURIComponent(entityId)}/events`, {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  elementDesign: (input: {
+    projectId: string;
+    type?: Entity["type"];
+    targetEntityId?: string;
+    prompt: string;
+    roleHint?: string;
+    relatedEntityIds?: string[];
+  }) =>
+    request<{ artifactId: string; taskId: string; cards: ElementDesignCard[] }>("/api/assist/element-design", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  applyElementDesign: (input: {
+    projectId: string;
+    card: ElementDesignCard;
+    targetEntityId?: string;
+    acceptanceId?: string;
+  }) =>
+    request<{ entity: Entity; arc?: CharacterArcProfile; snapshot: WorkspaceSnapshot }>("/api/assist/element-design/apply", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  createElementGuide: (input: {
+    projectId: string;
+    type?: Entity["type"];
+    targetEntityId?: string;
+    prompt?: string;
+    roleHint?: string;
+    relatedEntityIds?: string[];
+    forceNew?: boolean;
+  }) =>
+    request<{ session: ElementGuideSession }>("/api/element-guide/sessions", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  nextElementGuide: (sessionId: string) =>
+    request<{ session: ElementGuideSession }>(`/api/element-guide/sessions/${sessionId}/next`, { method: "POST", body: "{}" }),
+  answerElementGuide: (sessionId: string, input: { optionId?: string; custom?: string; skip?: boolean }) =>
+    request<{ session: ElementGuideSession }>(`/api/element-guide/sessions/${sessionId}/answer`, {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  backElementGuide: (sessionId: string) =>
+    request<{ session: ElementGuideSession }>(`/api/element-guide/sessions/${sessionId}/back`, { method: "POST", body: "{}" }),
+  cancelElementGuide: (sessionId: string) =>
+    request<{ session: ElementGuideSession }>(`/api/element-guide/sessions/${sessionId}/cancel`, { method: "POST", body: "{}" }),
+  updateElementGuideProposal: (sessionId: string, cards: ElementDesignCard[]) =>
+    request<{ session: ElementGuideSession }>(`/api/element-guide/sessions/${sessionId}/proposal`, {
+      method: "PATCH",
+      body: JSON.stringify({ cards }),
+    }),
+  applyElementGuide: (sessionId: string, input: { proposalId?: string; card?: ElementDesignCard }) =>
+    request<{ session: ElementGuideSession; entity: Entity; snapshot: WorkspaceSnapshot }>(`/api/element-guide/sessions/${sessionId}/apply`, {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  assistArc: (input: { projectId: string; entityId: string; mode: "propose" | "diagnose"; prompt?: string }) =>
+    request<{ taskId: string; mode: "propose" | "diagnose"; proposals?: ArcAssistProposal[]; diagnosis?: ArcDiagnosisReport }>("/api/assist/arc", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  plotIdeate: (input: {
+    projectId: string;
+    mode: PlotIdeateMode;
+    sceneId?: string;
+    toSceneId?: string;
+    chapterId?: string;
+    fieldTarget?: "goal" | "conflict" | "summary";
+    prompt?: string;
+    reviewSummary?: string;
+  }) =>
+    request<PlotIdeateResult>("/api/assist/plot-ideate", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  applyPlotIdeation: (input: {
+    projectId: string;
+    baseRevisionId: string;
+    acceptanceId?: string;
+    mode: PlotIdeateMode;
+    sceneId?: string;
+    chapterId?: string;
+    scenes?: SceneProposalCard[];
+    fieldTarget?: "goal" | "conflict" | "summary";
+    fieldValue?: string;
+  }) =>
+    request<{ revision: Revision; scenes: Scene[]; snapshot: WorkspaceSnapshot }>("/api/assist/plot-ideate/apply", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  incubateNotes: (input: { projectId: string; noteIds: string[]; targetKind: NoteIncubateTarget; prompt?: string }) =>
+    request<NoteIncubateResult>("/api/notes/incubate", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  applyNoteIncubation: (input: {
+    projectId: string;
+    noteIds: string[];
+    targetKind: NoteIncubateTarget;
+    baseRevisionId: string;
+    acceptanceId?: string;
+    elementCard?: ElementDesignCard;
+    sceneCards?: SceneProposalCard[];
+    chapterId?: string;
+  }) =>
+    request<{ notes: AuthorNote[]; entity?: Entity; scenes?: Scene[]; snapshot: WorkspaceSnapshot }>("/api/notes/incubate/apply", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  extractLedger: (input: { projectId: string; sceneId: string }) =>
+    request<ExtractedLedgerBundle>("/api/assist/extract-ledger", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  applyExtractedLedger: (input: {
+    projectId: string;
+    sceneId: string;
+    acceptanceId?: string;
+    newElements?: ExtractedElementProposal[];
+    factProposals?: ExtractedFactProposal[];
+    eventProposals?: ExtractedEventProposal[];
+  }) =>
+    request<{ entities: Entity[]; facts: FactAssertion[]; events: WorldEvent[]; snapshot: WorkspaceSnapshot }>("/api/assist/extract-ledger/apply", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
 };

@@ -4,6 +4,7 @@ import type { WorkflowDefinition, WorkflowGuideSession } from "@nova-novel/share
 import { ArrowLeft, ArrowRight, Check, CircleAlert, LoaderCircle, RotateCcw, ShieldCheck, Sparkles, X } from "lucide-react";
 import { api } from "../lib/api";
 import { Badge } from "./UI";
+import { useDialogKeyboard } from "./useDialogKeyboard";
 
 interface GuidedWorkflowDialogProps {
   projectId: string;
@@ -18,6 +19,8 @@ const STEPS = ["写作意图", "人工审阅", "发布版本"];
 
 export function GuidedWorkflowDialog({ projectId, session, aiReady, onChanged, onClose, onOpenSettings }: GuidedWorkflowDialogProps) {
   const [busy, setBusy] = useState(false);
+  const dialogRef = useRef<HTMLElement>(null);
+  useDialogKeyboard(dialogRef, () => { if (!busy) onClose(); });
   const [error, setError] = useState("");
   const [selected, setSelected] = useState("");
   const [custom, setCustom] = useState("");
@@ -65,7 +68,7 @@ export function GuidedWorkflowDialog({ projectId, session, aiReady, onChanged, o
 
   return (
     <div className="modal-backdrop" role="presentation" onMouseDown={() => { if (!busy) onClose(); }}>
-      <section className="guided-workflow-dialog" role="dialog" aria-modal="true" aria-label="交互式工作流编排" onMouseDown={(event) => event.stopPropagation()}>
+      <section ref={dialogRef} className="guided-workflow-dialog" role="dialog" aria-modal="true" aria-label="交互式工作流编排" onMouseDown={(event) => event.stopPropagation()}>
         <header><div><p className="eyebrow">GUIDED WORKFLOW · 节点与连线由你确认</p><h2>把写作方法编排成一个工作流</h2><p>Agent 提议步骤，应用校验节点、连线和人工关卡。只有点击发布后才会登记新版本，不会自动运行。</p></div><button className="icon-button" disabled={busy} onClick={onClose} aria-label="关闭并保留进度"><X size={17} /></button></header>
         <div className="guide-progress">{STEPS.map((label, index) => <span key={label} className={session && index < session.stepIndex ? "done" : session && index === session.stepIndex ? "current" : ""}>{index + 1}. {label}</span>)}</div>
         <div className="guided-workflow-body">

@@ -1,6 +1,6 @@
 appId: com.novanovel.studio
 productName: Nova Novel
-copyright: Copyright © 2026 Nova Novel contributors
+copyright: Copyright © 2026 KouzakiUmi
 directories:
   output: release-packaged
 files:
@@ -28,6 +28,7 @@ win:
 nsis:
   oneClick: false
   perMachine: false
+  artifactName: ${productName} Setup ${version}.${ext}
   allowToChangeInstallationDirectory: true
   createDesktopShortcut: true
   createStartMenuShortcut: true

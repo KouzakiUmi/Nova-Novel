@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { EditorContent, getTextBetween, getTextSerializersFromSchema, useEditor, useEditorState, type Editor } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
-import type { ConsistencyReport, GenerationProgress, GenerationReceipt, GenerationRequest, Scene, WorkspaceSnapshot } from "@nova-novel/shared";
+import type { ConsistencyReport, ExtractedLedgerBundle, GenerationProgress, GenerationReceipt, GenerationRequest, Scene, SceneFieldOption, SceneProposalCard, WorkspaceSnapshot } from "@nova-novel/shared";
 import { countWords, recommendNextAction, type NextActionKind } from "@nova-novel/shared";
 import {
   AlignLeft,
@@ -49,9 +49,10 @@ interface GenerationHandle {
 interface EditorViewProps {
   snapshot: WorkspaceSnapshot;
   scene: Scene;
+  localDraft?: string;
   focusMode: boolean;
   onSelectScene: (sceneId: string) => void;
-  onDirty: () => void;
+  onDirty: (scene: Scene) => void;
   onSave: (scene: Scene) => Promise<void>;
   onGenerate: (request: GenerationRequest) => GenerationHandle;
   onProgress: (idempotencyKey: string) => Promise<GenerationProgress>;
@@ -129,9 +130,9 @@ type SceneWritingIntent = keyof typeof SCENE_INTENTS;
 
 const SCENE_REVIEW_INTENT = "复盘当前场景，不改正文：开头人物追求什么或面对什么问题；结尾正文实际发生了什么结果或状态变化；若继续写下一场，人物可以作出什么决定。只依据正文明确支持的内容，不为迎合结构公式强造灾难、反转或变化。把正文未交代的因果与变化标为 unknown，把可选的表达建议标为 aesthetic，并在 summary 里用普通语言概括“结果与可能的下一步”。";
 
-export function EditorView({ snapshot, scene, focusMode, onSelectScene, onDirty, onSave, onGenerate, onProgress, onCancel, onOpenElement, onOpenReview, onOpenSettings, onChanged, onRegisterFlush }: EditorViewProps) {
-  const [body, setBody] = useState(scene.body);
-  const [saveState, setSaveState] = useState<"saved" | "dirty" | "saving">("saved");
+export function EditorView({ snapshot, scene, localDraft, focusMode, onSelectScene, onDirty, onSave, onGenerate, onProgress, onCancel, onOpenElement, onOpenReview, onOpenSettings, onChanged, onRegisterFlush }: EditorViewProps) {
+  const [body, setBody] = useState(localDraft ?? scene.body);
+  const [saveState, setSaveState] = useState<"saved" | "dirty" | "saving" | "error">(localDraft === undefined ? "saved" : "error");
   const [assistantTab, setAssistantTab] = useState<"assistant" | "context" | "scene" | "annotations" | "revision">("assistant");
   const [rightOpen, setRightOpen] = useState(true);
   const [outcome, setOutcome] = useState<Outcome | null>(null);
@@ -146,8 +147,13 @@ export function EditorView({ snapshot, scene, focusMode, onSelectScene, onDirty,
   const [lastAction, setLastAction] = useState<"accepted" | "reviewed" | null>(null);
   const [sceneFilter, setSceneFilter] = useState("");
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+  const [extractBusy, setExtractBusy] = useState(false);
+  const [extractBundle, setExtractBundle] = useState<ExtractedLedgerBundle | null>(null);
+  const [nextSceneBusy, setNextSceneBusy] = useState(false);
+  const [nextSceneCards, setNextSceneCards] = useState<SceneProposalCard[]>([]);
+  const [nextSceneArtifactId, setNextSceneArtifactId] = useState("");
   const sceneIdRef = useRef(scene.sceneId);
-  const bodyRef = useRef(scene.body);
+  const bodyRef = useRef(localDraft ?? scene.body);
   const sceneRef = useRef(scene);
   if (sceneRef.current.sceneId === scene.sceneId) sceneRef.current = scene;
   // 只表示尚未被任何一次保存请求捕获的修改，避免重复提交已在途的内容。
@@ -157,8 +163,8 @@ export function EditorView({ snapshot, scene, focusMode, onSelectScene, onDirty,
   const nextAction = recommendNextAction({ hasBody: Boolean(body.trim()), hasPlan: Boolean((scene.goal ?? "").trim() || scene.summary.trim()), outcome: outcome ? outcome.type === "report" ? "report" : "candidate" : null, stale: outcome && outcome.type !== "report" ? outcome.stale : false, lastAction });
 
   const editor = useEditor({
-    extensions: [StarterKit],
-    content: bodyToContent(scene.body),
+    extensions: [StarterKit.configure({ bold: false, italic: false, blockquote: false, bulletList: false, orderedList: false, listItem: false, listKeymap: false, heading: false, horizontalRule: false, codeBlock: false, code: false, strike: false, underline: false, link: false })],
+    content: bodyToContent(localDraft ?? scene.body),
     immediatelyRender: false,
     editorProps: {
       attributes: {
@@ -173,7 +179,7 @@ export function EditorView({ snapshot, scene, focusMode, onSelectScene, onDirty,
       unsavedChangesRef.current = true;
       setBody(text);
       setSaveState("dirty");
-      onDirty();
+      onDirty({ ...sceneRef.current, body: text });
     },
   });
 
@@ -202,13 +208,20 @@ export function EditorView({ snapshot, scene, focusMode, onSelectScene, onDirty,
     setSaveState("saving");
     try {
       await onSave({ ...currentScene, body: bodyToSave });
-      if (sceneIdRef.current === currentScene.sceneId) setSaveState("saved");
+      if (sceneIdRef.current === currentScene.sceneId) setSaveState(unsavedChangesRef.current ? "dirty" : "saved");
     } catch (error) {
       unsavedChangesRef.current = true;
-      if (sceneIdRef.current === currentScene.sceneId) setSaveState("dirty");
+      if (sceneIdRef.current === currentScene.sceneId) setSaveState("error");
       throw error;
     }
   }, [onSave]);
+
+  useEffect(() => {
+    if (localDraft === undefined && scene.body === bodyRef.current) {
+      unsavedChangesRef.current = false;
+      setSaveState("saved");
+    }
+  }, [localDraft, scene.body]);
 
   useEffect(() => {
     onRegisterFlush(flushPendingChanges);
@@ -222,7 +235,9 @@ export function EditorView({ snapshot, scene, focusMode, onSelectScene, onDirty,
       if (!unsavedChangesRef.current) return;
       const bodyToSave = bodyRef.current;
       unsavedChangesRef.current = false;
-      void onSave({ ...sceneRef.current, body: bodyToSave }).catch(() => undefined);
+      const draft = { ...sceneRef.current, body: bodyToSave };
+      onDirty(draft);
+      void onSave(draft).catch(cause => setTaskNote(cause instanceof Error ? `本地草稿已保留：${cause.message}` : "本地草稿已保留，请重试保存。"));
     };
   }, [scene.sceneId]);
 
@@ -252,12 +267,12 @@ export function EditorView({ snapshot, scene, focusMode, onSelectScene, onDirty,
       unsavedChangesRef.current = false;
       void onSave({ ...scene, body: bodyToSave })
         .then(() => {
-          if (sceneIdRef.current === scene.sceneId) setSaveState((state) => state === "saving" ? "saved" : state);
+          if (sceneIdRef.current === scene.sceneId) setSaveState((state) => state === "saving" && !unsavedChangesRef.current ? "saved" : state);
         })
         .catch(() => {
           if (sceneIdRef.current !== scene.sceneId) return;
           unsavedChangesRef.current = true;
-          setSaveState("dirty");
+          setSaveState("error");
         });
     }, 1400);
     return () => window.clearTimeout(timer);
@@ -391,7 +406,7 @@ export function EditorView({ snapshot, scene, focusMode, onSelectScene, onDirty,
     unsavedChangesRef.current = true;
     setBody(next);
     setSaveState("dirty");
-    onDirty();
+    onDirty({ ...sceneRef.current, body: next });
   };
 
   const acceptOutcome = () => {
@@ -402,16 +417,11 @@ export function EditorView({ snapshot, scene, focusMode, onSelectScene, onDirty,
       applyText(current.trim() ? `${current.replace(/\s+$/, "")}${BLOCK_SEPARATOR}${addition}` : addition);
     } else {
       const { from, to, baseText } = outcome.range;
-      let start = current.slice(from, to) === baseText ? from : current.indexOf(baseText);
-      if (start < 0 || !baseText) {
-        setTaskNote("原来选中的文字已经找不到了，改写没有应用。请重新选择后再试。");
+      if (outcome.stale || outcome.baseBody !== current || !baseText || current.slice(from, to) !== baseText) {
+        setTaskNote("原文已变化，改写没有应用。请重新选择要推敲的文字后再试。");
         return;
       }
-      if (current.indexOf(baseText, start + 1) >= 0 && current.slice(from, to) !== baseText) {
-        setTaskNote("原选段在正文中出现了多次，无法确定替换位置。请重新选择后再试。");
-        return;
-      }
-      applyText(`${current.slice(0, start)}${outcome.text}${current.slice(start + baseText.length)}`);
+      applyText(`${current.slice(0, from)}${outcome.text}${current.slice(to)}`);
     }
     setOutcome(null);
     setCompare(false);
@@ -455,12 +465,13 @@ export function EditorView({ snapshot, scene, focusMode, onSelectScene, onDirty,
             <button className="icon-button" onClick={() => editor?.chain().focus().undo().run()} disabled={!editor?.can().undo()} aria-label="撤销"><Undo2 size={16} /></button>
             <button className="icon-button" onClick={() => editor?.chain().focus().redo().run()} disabled={!editor?.can().redo()} aria-label="重做"><Redo2 size={16} /></button>
             <i />
-            <button className={`icon-button ${editorState?.bold ? "active" : ""}`} onClick={() => editor?.chain().focus().toggleBold().run()} aria-label="粗体"><Bold size={16} /></button>
-            <button className={`icon-button ${editorState?.italic ? "active" : ""}`} onClick={() => editor?.chain().focus().toggleItalic().run()} aria-label="斜体"><Italic size={16} /></button>
-            <button className="icon-button" onClick={() => editor?.chain().focus().toggleBlockquote().run()} aria-label="引用"><Quote size={16} /></button>
-            <button className="icon-button" onClick={() => editor?.chain().focus().toggleBulletList().run()} aria-label="列表"><List size={16} /></button>
+            <button className="icon-button" disabled title="正文按纯文本保存，暂不支持格式" aria-label="粗体"><Bold size={16} /></button>
+            <button className="icon-button" disabled title="正文按纯文本保存，暂不支持格式" aria-label="斜体"><Italic size={16} /></button>
+            <button className="icon-button" disabled title="正文按纯文本保存，暂不支持格式" aria-label="引用"><Quote size={16} /></button>
+            <button className="icon-button" disabled title="正文按纯文本保存，暂不支持格式" aria-label="列表"><List size={16} /></button>
+            <small>纯文本 · 保留段落与换行</small>
           </div>
-          <div className="editor-meta"><span className={`save-indicator ${saveState}`}>{saveState === "saved" ? <Check size={13} /> : saveState === "saving" ? <LoaderCircle size={13} className="spin" /> : <Clock3 size={13} />}{saveState === "saved" ? "已保存" : saveState === "saving" ? "保存中" : "待保存"}</span><button className="icon-button" aria-label="版本历史" title="版本历史" onClick={onOpenReview}><History size={16} /></button><button className="icon-button" onClick={() => setRightOpen((open) => !open)} aria-label={rightOpen ? "收起助手" : "展开助手"} title={rightOpen ? "收起助手" : "展开助手"}><PanelRightClose size={16} /></button></div>
+          <div className="editor-meta"><span className={`save-indicator ${saveState}`}>{saveState === "saved" ? <Check size={13} /> : saveState === "saving" ? <LoaderCircle size={13} className="spin" /> : <Clock3 size={13} />}{saveState === "saved" ? "已保存" : saveState === "saving" ? "保存中" : saveState === "error" ? "本地草稿 · 待处理" : "待保存"}</span><button className="icon-button" aria-label="版本历史" title="版本历史" onClick={onOpenReview}><History size={16} /></button><button className="icon-button" onClick={() => setRightOpen((open) => !open)} aria-label={rightOpen ? "收起助手" : "展开助手"} title={rightOpen ? "收起助手" : "展开助手"}><PanelRightClose size={16} /></button></div>
         </div>
 
         <div className="paper-scroll">
@@ -507,14 +518,84 @@ export function EditorView({ snapshot, scene, focusMode, onSelectScene, onDirty,
                     )))}
                   </ul>
                 )}
-                <div className="candidate-actions"><button className="button ghost small" onClick={() => lastRequest && void generate(lastRequest)}><WandSparkles size={14} />重新检查</button></div>
+                <div className="candidate-actions">
+                  <button className="button ghost small" onClick={() => lastRequest && void generate(lastRequest)}><WandSparkles size={14} />重新检查</button>
+                  <button
+                    className="button primary small"
+                    disabled={nextSceneBusy}
+                    onClick={() => {
+                      setNextSceneBusy(true);
+                      void api
+                        .plotIdeate({
+                          projectId: snapshot.activeProject.projectId,
+                          mode: "next_scene",
+                          sceneId: scene.sceneId,
+                          reviewSummary: outcome.report.summary,
+                        })
+                        .then((res) => {
+                          setNextSceneCards(res.scenes ?? []);
+                          setNextSceneArtifactId(res.artifactId);
+                        })
+                        .catch((err) => setTaskNote(err instanceof Error ? err.message : "构思下一场失败"))
+                        .finally(() => setNextSceneBusy(false));
+                    }}
+                  >
+                    {nextSceneBusy ? <LoaderCircle size={13} className="spin" /> : <Sparkles size={13} />}
+                    据此构思下一场
+                  </button>
+                </div>
+                {nextSceneCards.length > 0 && (
+                  <div style={{ marginTop: 12, borderTop: "1px solid rgba(0,0,0,0.08)", paddingTop: 10 }}>
+                    <strong>下一场提案（点击即可在当前场景之后新建并跳转）：</strong>
+                    <div className="fact-grid" style={{ marginTop: 8 }}>
+                      {nextSceneCards.map((sc) => (
+                        <div key={sc.proposalId} className="fact-card" style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                          <strong>{sc.title}</strong>
+                          <small>目标：{sc.goal}</small>
+                          <small>阻碍：{sc.conflict}</small>
+                          <small>结果：{sc.summary}</small>
+                          <button
+                            className="button primary small"
+                            disabled={nextSceneBusy}
+                            onClick={() => {
+                              setNextSceneBusy(true);
+                              void flushPendingChanges()
+                                .then(() => {
+                                  const head = snapshot.branches.find((b) => b.branchId === snapshot.activeProject.activeBranchId)?.headRevisionId ?? scene.baseRevisionId;
+                                  return api.applyPlotIdeation({
+                                    projectId: snapshot.activeProject.projectId,
+                                    baseRevisionId: head,
+                                    // 掺入本批生成产物 ID：proposalId（scene-1 等）跨批次重复不会撞幂等键。
+                                    acceptanceId: `plot_next_${nextSceneArtifactId || `legacy_${sc.proposalId}`}_${sc.proposalId}`,
+                                    mode: "next_scene",
+                                    sceneId: scene.sceneId,
+                                    scenes: [sc],
+                                  });
+                                })
+                                .then(async (res) => {
+                                  setNextSceneCards([]);
+                                  await onChanged();
+                                  if (res.scenes[0]) onSelectScene(res.scenes[0].sceneId);
+                                })
+                                .catch((err) => setTaskNote(err instanceof Error ? err.message : "采用下一场失败"))
+                                .finally(() => setNextSceneBusy(false));
+                            }}
+                          >
+                            <Check size={12} />
+                            采用并跳至下一场
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
               </section>
             )}
 
             {outcome && outcome.sceneId === scene.sceneId && outcome.type !== "report" && (
               <section className={`candidate-panel ${outcome.stale || outcome.baseBody !== body ? "is-stale" : ""}`}>
                 <div className="candidate-heading"><div><Sparkles size={16} /><strong>{outcome.incomplete ? "不完整候选" : outcome.type === "replacement" ? "选段改写" : "接着写的候选"}</strong><Badge tone="violet">未进入正文</Badge></div><button className="icon-button" onClick={() => { void api.recordInteraction({ projectId: scene.projectId, sceneId: scene.sceneId, kind: "candidate-dismiss" }).catch(() => undefined); setOutcome(null); }} aria-label="关闭候选"><X size={15} /></button></div>
-                {(outcome.stale || outcome.baseBody !== body) && <p className="stale-warning"><CircleAlert size={14} />你在生成期间修改了原文。候选仍保留，请比较后决定是否采用。</p>}
+                {(outcome.stale || outcome.baseBody !== body) && <p className="stale-warning"><CircleAlert size={14} />{outcome.type === "replacement" ? "原文已变化，不能直接替换。请重新选择要推敲的文字。" : "你在生成期间修改了原文。候选仍保留，请比较后决定是否采用。"}</p>}
                 <div className={`candidate-text ${compare ? "compare" : ""}`}>
                   {compare && <div><span>{outcome.type === "replacement" ? "原选段" : "当前结尾"}</span><p>{outcome.type === "replacement" ? outcome.range.baseText : body.slice(-600)}</p></div>}
                   <div><span>{outcome.type === "replacement" ? "改写后" : compare ? "候选段落" : "将接在正文末尾"}</span><p>{outcome.text}</p></div>
@@ -523,7 +604,7 @@ export function EditorView({ snapshot, scene, focusMode, onSelectScene, onDirty,
                   <div className="proposal-list"><span>需要你决定的新事实（不会自动写入设定）</span>{outcome.proposals.map((item, index) => <p key={index}><CircleHelp size={12} />{item}</p>)}</div>
                 )}
                 <div className="candidate-actions">
-                  <button className="button primary small" onClick={acceptOutcome}><Check size={14} />{outcome.type === "replacement" ? "替换选段" : "接到正文末尾"}</button>
+                  <button className="button primary small" disabled={outcome.type === "replacement" && (outcome.stale || outcome.baseBody !== body || !outcome.range.baseText || body.slice(outcome.range.from, outcome.range.to) !== outcome.range.baseText)} onClick={acceptOutcome}><Check size={14} />{outcome.type === "replacement" ? "替换选段" : "接到正文末尾"}</button>
                   <button className="button ghost small" onClick={() => setCompare((value) => !value)}><Columns2 size={14} />{compare ? "收起比较" : "比较原文"}</button>
                   <button className="button ghost small" disabled={!lastRequest || Boolean(running)} onClick={() => lastRequest && void generate(lastRequest)}><WandSparkles size={14} />再试一稿</button>
                 </div>
@@ -557,7 +638,100 @@ export function EditorView({ snapshot, scene, focusMode, onSelectScene, onDirty,
                 <button disabled={Boolean(running)} onClick={() => editorState?.hasSelection ? polishSelection("tighten") : setTaskNote("先在正文里选中想推敲的一段，再点这里。")}><span><Highlighter size={16} /></span><div><strong>推敲这一段</strong><small>选中一段，只替换那一段</small></div><ArrowRight size={14} /></button>
                 <button disabled={Boolean(running)} onClick={() => void generate({ kind: "consistency", label: "前后照应检查", input: "检查当前场景正文与已确认设定、人物知识和物品状态是否一致。" })}><span><CheckCircle2 size={16} /></span><div><strong>检查前后照应</strong><small>用证据说话，未知不当作错误</small></div><ArrowRight size={14} /></button>
                 <button disabled={Boolean(running)} onClick={() => void generate({ kind: "consistency", label: "场景复盘", input: SCENE_REVIEW_INTENT })}><span><BookOpen size={16} /></span><div><strong>复盘这场</strong><small>看结果与可能的下一步，不给正文打分</small></div><ArrowRight size={14} /></button>
+                <button
+                  disabled={Boolean(running) || extractBusy || !body.trim()}
+                  onClick={() => {
+                    setExtractBusy(true);
+                    setTaskNote("正在扫描本场正文并核验原句证据…");
+                    void flushPendingChanges()
+                      .then(() => api.extractLedger({ projectId: snapshot.activeProject.projectId, sceneId: scene.sceneId }))
+                      .then((bundle) => {
+                        setExtractBundle(bundle);
+                        setTaskNote("已提取本场新元素、事实与事件提案，请审阅后入库。");
+                      })
+                      .catch((err) => setTaskNote(err instanceof Error ? err.message : "提取设定失败"))
+                      .finally(() => setExtractBusy(false));
+                  }}
+                >
+                  <span>{extractBusy ? <LoaderCircle size={16} className="spin" /> : <LibraryBig size={16} />}</span>
+                  <div>
+                    <strong>从本场提取设定与状态</strong>
+                    <small>自动核验正文原句证据，经你确认后入库</small>
+                  </div>
+                  <ArrowRight size={14} />
+                </button>
               </div>
+              {extractBundle && extractBundle.sceneId === scene.sceneId && (
+                <section className="note-composer" style={{ marginBottom: 12 }} aria-label="本场设定提取审阅">
+                  <div className="note-composer-heading">
+                    <LibraryBig size={16} />
+                    <div>
+                      <strong>正文反向提取审阅</strong>
+                      <p>
+                        新元素 {extractBundle.newElements.length} · 事实 {extractBundle.factProposals.length} · 事件{" "}
+                        {extractBundle.eventProposals.length}
+                      </p>
+                    </div>
+                    <button className="button ghost small" onClick={() => setExtractBundle(null)}>
+                      关闭
+                    </button>
+                  </div>
+                  {extractBundle.newElements.map((el) => (
+                    <div key={el.proposalId} className="fact-card">
+                      <strong>
+                        新元素：{el.name}（{el.type}）
+                      </strong>
+                      <small>{el.summary}</small>
+                      <small style={{ opacity: 0.75 }}>证据原句：「{el.quote.slice(0, 60)}」</small>
+                    </div>
+                  ))}
+                  {extractBundle.factProposals.map((fp) => (
+                    <div key={fp.proposalId} className="fact-card">
+                      <strong>
+                        事实：{fp.subjectName} · {fp.predicate} = {fp.value}
+                      </strong>
+                      <small style={{ opacity: 0.75 }}>证据原句：「{fp.quote.slice(0, 60)}」</small>
+                    </div>
+                  ))}
+                  {extractBundle.eventProposals.map((ep) => (
+                    <div key={ep.proposalId} className="fact-card">
+                      <strong>
+                        事件：{ep.subjectName} · {ep.kind} → {ep.toValue}
+                      </strong>
+                      <small style={{ opacity: 0.75 }}>证据原句：「{ep.quote.slice(0, 60)}」</small>
+                    </div>
+                  ))}
+                  <div className="note-composer-actions">
+                    <span>全部绑定确定性段落证据 ID</span>
+                    <button
+                      className="button primary small"
+                      disabled={extractBusy}
+                      onClick={() => {
+                        setExtractBusy(true);
+                        void api
+                          .applyExtractedLedger({
+                            projectId: snapshot.activeProject.projectId,
+                            sceneId: scene.sceneId,
+                            acceptanceId: `extract_${scene.sceneId}_${extractBundle.revisionId}`,
+                            newElements: extractBundle.newElements,
+                            factProposals: extractBundle.factProposals,
+                            eventProposals: extractBundle.eventProposals,
+                          })
+                          .then(async () => {
+                            setExtractBundle(null);
+                            await onChanged();
+                            setTaskNote("已将提取的元素、事实与状态事件写入元素账本。");
+                          })
+                          .catch((err) => setTaskNote(err instanceof Error ? err.message : "入库失败"))
+                          .finally(() => setExtractBusy(false));
+                      }}
+                    >
+                      <Check size={13} />
+                      全部确认入库
+                    </button>
+                  </div>
+                </section>
+              )}
               <div className="assistant-divider"><span>本场写作依据</span></div>
               <section className="context-group"><div className="context-group-title"><ChevronDown size={13} /><strong>必须遵守</strong><span>{entities.length + 1}</span></div><div className="constraint-card"><BookOpen size={15} /><div><strong>选定计划 · 拟发生</strong><p>{scene.goal || scene.summary || "由当前正文继续发展"}</p></div></div>{entities.slice(0, 2).map((entity) => <button className="entity-context-row" key={entity.entityId} onClick={() => onOpenElement(entity.entityId)}><span className={`entity-glyph ${entity.type}`}>{entity.name.slice(0, 1)}</span><span><strong>{entity.name}</strong><small>{entity.summary}</small></span><ChevronRight size={13} /></button>)}</section>
               <section className="context-group"><div className="context-group-title"><ChevronDown size={13} /><strong>原文证据</strong><span>{relatedEvidence.length}</span></div>{relatedEvidence.length ? relatedEvidence.slice(0, 2).map((item) => <blockquote key={item.evidenceId}>{item.quote}<cite>{item.sourceKind === "manuscript" ? "已采用正文" : "作者设定"} · {item.sourceRevisionId.slice(0, 8)}</cite></blockquote>) : <p className="quiet-empty">新场景还没有额外检索证据，将优先使用你的输入与计划。</p>}</section>
@@ -591,8 +765,34 @@ export function ScenePanel({ scene, onSave }: { scene: Scene; onSave: (scene: Sc
   const [goal, setGoal] = useState(scene.goal ?? "");
   const [conflict, setConflict] = useState(scene.conflict ?? "");
   const [change, setChange] = useState(scene.summary);
+  const [pov, setPov] = useState(scene.pov ?? "");
+  const [storyTime, setStoryTime] = useState(scene.storyTime ?? "");
   const [saved, setSaved] = useState(false);
+  const [brainstormBusy, setBrainstormBusy] = useState<"goal" | "conflict" | "summary" | null>(null);
+  const [brainstormTarget, setBrainstormTarget] = useState<"goal" | "conflict" | "summary">("conflict");
+  const [brainstormOptions, setBrainstormOptions] = useState<SceneFieldOption[]>([]);
   const update = (setter: (value: string) => void, value: string) => { setter(value); setSaved(false); };
+  const runBrainstorm = (target: "goal" | "conflict" | "summary") => {
+    if (brainstormBusy) return;
+    setBrainstormBusy(target);
+    setBrainstormTarget(target);
+    void api
+      .plotIdeate({
+        projectId: scene.projectId,
+        mode: "scene_brainstorm",
+        sceneId: scene.sceneId,
+        fieldTarget: target,
+      })
+      .then((res) => setBrainstormOptions(res.fieldOptions ?? []))
+      .catch(() => setBrainstormOptions([]))
+      .finally(() => setBrainstormBusy(null));
+  };
+  const applyBrainstorm = (val: string) => {
+    if (brainstormTarget === "goal") update(setGoal, val);
+    else if (brainstormTarget === "conflict") update(setConflict, val);
+    else update(setChange, val);
+    setBrainstormOptions([]);
+  };
   return (
     <div className="side-panel-content">
       <p className="eyebrow">SCENE INTENTION</p><h3>{scene.title}</h3><p className="panel-description">只填此刻有用的一项，其余可以留空。结果不必是失败或反转，也可以是决定、关系或信息变化。</p>
@@ -601,11 +801,55 @@ export function ScenePanel({ scene, onSave }: { scene: Scene; onSave: (scene: Sc
         <div><p><b>目标</b>{goal.trim() || "尚未决定"}</p><i>→</i><p><b>阻碍</b>{conflict.trim() || "尚未决定"}</p><i>→</i><p><b>结果 / 变化</b>{change.trim() || "尚未决定"}</p></div>
         <small>用来检查计划的因果连接，不给正文评分。</small>
       </div>
-      <label className="field-label">这场戏要发生什么<textarea value={goal} placeholder="例如：阿禾想在关门前结清最后一笔旧账" onChange={(event) => update(setGoal, event.target.value)} rows={3} /></label>
-      <label className="field-label">真正的阻碍<textarea value={conflict} placeholder="例如：取鞋的人说出的年份对不上" onChange={(event) => update(setConflict, event.target.value)} rows={3} /></label>
-      <label className="field-label">预期结果 / 场景摘要<textarea value={change} placeholder="例如：阿禾决定先修鞋，再询问收据来历；关店计划没有改变" onChange={(event) => update(setChange, event.target.value)} rows={3} /></label>
-      <div className="scene-fact"><span>叙述顺序</span><strong>{scene.narrationOrder}</strong></div><div className="scene-fact"><span>故事时间</span><strong>{scene.storyTime ?? "未知"}</strong></div><div className="scene-fact"><span>视角</span><strong>{scene.pov ?? "待定"}</strong></div>
-      <button className="button primary full" onClick={() => void onSave({ ...scene, goal, conflict, summary: change }).then(() => setSaved(true)).catch(() => undefined)}>{saved ? <Check size={14} /> : <Save size={14} />}{saved ? "场景卡已保存" : "保存场景卡"}</button>
+      {brainstormOptions.length > 0 && (
+        <div className="note-composer" style={{ marginBottom: 10 }} aria-label="场景字段AI急救候选">
+          <div className="note-composer-heading">
+            <Sparkles size={15} />
+            <div>
+              <strong>AI 帮我想「{brainstormTarget === "goal" ? "目标" : brainstormTarget === "conflict" ? "阻碍" : "结果"}」</strong>
+            </div>
+            <button className="button ghost small" onClick={() => setBrainstormOptions([])}>收起</button>
+          </div>
+          {brainstormOptions.map((opt) => (
+            <div key={opt.optionId} className="fact-card" style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+              <strong>{opt.label}</strong>
+              <small>{opt.value}</small>
+              <button className="button primary small" onClick={() => applyBrainstorm(opt.value)}><Check size={12} />填入此项</button>
+            </div>
+          ))}
+        </div>
+      )}
+      <label className="field-label">
+        <span style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          这场戏要发生什么
+          <button type="button" className="text-button" disabled={brainstormBusy !== null} onClick={() => runBrainstorm("goal")}>
+            {brainstormBusy === "goal" ? <LoaderCircle size={12} className="spin" /> : <Sparkles size={12} />}AI 帮我想目标
+          </button>
+        </span>
+        <textarea value={goal} placeholder="例如：阿禾想在关门前结清最后一笔旧账" onChange={(event) => update(setGoal, event.target.value)} rows={3} />
+      </label>
+      <label className="field-label">
+        <span style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          真正的阻碍
+          <button type="button" className="text-button" disabled={brainstormBusy !== null} onClick={() => runBrainstorm("conflict")}>
+            {brainstormBusy === "conflict" ? <LoaderCircle size={12} className="spin" /> : <Sparkles size={12} />}AI 帮我想阻碍
+          </button>
+        </span>
+        <textarea value={conflict} placeholder="例如：取鞋的人说出的年份对不上" onChange={(event) => update(setConflict, event.target.value)} rows={3} />
+      </label>
+      <label className="field-label">
+        <span style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          预期结果 / 场景摘要
+          <button type="button" className="text-button" disabled={brainstormBusy !== null} onClick={() => runBrainstorm("summary")}>
+            {brainstormBusy === "summary" ? <LoaderCircle size={12} className="spin" /> : <Sparkles size={12} />}AI 帮我想结果
+          </button>
+        </span>
+        <textarea value={change} placeholder="例如：阿禾决定先修鞋，再询问收据来历；关店计划没有改变" onChange={(event) => update(setChange, event.target.value)} rows={3} />
+      </label>
+      <label className="field-label">视角人物（POV）<input aria-label="场景卡视角人物" value={pov} placeholder="例如：阿禾" onChange={(event) => update(setPov, event.target.value)} /></label>
+      <label className="field-label">故事时间（storyTime）<input aria-label="场景卡故事时间" value={storyTime} placeholder="例如：1 或 第一夜" onChange={(event) => update(setStoryTime, event.target.value)} /></label>
+      <div className="scene-fact"><span>叙述顺序</span><strong>{scene.narrationOrder}</strong></div>
+      <button className="button primary full" onClick={() => void onSave({ ...scene, goal, conflict, summary: change, ...(pov.trim() ? { pov: pov.trim() } : { pov: "" }), ...(storyTime.trim() ? { storyTime: storyTime.trim() } : { storyTime: "" }) }).then(() => setSaved(true)).catch(() => undefined)}>{saved ? <Check size={14} /> : <Save size={14} />}{saved ? "场景卡已保存" : "保存场景卡"}</button>
       <p className="panel-footnote"><FilePlus2 size={13} />计划只表示“拟发生”，采用正文后才会成为稿件证据。</p>
     </div>
   );

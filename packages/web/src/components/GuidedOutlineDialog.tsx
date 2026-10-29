@@ -3,6 +3,7 @@ import type { GuidedSession, OutlineProposalScene } from "@nova-novel/shared";
 import { ArrowLeft, ArrowRight, Check, CircleAlert, LoaderCircle, RotateCcw, ShieldCheck, Sparkles, X } from "lucide-react";
 import { api } from "../lib/api";
 import { Badge } from "./UI";
+import { useDialogKeyboard } from "./useDialogKeyboard";
 
 interface GuidedOutlineDialogProps {
   projectId: string;
@@ -17,6 +18,8 @@ const STEP_LABELS = ["目标", "阻碍", "结果", "大纲"];
 
 export function GuidedOutlineDialog({ projectId, session, aiReady, onChanged, onClose, onOpenSettings }: GuidedOutlineDialogProps) {
   const [busy, setBusy] = useState(false);
+  const dialogRef = useRef<HTMLElement>(null);
+  useDialogKeyboard(dialogRef, () => { if (!busy) onClose(); });
   const [error, setError] = useState("");
   const [selected, setSelected] = useState("");
   const [custom, setCustom] = useState("");
@@ -54,7 +57,7 @@ export function GuidedOutlineDialog({ projectId, session, aiReady, onChanged, on
 
   return (
     <div className="modal-backdrop" role="presentation" onMouseDown={() => { if (!busy) onClose(); }}>
-      <section className="guided-outline-dialog" role="dialog" aria-modal="true" aria-label="交互式大纲" onMouseDown={(event) => event.stopPropagation()}>
+      <section ref={dialogRef} className="guided-outline-dialog" role="dialog" aria-modal="true" aria-label="交互式大纲" onMouseDown={(event) => event.stopPropagation()}>
         <header>
           <div><p className="eyebrow">GUIDED OUTLINE · 每一步都由你决定</p><h2>一起想出一组三场景大纲</h2><p>AI 每次只问一个问题。你可以选择、自己回答、跳过或返回；只有最后点击采用，内容才会进入作品。</p></div>
           <button className="icon-button" disabled={busy} onClick={onClose} aria-label="关闭并保留进度"><X size={17} /></button>

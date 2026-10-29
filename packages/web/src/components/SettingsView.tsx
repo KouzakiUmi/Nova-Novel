@@ -6,7 +6,7 @@ import { AppearanceView } from "./AppearanceView";
 import { writingRecommendation } from "../lib/writing-models";
 import { api } from "../lib/api";
 import { Badge } from "./UI";
-import { IconBeacon, IconCore, IconFacet, IconLens, IconQuill, IconSpark, type IconProps } from "./icons";
+import { IconBeacon, IconConstellation, IconCore, IconFacet, IconLens, IconQuill, IconSpark, type IconProps } from "./icons";
 
 const API_OPTIONS: Array<{ value: ProviderApi; label: string; hint: string; placeholder: string }> = [
   { value: "openai-completions", label: "OpenAI 兼容（Chat Completions）", hint: "适用于大多数国内外服务、OpenRouter、Ollama、LM Studio、vLLM", placeholder: "https://api.example.com/v1" },
@@ -27,7 +27,7 @@ const TASK_META: Record<TaskKind, { label: string; hint: string; icon: (props: I
   scene: { label: "续写场景", hint: "正文质量最关键，优先选中文文笔最好的模型", icon: IconQuill },
   polish: { label: "推敲与扩写", hint: "要听话、改动克制，只改选中的一段", icon: IconLens },
   consistency: { label: "一致性检查", hint: "需要推理能力和结构化输出，思考可以开高", icon: IconFacet },
-  guide: { label: "交互大纲", hint: "每轮只出一道选择题，要求选项具体、结构稳定", icon: IconSpark },
+  guide: { label: "交互大纲", hint: "每轮只出一道选择题，要求选项具体、结构稳定", icon: IconConstellation },
 };
 
 const THINKING_LABEL: Record<ThinkingLevel, string> = { off: "关闭", minimal: "极少", low: "低", medium: "中", high: "高", xhigh: "很高", max: "最高" };
