@@ -28,6 +28,11 @@
 - 可借鉴 / 建议采用：MIT 的 Agent 工具箱 monorepo，含 pi-ai（多供应商 LLM API）、pi-agent-core（工具调用与状态）、pi-durable（会话、任务与文档运行时）、pi-coding-agent（交互式 CLI）、pi-tui、pi-telemetry 等包。RPC 契约（以 v1.4.0 为准）：`pi --mode rpc --no-session` 把 Pi 作为长驻子进程，stdin / stdout 上跑严格 JSONL 记录，分为 Command（stdin）、response、Session event、Extension UI record 四类；命令可带 id，响应回带同一 id，命令处理异步，客户端须按 id 关联而非按到达顺序；`prompt` 响应的 disposition 只表示提示被接受、排队或处理，不代表模型工作已完成，须继续消费事件，`agent_end` 表示一次底层运行结束而 `agent_settled` 才表示 Pi 不会自行继续；stdout 专用于协议记录，诊断与日志走 stderr；读取须只按 LF 分帧，不能把 Unicode 换行分隔符当作记录边界；关闭 stdin 请求有序退出。文档另提供进程内 SDK（Node / Bun）与导出的 TypeScript RpcClient 两种形态。建议本平台按“子进程 + JSONL 命令/事件 + ID 关联”集成；agent_settled 只表示运行静止，任务成功还须核验中断状态、错误和产物。
 - 许可与限制：MIT。仓库说明 Pi 本身不含内置的文件系统、进程、网络与凭据权限系统，需要更强边界时应自行容器化或沙箱化；本平台的权限与审批由宿主实现承担。本机可获取的版本元数据为 1.4.0，本文所引 RPC 契约即取自该版本标签，其他版本契约须重新核对，不以最新版代替。
 
+### 1.3 Provider 插件元数据与额度语义
+
+- 来源（已读本机实现与声明）：[dsh-codex-connect](<https://github.com/franksong2702/dsh-codex-connect>)（Apache-2.0）、[dsh-opendesign-corouter](<https://github.com/KouzakiUmi/dsh-opendesign-corouter>)（MIT）、[dsh-subusage](<https://github.com/KouzakiUmi/dsh-subusage>)（MIT）、[dsh-volcengine-provider](<https://github.com/KouzakiUmi/dsh-volcengine-provider>)（MIT）。
+- 采用方式：参考 Command Code 的模型注册、OpenDesign 的 plan/paid 目录与额度端点、火山方舟双套餐模型快照/ArkCli 命令与 AK/SK 签名，以及各提供商的只读额度窗口/余额表达，独立实现 `provider-metadata.ts`、`volcengine/` 和 `AgentUsageService`。不嵌入 DSH Host，不读取这些插件、桌面端或 Codex CLI 的凭据；模型元数据按所读版本记录，真实上游能力与套餐仍需另行验证。
+
 ---
 
 ## 2. 竞品机制（产品文档）
@@ -85,6 +90,18 @@
 - 来源（2026-10-28 已读原文）：Writing Excuses 的 [15.15: Dialog](<https://writingexcuses.com/15-15-dialog/>)。节目建议区分人物的物理目标与谈话／情绪目标，并区分作者场景意图和人物说话目的。
 - 可借鉴 / 建议采用：提供“对话与行动”生成意图，保留正在做的事和想从谈话中得到的东西，允许回避、停顿与行动表达。节目自身的定位是“工具，不是规则”；删减对白等练习不转成自动修改。
 - 许可与限制：以上仅总结方法并链接原文，不复制课程、模板或示例文本；方法是否改善中文新手作品仍需真实作者与阅读体验验证。
+
+### 2.9 人机协同写作的交互证据
+
+- 来源（已读原文）：Microsoft [Human-AI Interaction Guidelines](<https://learn.microsoft.com/en-us/training/modules/introduction-to-microsofts-responsible-ai-approach/3-use-guidelines-for-human-ai-interaction>)；[CoAuthor](<https://arxiv.org/abs/2201.06796>)；[Wordcraft 专业作者研究](<https://arxiv.org/abs/2211.05030>)；[Sparks](<https://ar5iv.labs.arxiv.org/html/2110.07640>)；[TaleBrush](<https://dlnext.acm.org/doi/fullHtml/10.1145/3491102.3501819>)。
+- 采用方式：AI 输出以短建议和可丢弃候选为主，作者可忽略、局部纠正和查看后果；长候选可折叠，退回修改须能说明保留项与调整方向；优先使用场景卡和行动线而不是要求提示词。交互评估应记录建议打开、忽略、采用和修改过程，不能只看最终文本或采用率。
+- 落地位置：写作页下一步行动条、人工审阅的退回说明、交互大纲子集采用与影响预览。研究样本与模型年代各不相同，这些资料用于交互设计依据，不当作当前模型写作质量或中文用户体验已验证的结论。
+
+### 2.10 想法整理、场景组织与分层修订
+
+- 来源（已读原文）：Randy Ingermanson 的 [Snowflake Method](<https://www.advancedfictionwriting.com/articles/snowflake-method/>)；[Campfire 写作与组织功能](<https://www.campfirewriting.com/write>)；Dabble 的 [Organizing Your Story](<https://help.dabblewriter.com/en/articles/3426284-organizing-your-story>)；Scrivener 的 [Inspector](<https://www.literatureandlatte.com/blog/get-to-know-the-scrivener-inspector>)；[Plot Factory](<https://plotfactory.com/faq>)；[AutoCrit Story Analyzer](<https://www.autocrit.com/autocrit-story-analyzer-book-editing-ai-manuscript-analysis-lifetime-fb/>)；Reedsy 的 [Copy Editing](<https://reedsy.com/editing/copy-editing/>)。
+- 采用方式：正文之外需要独立的便签空间，想法可以先收集、后关联，不能自动变成事实或正文；场景列表和角色/情节大纲允许逐步扩展并回修，不把一种结构方法强制给所有作者；分析应先结构后语言，保留作者声音，避免把“检查”直接变成自动重写。
+- 落地位置：`notes` 表与创作便签页、场景卡和行动线、分级复盘、人工审阅与退回说明。Snowflake、AutoCrit 等方法和产品描述只作设计参照，不宣称其结构公式、分析维度或商业文案已经验证适用于中文作品。
 
 ---
 

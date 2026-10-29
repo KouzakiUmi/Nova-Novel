@@ -1,0 +1,35 @@
+appId: com.novanovel.studio
+productName: Nova Novel
+copyright: Copyright © 2026 Nova Novel contributors
+directories:
+  output: release-packaged
+files:
+  - electron/**
+  - packages/server/dist/**
+  - node_modules/**
+  - packages/web/dist/**
+  - package.json
+  - build/icon.ico
+asarUnpack:
+  - "**/*.node"
+  - "**/better-sqlite3/**"
+npmRebuild: false
+electronFuses:
+  runAsNode: true
+  enableNodeOptionsEnvironmentVariable: true
+  enableNodeCliInspectArguments: true
+win:
+  icon: build/icon.ico
+  requestedExecutionLevel: asInvoker
+  target:
+    - target: nsis
+      arch:
+        - x64
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: Nova Novel
+  uninstallDisplayName: Nova Novel

@@ -652,6 +652,23 @@ test("重复提交人工决定不会重复提交修订", async () => {
   assert.equal(hooks.commitCalls[0]?.body, "初稿正文\n\n候选正文：scene", "续写只能追加到已有正文末尾");
 });
 
+test("退回修改说明持久化在人工决定中且不允许伪造提交", async () => {
+  const db = await createDatabase();
+  const hooks = new TestHooks();
+  hooks.scenes.set("scene_1", makeScene());
+  const service = new PersistentWorkflowService(db, hooks);
+  const run = service.startRun("proj_1", "wfv_scene_create_1", { sceneId: "scene_1" });
+  await waitFor(() => service.getRun(run.runId)?.state === "waiting_human", "等待人工审阅");
+  const pending = service.getRun(run.runId)!.pendingDecision!;
+  service.decide(run.runId, pending.todoId, "revise", pending.inputHash, "保留当前结果，只减少解释性对白");
+  const row = db.prepare("SELECT decision_json FROM todos WHERE todo_id = ?").get(pending.todoId) as { decision_json: string };
+  const decision = JSON.parse(row.decision_json);
+  assert.equal(decision.reviewNote, "保留当前结果，只减少解释性对白");
+  assert.equal(decision.approved, false);
+  await new Promise(resolve => setTimeout(resolve, 30));
+  assert.equal(hooks.commitCalls.length, 0);
+});
+
 test("人工拒绝不同来源的候选提交", async () => {
   const db = await createDatabase();
   const hooks = new TestHooks();

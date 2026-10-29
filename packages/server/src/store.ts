@@ -1,12 +1,14 @@
 import type Database from "better-sqlite3";
 import {
   countWords, type AgentTask, type AuthoringSelection, type Branch, type CardRef, type ChangeSet,
+  type AuthorNote, type Chapter, type StructureChange, type SceneAnnotation, type CharacterArcProfile, type AuthoringEvent,
   type ContextBundle, type Evidence, type GenerationReceipt, type GenerationRequest, type IdeaCard,
   type IdeaCardFields, type Project, type ProposalBatch, type Revision, type Scene, type SelectionAction,
   type StoryRoute,
 } from "@nova-novel/shared";
 import { DomainError, EXAMPLE_IDEAS, cardKey, initialManifest, planHash, requiredString, versionNumber, type RevisionManifest } from "./domain.js";
 import { newId, now, sha256, stableHash } from "./utils.js";
+import type { ImportedScene, NovaBackup } from "./transfer.js";
 
 type JsonRow = { json: string };
 type StoredSelection = AuthoringSelection & { previousArtifactId?: string; undoTargetArtifactId?: string };
@@ -36,6 +38,7 @@ export interface ChangeSetInput {
   factChanges?: ChangeSet["factChanges"];
   graphChanges?: ChangeSet["graphChanges"];
   sceneAdditions?: ChangeSet["sceneAdditions"];
+  structureChanges?: ChangeSet["structureChanges"];
   sourceTaskId?: string;
   draftId?: string;
   selectionVersion?: number;
@@ -48,6 +51,8 @@ export interface ArtifactRecord<T = unknown> {
   createdAt: string;
   completeness: "complete" | "partial";
 }
+
+const INTERACTION_KINDS = new Set(["suggestion-open", "candidate-presented", "candidate-dismiss", "candidate-accept", "candidate-revise", "candidate-reject", "review-open", "review-dismiss", "review-decided", "note-promoted", "scene-structure-saved", "scene-plan-saved"]);
 
 /** Owns the single writable connection; callers must not open competing writers. */
 export class DomainStore {
@@ -67,6 +72,11 @@ export class DomainStore {
       CREATE TABLE IF NOT EXISTS authoring_drafts (draft_id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(project_id), branch_id TEXT NOT NULL REFERENCES branches(branch_id), base_revision_id TEXT NOT NULL REFERENCES revisions(revision_id), selection_version INTEGER NOT NULL CHECK(selection_version>=0), selection_artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id));
       CREATE TABLE IF NOT EXISTS changesets (changeset_id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(project_id), branch_id TEXT NOT NULL REFERENCES branches(branch_id), base_revision_id TEXT NOT NULL REFERENCES revisions(revision_id), acceptance_id TEXT NOT NULL UNIQUE, payload_hash TEXT NOT NULL, json TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS tasks (task_id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(project_id), idempotency_key TEXT NOT NULL UNIQUE, json TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS notes (note_id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(project_id), status TEXT NOT NULL, scene_id TEXT, element_id TEXT, json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS notes_project_idx ON notes(project_id,status,updated_at);
+      CREATE TABLE IF NOT EXISTS annotations (annotation_id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(project_id), scene_id TEXT NOT NULL REFERENCES scenes(scene_id), status TEXT NOT NULL, json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS annotations_scene_idx ON annotations(scene_id,status,updated_at);
+      CREATE TABLE IF NOT EXISTS character_arcs (entity_id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(project_id), json TEXT NOT NULL, updated_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS context_snapshots (snapshot_id TEXT PRIMARY KEY, task_id TEXT NOT NULL UNIQUE REFERENCES tasks(task_id), revision_id TEXT NOT NULL REFERENCES revisions(revision_id), blob_id TEXT NOT NULL REFERENCES blobs(blob_id));
       CREATE TABLE IF NOT EXISTS domain_events (seq INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, json TEXT NOT NULL, created_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS domain_outbox (seq INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL REFERENCES projects(project_id), revision_id TEXT NOT NULL REFERENCES revisions(revision_id), created_at TEXT NOT NULL);
@@ -118,11 +128,47 @@ export class DomainStore {
     return rows.map(row => ({ seq: row.seq, kind: row.kind, value: JSON.parse(row.json) as unknown }));
   }
   eventCursor(): number { return (this.db.prepare("SELECT COALESCE(MAX(seq),0) AS seq FROM domain_events").get() as { seq: number }).seq; }
-  listProjects(): Project[] { return this.jsonList("SELECT json FROM projects ORDER BY rowid"); }
+  recordInteraction(input: { projectId: string; kind: string; sceneId?: string; actor?: AuthoringEvent["actor"]; meta?: AuthoringEvent["meta"] }): number {
+    if (!INTERACTION_KINDS.has(input.kind)) throw new DomainError(400, "INVALID_INPUT", "交互事件类型无效");
+    this.getProject(input.projectId);
+    if (input.sceneId) this.getScene(input.sceneId);
+    if (input.meta && (Object.keys(input.meta).length > 20 || Object.entries(input.meta).some(([key, value]) => key.length > 40 || !["string", "number", "boolean"].includes(typeof value) || String(value).length > 200))) throw new DomainError(400, "INVALID_INPUT", "交互事件元数据无效");
+    this.emit(input.kind, { projectId: input.projectId, ...(input.sceneId ? { sceneId: input.sceneId } : {}), actor: input.actor ?? "author", createdAt: now(), ...(input.meta ? { meta: input.meta } : {}) });
+    return this.eventCursor();
+  }
+  listInteractionEvents(projectId: string, cursor = 0, limit = 200): AuthoringEvent[] {
+    const safeLimit = Math.max(1, Math.min(500, Math.trunc(limit)));
+    const kinds = [...INTERACTION_KINDS];
+    const placeholders = kinds.map(() => "?").join(",");
+    const rows = this.db.prepare(`SELECT seq,kind,json FROM domain_events WHERE json_extract(json,'$.projectId')=? AND seq>? AND kind IN (${placeholders}) ORDER BY seq LIMIT ?`).all(projectId, cursor, ...kinds, safeLimit) as Array<{ seq: number; kind: string; json: string }>;
+    return rows.map(row => ({ seq: row.seq, kind: row.kind, ...JSON.parse(row.json) as Omit<AuthoringEvent, "seq" | "kind"> }));
+  }
+  listAllInteractionEvents(projectId: string): AuthoringEvent[] {
+    const events: AuthoringEvent[] = [];
+    let cursor = 0;
+    while (true) {
+      const batch = this.listInteractionEvents(projectId, cursor, 500);
+      events.push(...batch);
+      if (batch.length < 500) return events;
+      cursor = batch.at(-1)!.seq;
+    }
+  }
+  listProjects(includeArchived = false): Project[] { return this.jsonList<Project>("SELECT json FROM projects ORDER BY rowid").filter(project => includeArchived || !project.archivedAt); }
   getProject(projectId?: string): Project {
     const project = projectId ? this.json<Project>("SELECT json FROM projects WHERE project_id=?", projectId) : this.listProjects()[0];
     if (!project) throw new DomainError(404, "NOT_FOUND", "作品不存在");
     return project;
+  }
+  updateProject(projectId: string, patch: { title?: string; archived?: boolean }): Project {
+    const current = this.getProject(projectId);
+    const next: Project = { ...current, ...(patch.title !== undefined ? { title: requiredString(patch.title, "作品名称", 200) } : {}), updatedAt: now() };
+    if (patch.archived === true) {
+      if (!current.archivedAt && this.listProjects().length <= 1) throw new DomainError(409, "LAST_ACTIVE_PROJECT", "至少保留一个未归档作品；可以先复制作品再归档");
+      next.archivedAt = current.archivedAt ?? now();
+    } else if (patch.archived === false) delete next.archivedAt;
+    this.db.prepare("UPDATE projects SET json=? WHERE project_id=?").run(JSON.stringify(next), projectId);
+    this.emit(patch.archived === true ? "project.archived" : patch.archived === false ? "project.restored" : "project.renamed", { projectId, title: next.title });
+    return next;
   }
   listBranches(projectId: string): Branch[] {
     const rows = this.db.prepare("SELECT json,head_revision_id FROM branches WHERE project_id=? ORDER BY rowid").all(projectId) as Array<JsonRow & { head_revision_id: string }>;
@@ -171,6 +217,102 @@ export class DomainStore {
     throw new DomainError(400, "SCOPE_MISMATCH", "修订不在此分支的历史中");
   }
   listScenes(projectId: string, revisionId?: string): Scene[] { return this.getManifest(this.resolveRevision(projectId, revisionId)).scenes; }
+  listNotes(projectId: string, includeArchived = true): AuthorNote[] {
+    return this.jsonList<AuthorNote>(`SELECT json FROM notes WHERE project_id=? ${includeArchived ? "" : "AND status != 'archived'"} ORDER BY updated_at DESC`, projectId);
+  }
+  getNote(noteId: string): AuthorNote {
+    const note = this.json<AuthorNote>("SELECT json FROM notes WHERE note_id=?", noteId);
+    if (!note) throw new DomainError(404, "NOT_FOUND", "便签不存在");
+    return note;
+  }
+  createNote(input: { projectId: string; title: string; body?: string; sceneId?: string; elementId?: string; tags?: string[] }): AuthorNote {
+    this.getProject(input.projectId);
+    const note: AuthorNote = { noteId: newId("note"), projectId: input.projectId, title: requiredString(input.title, "便签标题", 200), body: input.body ?? "", status: "inbox", tags: (input.tags ?? []).slice(0, 20).map(tag => requiredString(tag, "标签", 40)), source: "author", createdAt: now(), updatedAt: now(), ...(input.sceneId ? { sceneId: input.sceneId } : {}), ...(input.elementId ? { elementId: input.elementId } : {}) };
+    if (note.sceneId) this.getScene(note.sceneId);
+    if (note.elementId) this.db.prepare("SELECT entity_id FROM kw_entities WHERE entity_id=?").get(note.elementId) ?? (() => { throw new DomainError(404, "NOT_FOUND", "元素不存在"); })();
+    this.db.prepare("INSERT INTO notes(note_id,project_id,status,scene_id,element_id,json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)").run(note.noteId, note.projectId, note.status, note.sceneId ?? null, note.elementId ?? null, JSON.stringify(note), note.createdAt, note.updatedAt);
+    this.emit("note.created", note);
+    return note;
+  }
+  updateNote(noteId: string, patch: { title?: string; body?: string; status?: AuthorNote["status"]; sceneId?: string | null; elementId?: string | null; tags?: string[] }): AuthorNote {
+    const current = this.getNote(noteId);
+    const next: AuthorNote = { ...current, ...patch, updatedAt: now() } as AuthorNote;
+    if (patch.sceneId === null) delete next.sceneId;
+    if (patch.elementId === null) delete next.elementId;
+    if (patch.title !== undefined) next.title = requiredString(patch.title, "便签标题", 200);
+    if (patch.body !== undefined && (typeof patch.body !== "string" || patch.body.length > 100_000)) throw new DomainError(400, "INVALID_INPUT", "便签内容最多 100000 字符");
+    if (patch.status !== undefined && !["inbox", "linked", "archived"].includes(patch.status)) throw new DomainError(400, "INVALID_INPUT", "便签状态无效");
+    if (patch.tags !== undefined) next.tags = patch.tags.slice(0, 20).map(tag => requiredString(tag, "标签", 40));
+    if (next.sceneId) this.getScene(next.sceneId);
+    if (next.elementId) this.db.prepare("SELECT entity_id FROM kw_entities WHERE entity_id=?").get(next.elementId) ?? (() => { throw new DomainError(404, "NOT_FOUND", "元素不存在"); })();
+    this.db.prepare("UPDATE notes SET status=?,scene_id=?,element_id=?,json=?,updated_at=? WHERE note_id=?").run(next.status, next.sceneId ?? null, next.elementId ?? null, JSON.stringify(next), next.updatedAt, noteId);
+    this.emit("note.updated", next);
+    return next;
+  }
+  promoteNote(noteId: string): { note: AuthorNote; scene: Scene; revision: Revision } {
+    const current = this.getNote(noteId);
+    if (current.status === "archived") throw new DomainError(409, "NOTE_ARCHIVED", "已归档便签不能转为场景");
+    if (current.sceneId) return { note: current, scene: this.getScene(current.sceneId), revision: this.getRevision(this.projectBranch(current.projectId).headRevisionId) };
+    return this.db.transaction(() => {
+      const branch = this.projectBranch(current.projectId);
+      const adopted = this.addScenes({ projectId: current.projectId, branchId: branch.branchId, baseRevisionId: branch.headRevisionId, acceptanceId: `note_${noteId}`, scenes: [{ title: current.title, summary: current.body }] });
+      const note = this.updateNote(noteId, { status: "linked", sceneId: adopted.scenes[0]!.sceneId });
+      this.emit("note.promoted", { noteId, sceneId: note.sceneId, revisionId: adopted.revision.revisionId });
+      return { note, scene: adopted.scenes[0]!, revision: adopted.revision };
+    })();
+  }
+  listAnnotations(projectId: string, sceneId?: string): SceneAnnotation[] {
+    return this.jsonList<SceneAnnotation>(`SELECT json FROM annotations WHERE project_id=? ${sceneId ? "AND scene_id=?" : ""} ORDER BY created_at DESC`, ...(sceneId ? [projectId, sceneId] : [projectId]));
+  }
+  getAnnotation(annotationId: string): SceneAnnotation {
+    const annotation = this.json<SceneAnnotation>("SELECT json FROM annotations WHERE annotation_id=?", annotationId);
+    if (!annotation) throw new DomainError(404, "NOT_FOUND", "批注不存在");
+    return annotation;
+  }
+  createAnnotation(input: { projectId: string; sceneId: string; kind: SceneAnnotation["kind"]; body: string; range?: SceneAnnotation["range"] }): SceneAnnotation {
+    this.getScene(input.sceneId);
+    if (!["comment", "question", "todo"].includes(input.kind)) throw new DomainError(400, "INVALID_INPUT", "批注类型无效");
+    if (input.range) {
+      const { from, to, baseText, textHash } = input.range;
+      if (!Number.isSafeInteger(from) || !Number.isSafeInteger(to) || from < 0 || to <= from || baseText.length !== to - from || sha256(baseText) !== textHash) throw new DomainError(400, "INVALID_INPUT", "批注选区锚点无效");
+    }
+    const annotation: SceneAnnotation = { annotationId: newId("annotation"), projectId: input.projectId, sceneId: input.sceneId, kind: input.kind, body: requiredString(input.body, "批注内容", 20_000), status: "open", ...(input.range ? { range: input.range } : {}), createdAt: now(), updatedAt: now() };
+    this.db.prepare("INSERT INTO annotations(annotation_id,project_id,scene_id,status,json,created_at,updated_at) VALUES(?,?,?,?,?,?,?)").run(annotation.annotationId, annotation.projectId, annotation.sceneId, annotation.status, JSON.stringify(annotation), annotation.createdAt, annotation.updatedAt);
+    this.emit("annotation.created", annotation);
+    return annotation;
+  }
+  updateAnnotation(annotationId: string, patch: { body?: string; status?: SceneAnnotation["status"] }): SceneAnnotation {
+    const current = this.getAnnotation(annotationId);
+    const next: SceneAnnotation = { ...current, ...(patch.body !== undefined ? { body: requiredString(patch.body, "批注内容", 20_000) } : {}), ...(patch.status !== undefined ? { status: patch.status } : {}), updatedAt: now(), ...(patch.status === "resolved" ? { resolvedAt: now() } : patch.status === "open" ? {} : { resolvedAt: current.resolvedAt }) };
+    if (patch.status !== undefined && !["open", "resolved"].includes(patch.status)) throw new DomainError(400, "INVALID_INPUT", "批注状态无效");
+    if (patch.status === "open") delete next.resolvedAt;
+    this.db.prepare("UPDATE annotations SET status=?,json=?,updated_at=? WHERE annotation_id=?").run(next.status, JSON.stringify(next), next.updatedAt, annotationId);
+    this.emit("annotation.updated", next);
+    return next;
+  }
+  isAnnotationStale(annotation: SceneAnnotation): boolean {
+    if (!annotation.range) return false;
+    const body = this.getScene(annotation.sceneId).body;
+    const { from, to, baseText, textHash } = annotation.range;
+    return body.slice(from, to) !== baseText || sha256(body.slice(from, to)) !== textHash;
+  }
+  listCharacterArcs(projectId: string): CharacterArcProfile[] { return this.jsonList<CharacterArcProfile>("SELECT json FROM character_arcs WHERE project_id=? ORDER BY updated_at DESC", projectId); }
+  getCharacterArc(entityId: string): CharacterArcProfile {
+    const entity = this.db.prepare("SELECT type FROM kw_entities WHERE entity_id=?").get(entityId) as { type: string } | undefined;
+    if (!entity || entity.type !== "character") throw new DomainError(404, "NOT_FOUND", "人物不存在");
+    const stored = this.json<CharacterArcProfile>("SELECT json FROM character_arcs WHERE entity_id=?", entityId);
+    if (stored) return stored;
+    return { entityId, projectId: "", motivation: "", goal: "", conflict: "", epiphany: "", notes: "", updatedAt: "" };
+  }
+  saveCharacterArc(entityId: string, input: Pick<CharacterArcProfile, "motivation" | "goal" | "conflict" | "epiphany" | "notes">): CharacterArcProfile {
+    const current = this.getCharacterArc(entityId);
+    const projectId = (this.db.prepare("SELECT project_id FROM kw_entities WHERE entity_id=?").get(entityId) as { project_id: string }).project_id;
+    for (const value of Object.values(input)) if (typeof value !== "string" || value.length > 20_000) throw new DomainError(400, "INVALID_INPUT", "人物弧线字段不能超过 20000 字符");
+    const profile: CharacterArcProfile = { entityId, projectId, ...input, updatedAt: now() };
+    this.db.prepare("INSERT INTO character_arcs(entity_id,project_id,json,updated_at) VALUES(?,?,?,?) ON CONFLICT(entity_id) DO UPDATE SET json=excluded.json,updated_at=excluded.updated_at").run(entityId, projectId, JSON.stringify(profile), profile.updatedAt);
+    this.emit("character_arc.updated", profile);
+    return profile;
+  }
   getScene(sceneId: string, revisionId?: string): Scene {
     const row = this.db.prepare("SELECT project_id FROM scenes WHERE scene_id=?").get(sceneId) as { project_id: string } | undefined;
     if (!row) throw new DomainError(404, "NOT_FOUND", "场景不存在");
@@ -179,6 +321,24 @@ export class DomainStore {
     return scene;
   }
   listChapters(projectId: string, revisionId?: string) { return this.getManifest(this.resolveRevision(projectId, revisionId)).chapters; }
+  addChapter(projectId: string, title: string): { chapter: Chapter; revision: Revision } {
+    const branch = this.projectBranch(projectId);
+    const chapter: Chapter = { chapterId: newId("chapter"), projectId, title: requiredString(title, "章节标题", 200), order: Math.max(0, ...this.listChapters(projectId).map(item => item.order)) + 1 };
+    const changeset = this.createChangeSet({ projectId, branchId: branch.branchId, baseRevisionId: branch.headRevisionId, acceptanceId: `chapter_add_${chapter.chapterId}`, structureChanges: [{ kind: "chapter.add", chapter }] });
+    return { chapter, revision: this.commitChangeSet(changeset.changeSetId, "新建章节") };
+  }
+  renameChapter(chapterId: string, title: string, baseRevisionId: string): Revision {
+    const current = this.listChapters(this.getRevision(baseRevisionId).projectId, baseRevisionId).find(chapter => chapter.chapterId === chapterId);
+    if (!current) throw new DomainError(404, "NOT_FOUND", "章节不存在");
+    const changeset = this.createChangeSet({ projectId: current.projectId, baseRevisionId, acceptanceId: `chapter_rename_${chapterId}_${sha256(title).slice(0, 16)}`, structureChanges: [{ kind: "chapter.rename", chapterId, title: requiredString(title, "章节标题", 200) }] });
+    return this.commitChangeSet(changeset.changeSetId, "重命名章节");
+  }
+  moveScene(sceneId: string, chapterId: string, narrationOrder: number, baseRevisionId: string): Revision {
+    const scene = this.getScene(sceneId, baseRevisionId);
+    if (!this.listChapters(scene.projectId, baseRevisionId).some(chapter => chapter.chapterId === chapterId)) throw new DomainError(404, "NOT_FOUND", "目标章节不存在");
+    const changeset = this.createChangeSet({ projectId: scene.projectId, baseRevisionId, acceptanceId: `scene_move_${sceneId}_${chapterId}_${narrationOrder}`, structureChanges: [{ kind: "scene.move", sceneId, chapterId, narrationOrder }] });
+    return this.commitChangeSet(changeset.changeSetId, "调整场景结构");
+  }
   getStoryGraph(projectId: string, revisionId?: string) { return this.getManifest(this.resolveRevision(projectId, revisionId)).storyGraph; }
   listEvidence(projectId: string, revisionId?: string): Evidence[] {
     const id = this.resolveRevision(projectId, revisionId);
@@ -187,6 +347,20 @@ export class DomainStore {
       sourceRevisionId: id, sceneId: scene.sceneId, blockId: "body", quote: scene.body,
       contentHash: sha256(scene.body), sourceKind: "manuscript", routeId: scene.routeId,
       narrationOrder: scene.narrationOrder,
+    }));
+  }
+  listKnowledgeEvidence(projectId: string): Evidence[] {
+    const table = this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='kw_evidence'").get();
+    if (!table) return this.listEvidence(projectId);
+    const rows = this.db.prepare("SELECT * FROM kw_evidence WHERE project_id=? ORDER BY source_revision_id, evidence_id").all(projectId) as Array<Record<string, unknown>>;
+    return rows.map(row => ({
+      evidenceId: String(row.evidence_id), projectId,
+      sourceRevisionId: String(row.source_revision_id),
+      ...(row.scene_id ? { sceneId: String(row.scene_id) } : {}),
+      ...(row.block_id ? { blockId: String(row.block_id) } : {}),
+      quote: String(row.quote), contentHash: String(row.content_hash), sourceKind: String(row.source_kind) as Evidence["sourceKind"], routeId: String(row.route_id),
+      ...(row.narration_order !== null ? { narrationOrder: Number(row.narration_order) } : {}),
+      ...(row.story_order !== null ? { storyOrder: Number(row.story_order) } : {}),
     }));
   }
   private writeRevision(revision: Revision, manifest: RevisionManifest): void {
@@ -222,6 +396,200 @@ export class DomainStore {
       if (input.example) this.addProposalBatch(selection.draftId, EXAMPLE_IDEAS, "example");
       this.emit("project.created", project);
       return project;
+    })();
+  }
+  importProject(input: { title?: string; premise?: string; chapterTitle: string; scenes: ImportedScene[] }): { project: Project; revision: Revision } {
+    if (!Array.isArray(input.scenes) || input.scenes.length < 1 || input.scenes.length > 500) throw new DomainError(400, "INVALID_INPUT", "导入必须包含 1–500 个场景");
+    const title = input.title === undefined ? "导入的作品" : requiredString(input.title, "title", 200);
+    return this.db.transaction(() => {
+      const project: Project = { projectId: newId("project"), title, premise: input.premise ?? "", createdAt: now(), updatedAt: now(), activeBranchId: newId("branch"), activeRouteId: newId("route") };
+      this.db.prepare("INSERT INTO projects(project_id,json) VALUES(?,?)").run(project.projectId, JSON.stringify(project));
+      const route: StoryRoute = { routeId: project.activeRouteId, projectId: project.projectId, name: "主线" };
+      this.db.prepare("INSERT INTO story_routes(route_id,project_id,json) VALUES(?,?,?)").run(route.routeId, project.projectId, JSON.stringify(route));
+      const chapterId = newId("chapter");
+      const scenes: Scene[] = input.scenes.map((item, index) => ({ sceneId: newId("scene"), projectId: project.projectId, chapterId, title: requiredString(item.title || `第 ${index + 1} 场`, "场景标题", 200), summary: item.summary ?? "", body: item.body, status: item.body.trim() ? "writing" : "planned", narrationOrder: index + 1, routeId: route.routeId, entityIds: [], baseRevisionId: "", updatedAt: now() }));
+      const manifest = { chapters: [{ chapterId, projectId: project.projectId, title: requiredString(input.chapterTitle, "章节标题", 200), order: 1 }], scenes, facts: [], writingIntent: {}, storyGraph: { projectId: project.projectId, revisionId: "", nodes: scenes.map((scene, index) => ({ id: scene.sceneId, kind: "scene" as const, sceneId: scene.sceneId, title: scene.title, summary: scene.summary, position: { x: 80 + index * 220, y: 120 } })), edges: [] } };
+      const revision: Revision = { revisionId: newId("revision"), projectId: project.projectId, branchId: project.activeBranchId, parentRevisionIds: [], name: "导入作品", kind: "named", createdAt: now(), wordCount: scenes.reduce((sum, scene) => sum + countWords(scene.body), 0) };
+      this.writeRevision(revision, manifest);
+      const branch: Branch = { branchId: project.activeBranchId, projectId: project.projectId, name: "主稿", headRevisionId: revision.revisionId };
+      this.db.prepare("INSERT INTO branches(branch_id,project_id,head_revision_id,json) VALUES(?,?,?,?)").run(branch.branchId, project.projectId, revision.revisionId, JSON.stringify(branch));
+      this.createDraft(project.projectId, branch.branchId);
+      this.emit("project.imported", { projectId: project.projectId, revisionId: revision.revisionId });
+      return { project, revision };
+    })();
+  }
+  duplicateProject(projectId: string): { project: Project; revision: Revision } {
+    const source = this.getProject(projectId);
+    const sourceBranch = this.projectBranch(projectId);
+    const sourceManifest = this.getManifest(sourceBranch.headRevisionId);
+    return this.db.transaction(() => {
+      const project: Project = { ...source, projectId: newId("project"), title: requiredString(`${source.title.slice(0, 190)}（副本）`, "作品名称", 200), createdAt: now(), updatedAt: now(), activeBranchId: newId("branch"), activeRouteId: "" };
+      delete project.archivedAt;
+      this.db.prepare("INSERT INTO projects(project_id,json) VALUES(?,?)").run(project.projectId, JSON.stringify(project));
+      const routeIds = new Map(this.listRoutes(projectId).map(route => [route.routeId, newId("route")]));
+      if (!routeIds.has(source.activeRouteId)) routeIds.set(source.activeRouteId, newId("route"));
+      for (const route of this.listRoutes(projectId)) {
+        const next = { ...route, routeId: routeIds.get(route.routeId)!, projectId: project.projectId };
+        this.db.prepare("INSERT INTO story_routes(route_id,project_id,json) VALUES(?,?,?)").run(next.routeId, next.projectId, JSON.stringify(next));
+      }
+      if (!this.listRoutes(projectId).length) {
+        const route: StoryRoute = { routeId: routeIds.get(source.activeRouteId)!, projectId: project.projectId, name: "主线" };
+        this.db.prepare("INSERT INTO story_routes(route_id,project_id,json) VALUES(?,?,?)").run(route.routeId, route.projectId, JSON.stringify(route));
+      }
+      project.activeRouteId = routeIds.get(source.activeRouteId)!;
+      this.db.prepare("UPDATE projects SET json=? WHERE project_id=?").run(JSON.stringify(project), project.projectId);
+      const chapterIds = new Map(sourceManifest.chapters.map(chapter => [chapter.chapterId, newId("chapter")]));
+      const sceneIds = new Map(sourceManifest.scenes.map(scene => [scene.sceneId, newId("scene")]));
+      const nodeIds = new Map(sourceManifest.storyGraph.nodes.map(node => [node.id, node.sceneId ? sceneIds.get(node.sceneId) ?? newId("node") : newId("node")]));
+      const idMap = new Map([...chapterIds, ...sceneIds, ...routeIds, ...nodeIds]);
+      const remapValue = (value: unknown): unknown => Array.isArray(value) ? value.map(remapValue) : value && typeof value === "object" ? Object.fromEntries(Object.entries(value).map(([key, item]) => [key, remapValue(item)])) : typeof value === "string" ? idMap.get(value) ?? value : value;
+      const scenes = sourceManifest.scenes.map(scene => {
+        const { pov: _pov, ...withoutPov } = scene;
+        return { ...withoutPov, sceneId: sceneIds.get(scene.sceneId)!, projectId: project.projectId, chapterId: chapterIds.get(scene.chapterId)!, routeId: routeIds.get(scene.routeId) ?? project.activeRouteId, entityIds: [], baseRevisionId: "", updatedAt: now() };
+      });
+      const manifest: RevisionManifest = {
+        chapters: sourceManifest.chapters.map(chapter => ({ ...chapter, chapterId: chapterIds.get(chapter.chapterId)!, projectId: project.projectId })),
+        scenes,
+        facts: [],
+        writingIntent: remapValue(sourceManifest.writingIntent) as Record<string, unknown>,
+        storyGraph: {
+          projectId: project.projectId,
+          revisionId: "",
+          nodes: sourceManifest.storyGraph.nodes.map(node => ({ ...node, id: nodeIds.get(node.id)!, ...(node.sceneId ? { sceneId: sceneIds.get(node.sceneId)! } : {}) })),
+          edges: sourceManifest.storyGraph.edges.filter(edge => nodeIds.has(edge.source) && nodeIds.has(edge.target)).map(edge => ({ ...edge, id: newId("edge"), source: nodeIds.get(edge.source)!, target: nodeIds.get(edge.target)! })),
+        },
+      };
+      const revision: Revision = { revisionId: newId("revision"), projectId: project.projectId, branchId: project.activeBranchId, parentRevisionIds: [], name: "复制当前作品", kind: "named", createdAt: now(), wordCount: scenes.reduce((sum, scene) => sum + countWords(scene.body), 0) };
+      this.writeRevision(revision, manifest);
+      const branch: Branch = { branchId: project.activeBranchId, projectId: project.projectId, name: "主稿", headRevisionId: revision.revisionId };
+      this.db.prepare("INSERT INTO branches(branch_id,project_id,head_revision_id,json) VALUES(?,?,?,?)").run(branch.branchId, project.projectId, revision.revisionId, JSON.stringify(branch));
+      this.createDraft(project.projectId, branch.branchId);
+      this.emit("project.duplicated", { projectId: project.projectId, sourceProjectId: projectId, revisionId: revision.revisionId });
+      return { project, revision };
+    })();
+  }
+  restoreBackup(backup: NovaBackup): { project: Project; revision: Revision; warnings: string[] } {
+    const warnings: string[] = ["恢复为当前快照的新作品；历史修订、任务运行和旧选择批次未恢复"];
+    return this.db.transaction(() => {
+      const source = backup.project;
+      const project: Project = { ...source, projectId: newId("project"), title: requiredString(`${source.title.slice(0, 190)}（恢复）`, "作品名称", 200), createdAt: now(), updatedAt: now(), activeBranchId: newId("branch"), activeRouteId: "" };
+      delete project.archivedAt;
+      this.db.prepare("INSERT INTO projects(project_id,json) VALUES(?,?)").run(project.projectId, JSON.stringify(project));
+      if (!backup.routes.length) throw new DomainError(400, "INVALID_BACKUP", "备份缺少故事路线");
+      const routeIds = new Map(backup.routes.map(route => [route.routeId, newId("route")]));
+      for (const route of backup.routes) {
+        const next = { ...route, routeId: routeIds.get(route.routeId)!, projectId: project.projectId };
+        this.db.prepare("INSERT INTO story_routes(route_id,project_id,json) VALUES(?,?,?)").run(next.routeId, next.projectId, JSON.stringify(next));
+      }
+      project.activeRouteId = routeIds.get(source.activeRouteId) ?? routeIds.values().next().value!;
+      this.db.prepare("UPDATE projects SET json=? WHERE project_id=?").run(JSON.stringify(project), project.projectId);
+      const chapterIds = new Map(backup.chapters.map(chapter => [chapter.chapterId, newId("chapter")]));
+      const sceneIds = new Map(backup.scenes.map(scene => [scene.sceneId, newId("scene")]));
+      const entityIds = new Map(backup.elements.map(entity => [entity.entityId, newId("entity")]));
+      const scenes = backup.scenes.map(scene => {
+        const chapterId = chapterIds.get(scene.chapterId);
+        if (!chapterId) throw new DomainError(400, "INVALID_BACKUP", "场景引用了不存在的章节");
+        const povEntity = scene.pov ? backup.elements.find(entity => entity.entityId === scene.pov || entity.name === scene.pov || entity.aliases.includes(scene.pov!)) : undefined;
+        const pov = povEntity ? entityIds.get(povEntity.entityId) : undefined;
+        if (scene.pov && !pov) throw new DomainError(400, "INVALID_BACKUP", "场景视角无法对应到备份中的人物 ID、名称或别名");
+        return { ...scene, sceneId: sceneIds.get(scene.sceneId)!, projectId: project.projectId, chapterId, routeId: routeIds.get(scene.routeId) ?? project.activeRouteId, entityIds: scene.entityIds.map(id => entityIds.get(id)).filter((id): id is string => Boolean(id)), ...(pov ? { pov } : {}), baseRevisionId: "", updatedAt: now() };
+      });
+      const sourceGraph = backup.storyGraph;
+      const nodeIds = new Map((sourceGraph?.nodes ?? []).map(node => [node.id, node.sceneId ? sceneIds.get(node.sceneId) ?? newId("node") : newId("node")]));
+      const manifest: RevisionManifest = {
+        chapters: backup.chapters.map(chapter => ({ ...chapter, chapterId: chapterIds.get(chapter.chapterId)!, projectId: project.projectId })),
+        scenes,
+        facts: [],
+        writingIntent: {},
+        storyGraph: sourceGraph ? {
+          projectId: project.projectId,
+          revisionId: "",
+          nodes: sourceGraph.nodes.map(node => ({ ...node, id: nodeIds.get(node.id)!, ...(node.sceneId ? { sceneId: sceneIds.get(node.sceneId)! } : {}) })),
+          edges: sourceGraph.edges.filter(edge => nodeIds.has(edge.source) && nodeIds.has(edge.target)).map(edge => ({ ...edge, id: newId("edge"), source: nodeIds.get(edge.source)!, target: nodeIds.get(edge.target)! })),
+        } : { projectId: project.projectId, revisionId: "", nodes: scenes.map((scene, index) => ({ id: scene.sceneId, kind: "scene" as const, sceneId: scene.sceneId, title: scene.title, summary: scene.summary, position: { x: 80 + index * 220, y: 120 } })), edges: [] },
+      };
+      const revision: Revision = { revisionId: newId("revision"), projectId: project.projectId, branchId: project.activeBranchId, parentRevisionIds: [], name: "从备份恢复", kind: "restored", createdAt: now(), wordCount: scenes.reduce((sum, scene) => sum + countWords(scene.body), 0) };
+      this.writeRevision(revision, manifest);
+      const branch: Branch = { branchId: project.activeBranchId, projectId: project.projectId, name: "主稿", headRevisionId: revision.revisionId };
+      this.db.prepare("INSERT INTO branches(branch_id,project_id,head_revision_id,json) VALUES(?,?,?,?)").run(branch.branchId, project.projectId, revision.revisionId, JSON.stringify(branch));
+      this.createDraft(project.projectId, branch.branchId);
+      const evidenceIds = new Map<string, string>();
+      const usedEvidenceIds = new Set<string>();
+      const backupHeadRevisionId = backup.branches.find(branch => branch.branchId === source.activeBranchId)?.headRevisionId ?? backup.branches[0]?.headRevisionId ?? "";
+      let migratedWholeEvidence = 0;
+      for (const evidence of backup.evidence) {
+        const sceneId = evidence.sceneId ? sceneIds.get(evidence.sceneId) : undefined;
+        const scene = sceneId ? scenes.find(item => item.sceneId === sceneId) : undefined;
+        const sourceRevisionId = evidence.sourceRevisionId === backupHeadRevisionId ? revision.revisionId : evidence.sourceRevisionId;
+        let quote = evidence.quote;
+        let blockId = evidence.blockId;
+        if (scene && evidence.sourceKind === "manuscript") {
+          const blocks = scene.body.split(/\n{2,}/).map(block => block.trim()).filter(Boolean);
+          if (!blockId || blockId === "body") {
+            const firstBlock = blocks[0];
+            if (firstBlock) { quote = firstBlock; blockId = `${scene.sceneId}_b1`; migratedWholeEvidence++; }
+          } else {
+            const blockMatch = blockId.match(/_b(\d+)$/);
+            if (blockMatch) blockId = `${scene.sceneId}_b${blockMatch[1]}`;
+            else if (blocks.length) {
+              const blockIndex = Math.max(0, blocks.indexOf(quote));
+              blockId = `${scene.sceneId}_b${blockIndex + 1}`;
+              quote = blocks[blockIndex] ?? quote;
+            }
+          }
+        }
+        const deterministicId = scene && evidence.sourceKind === "manuscript" && blockId ? `evidence_${sha256(`${project.projectId}:${sourceRevisionId}:${scene.sceneId}:${blockId}:${quote}`).slice(0, 24)}` : newId("evidence");
+        const evidenceId = usedEvidenceIds.has(deterministicId) ? newId("evidence") : deterministicId;
+        usedEvidenceIds.add(evidenceId);
+        evidenceIds.set(evidence.evidenceId, evidenceId);
+        this.db.prepare("INSERT INTO kw_evidence(evidence_id,project_id,source_revision_id,scene_id,block_id,quote,content_hash,source_kind,route_id,narration_order,story_order,entity_refs,secret_refs) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)").run(evidenceId, project.projectId, sourceRevisionId, sceneId ?? null, blockId ?? null, quote, sha256(quote), evidence.sourceKind, routeIds.get(evidence.routeId) ?? project.activeRouteId, evidence.narrationOrder ?? null, evidence.storyOrder ?? null, "[]", "[]");
+      }
+      if (migratedWholeEvidence) warnings.push(`${migratedWholeEvidence} 条旧版整场证据已按段落重新索引`);
+      for (const entity of backup.elements) {
+        const entityId = entityIds.get(entity.entityId)!;
+        this.db.prepare("INSERT INTO kw_entities(entity_id,project_id,type,name,summary,route_id,source_kind,review_state,unique_flag,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)").run(entityId, project.projectId, entity.type, entity.name, entity.summary, routeIds.get(entity.routeId) ?? project.activeRouteId, entity.sourceKind, entity.reviewState, 0, entity.createdAt, entity.updatedAt);
+        this.db.prepare("INSERT OR IGNORE INTO kw_aliases(project_id,entity_id,alias,kind) VALUES(?,?,?,?)").run(project.projectId, entityId, entity.name, "name");
+        for (const alias of entity.aliases) this.db.prepare("INSERT OR IGNORE INTO kw_aliases(project_id,entity_id,alias,kind) VALUES(?,?,?,?)").run(project.projectId, entityId, alias, "alias");
+      }
+      const remapEvidence = (ids: string[]) => ids.map(id => {
+        const mapped = evidenceIds.get(id);
+        if (!mapped) throw new DomainError(400, "INVALID_BACKUP", "事实或事件引用了备份中不存在的证据");
+        return mapped;
+      });
+      for (const fact of backup.facts) {
+        const entityValue = typeof fact.value === "object" && fact.value !== null && "entityId" in fact.value ? entityIds.get(fact.value.entityId) : undefined;
+        const valueKind = entityValue ? "entity" : fact.value === null ? "null" : typeof fact.value === "boolean" ? "boolean" : typeof fact.value === "number" ? "number" : "text";
+        const valueText = entityValue ? null : fact.value === null ? null : typeof fact.value === "object" ? null : String(fact.value);
+        const validFrom = fact.validFrom !== undefined && Number.isFinite(Number(fact.validFrom)) ? Number(fact.validFrom) : null;
+        const validTo = fact.validTo !== undefined && Number.isFinite(Number(fact.validTo)) ? Number(fact.validTo) : null;
+        this.db.prepare("INSERT INTO kw_facts(fact_id,project_id,subject_id,predicate,value_kind,value_text,value_entity_id,semantic_type,review_state,source_kind,route_id,valid_from_order,valid_to_order,holder_id,evidence_ids) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(newId("fact"), project.projectId, entityIds.get(fact.subjectId) ?? fact.subjectId, fact.predicate, valueKind, valueText, entityValue ?? null, fact.semanticType, fact.reviewState, fact.sourceKind, routeIds.get(fact.routeId) ?? project.activeRouteId, validFrom, validTo, fact.holderId ? entityIds.get(fact.holderId) ?? null : null, JSON.stringify(remapEvidence(fact.evidenceIds)));
+      }
+      for (const event of backup.events) {
+        this.db.prepare("INSERT INTO kw_world_events(event_id,project_id,kind,scene_id,route_id,story_time,story_order,subject_id,from_value,to_value,location,review_state,evidence_ids) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)").run(newId("event"), project.projectId, event.kind, event.sceneId ? sceneIds.get(event.sceneId) ?? null : null, routeIds.get(event.routeId) ?? project.activeRouteId, event.storyTime ?? null, event.storyOrder, entityIds.get(event.subjectId) ?? event.subjectId, event.fromValue ?? null, event.toValue ?? null, event.location ?? null, event.reviewState, JSON.stringify(remapEvidence(event.evidenceIds)));
+      }
+      for (const note of backup.notes) {
+        const next = { ...note, noteId: newId("note"), projectId: project.projectId, ...(note.sceneId ? { sceneId: sceneIds.get(note.sceneId) } : {}), ...(note.elementId ? { elementId: entityIds.get(note.elementId) } : {}) };
+        if (next.sceneId === undefined) delete next.sceneId;
+        if (next.elementId === undefined) delete next.elementId;
+        this.db.prepare("INSERT INTO notes(note_id,project_id,status,scene_id,element_id,json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)").run(next.noteId, project.projectId, next.status, next.sceneId ?? null, next.elementId ?? null, JSON.stringify(next), next.createdAt, next.updatedAt);
+      }
+      let skippedAnnotations = 0;
+      for (const annotation of backup.annotations) {
+        const sceneId = sceneIds.get(annotation.sceneId);
+        if (!sceneId) { skippedAnnotations++; continue; }
+        const next = { ...annotation, annotationId: newId("annotation"), projectId: project.projectId, sceneId };
+        this.db.prepare("INSERT INTO annotations(annotation_id,project_id,scene_id,status,json,created_at,updated_at) VALUES(?,?,?,?,?,?,?)").run(next.annotationId, project.projectId, sceneId, next.status, JSON.stringify(next), next.createdAt, next.updatedAt);
+      }
+      if (skippedAnnotations) warnings.push(`${skippedAnnotations} 条批注因来源场景缺失而未恢复`);
+      for (const arc of backup.characterArcs) {
+        const entityId = entityIds.get(arc.entityId);
+        if (!entityId) continue;
+        const next = { ...arc, entityId, projectId: project.projectId };
+        this.db.prepare("INSERT INTO character_arcs(entity_id,project_id,json,updated_at) VALUES(?,?,?,?)").run(entityId, project.projectId, JSON.stringify(next), next.updatedAt);
+      }
+      if (backup.workflows?.length) warnings.push("工作流定义未恢复；请在新作品中重新发布并检查场景引用");
+      this.emit("project.backup_restored", { projectId: project.projectId, revisionId: revision.revisionId, sourceProjectId: source.projectId });
+      return { project, revision, warnings };
     })();
   }
   putArtifact<T>(kind: string, value: T, taskId?: string, completeness: "complete" | "partial" = "complete", artifactId = newId("artifact")): ArtifactRecord<T> {
@@ -377,7 +745,7 @@ export class DomainStore {
     requiredString(input.acceptanceId, "acceptanceId", 200);
     requiredString(input.baseRevisionId, "baseRevisionId");
     this.assertRevisionOnBranch(input.projectId, branch.branchId, input.baseRevisionId);
-    for (const changes of [input.sceneChanges, input.factChanges, input.graphChanges]) {
+    for (const changes of [input.sceneChanges, input.factChanges, input.graphChanges, input.structureChanges]) {
       if (changes !== undefined && !Array.isArray(changes)) throw new DomainError(400, "INVALID_INPUT", "变更内容必须是数组");
     }
     for (const change of input.sceneChanges ?? []) {
@@ -390,6 +758,12 @@ export class DomainStore {
       if (!scene || typeof scene !== "object" || scene.projectId !== input.projectId) throw new DomainError(400, "SCOPE_MISMATCH", "新增场景不属于此作品");
       requiredString(scene.sceneId, "sceneId", 200); requiredString(scene.chapterId, "chapterId", 200); requiredString(scene.routeId, "routeId", 200);
       this.patchScene(scene, { title: scene.title, summary: scene.summary, body: scene.body, status: scene.status, narrationOrder: scene.narrationOrder, entityIds: scene.entityIds, ...(scene.goal !== undefined ? { goal: scene.goal } : {}), ...(scene.conflict !== undefined ? { conflict: scene.conflict } : {}), ...(scene.pov !== undefined ? { pov: scene.pov } : {}), ...(scene.storyTime !== undefined ? { storyTime: scene.storyTime } : {}) });
+    }
+    for (const change of input.structureChanges ?? []) {
+      if (!change || typeof change !== "object" || !["chapter.add", "chapter.rename", "scene.move"].includes(change.kind)) throw new DomainError(400, "INVALID_INPUT", "结构变更格式无效");
+      if (change.kind === "chapter.add" && (!change.chapter || typeof change.chapter.chapterId !== "string" || typeof change.chapter.title !== "string")) throw new DomainError(400, "INVALID_INPUT", "新增章节字段不完整");
+      if (change.kind === "chapter.rename" && (typeof change.chapterId !== "string" || typeof change.title !== "string")) throw new DomainError(400, "INVALID_INPUT", "章节重命名字段不完整");
+      if (change.kind === "scene.move" && (typeof change.sceneId !== "string" || typeof change.chapterId !== "string" || !Number.isSafeInteger(change.narrationOrder) || change.narrationOrder < 1)) throw new DomainError(400, "INVALID_INPUT", "场景移动字段不完整");
     }
     for (const fact of input.factChanges ?? []) {
       if (!fact || typeof fact !== "object" || typeof fact.factId !== "string" || typeof fact.subjectId !== "string" || typeof fact.predicate !== "string" || !Array.isArray(fact.evidenceIds)) throw new DomainError(400, "INVALID_FACT", "事实字段不完整");
@@ -405,7 +779,7 @@ export class DomainStore {
       if (record.task.state !== "succeeded") throw new DomainError(409, "TASK_NOT_COMPLETE", "任务尚无完整成功产物", branch.headRevisionId);
       if (record.freeze.draftId && (input.draftId !== record.freeze.draftId || input.selectionVersion !== record.freeze.selectionVersion)) throw new DomainError(409, "VERSION_CONFLICT", "必须使用产物冻结的选择版本", branch.headRevisionId, record.freeze.draftId ? this.getSelection(record.freeze.draftId).selectionVersion : undefined);
     }
-    const payload = { projectId: input.projectId, branchId: branch.branchId, baseRevisionId: input.baseRevisionId, acceptanceId: input.acceptanceId, sceneChanges: input.sceneChanges ?? [], factChanges: input.factChanges ?? [], graphChanges: input.graphChanges ?? [], sceneAdditions: input.sceneAdditions ?? [], ...(input.restoreRevisionId ? { restoreRevisionId: input.restoreRevisionId } : {}), ...(input.sourceTaskId ? { sourceTaskId: input.sourceTaskId } : {}), ...(input.draftId ? { draftId: input.draftId, selectionVersion: versionNumber(input.selectionVersion) } : {}) };
+    const payload = { projectId: input.projectId, branchId: branch.branchId, baseRevisionId: input.baseRevisionId, acceptanceId: input.acceptanceId, sceneChanges: input.sceneChanges ?? [], factChanges: input.factChanges ?? [], graphChanges: input.graphChanges ?? [], sceneAdditions: input.sceneAdditions ?? [], structureChanges: input.structureChanges ?? [], ...(input.restoreRevisionId ? { restoreRevisionId: input.restoreRevisionId } : {}), ...(input.sourceTaskId ? { sourceTaskId: input.sourceTaskId } : {}), ...(input.draftId ? { draftId: input.draftId, selectionVersion: versionNumber(input.selectionVersion) } : {}) };
     const payloadHash = stableHash(payload);
     const existing = this.json<StoredChangeSet>("SELECT json FROM changesets WHERE acceptance_id=?", input.acceptanceId);
     if (existing) {
@@ -450,6 +824,23 @@ export class DomainStore {
       const branch = this.projectBranch(changeset.projectId, changeset.branchId);
       if (branch.headRevisionId !== changeset.baseRevisionId) this.conflict(branch.branchId, changeset.draftId);
       const manifest = this.getManifest(changeset.baseRevisionId);
+      for (const change of changeset.structureChanges ?? []) {
+        if (change.kind === "chapter.add") {
+          if (manifest.chapters.some(chapter => chapter.chapterId === change.chapter.chapterId) || manifest.chapters.some(chapter => chapter.title === change.chapter.title)) throw new DomainError(400, "SCOPE_MISMATCH", "章节已存在");
+          manifest.chapters.push({ ...change.chapter, projectId: changeset.projectId, title: requiredString(change.chapter.title, "章节标题", 200) });
+        } else if (change.kind === "chapter.rename") {
+          const chapter = manifest.chapters.find(item => item.chapterId === change.chapterId);
+          if (!chapter) throw new DomainError(400, "SCOPE_MISMATCH", "章节不在此修订");
+          chapter.title = requiredString(change.title, "章节标题", 200);
+        } else {
+          const scene = manifest.scenes.find(item => item.sceneId === change.sceneId);
+          if (!scene || !manifest.chapters.some(chapter => chapter.chapterId === change.chapterId)) throw new DomainError(400, "SCOPE_MISMATCH", "移动的场景或章节不在此修订");
+          scene.chapterId = change.chapterId;
+          const targetScenes = manifest.scenes.filter(item => item.chapterId === change.chapterId && item.sceneId !== scene.sceneId).sort((a, b) => a.narrationOrder - b.narrationOrder);
+          targetScenes.splice(Math.max(0, Math.min(change.narrationOrder - 1, targetScenes.length)), 0, scene);
+          targetScenes.forEach((item, index) => { item.narrationOrder = index + 1; });
+        }
+      }
       for (const scene of changeset.sceneAdditions ?? []) {
         if (manifest.scenes.some(item => item.sceneId === scene.sceneId) || manifest.storyGraph.nodes.some(node => node.id === scene.sceneId)) throw new DomainError(400, "SCOPE_MISMATCH", "新增场景或节点已存在");
         if (!manifest.chapters.some(chapter => chapter.chapterId === scene.chapterId) || !this.listRoutes(changeset.projectId).some(route => route.routeId === scene.routeId)) throw new DomainError(400, "SCOPE_MISMATCH", "新增场景的卷章或路线不属于此作品");
@@ -506,12 +897,17 @@ export class DomainStore {
     const revision = this.commitChangeSet(changeset.changeSetId, "自动保存", "autosave");
     return { scene: this.getScene(sceneId, revision.revisionId), revision };
   }
-  addScenes(input: { projectId: string; branchId?: string; baseRevisionId: string; acceptanceId: string; scenes: Array<{ title: string; goal?: string; conflict?: string; summary?: string }> }): { revision: Revision; scenes: Scene[] } {
+  createScene(projectId: string, chapterId: string | undefined, title: string): { revision: Revision; scene: Scene } {
+    const branch = this.projectBranch(projectId);
+    const adopted = this.addScenes({ projectId, branchId: branch.branchId, baseRevisionId: branch.headRevisionId, acceptanceId: `scene_create_${newId("acceptance")}`, ...(chapterId ? { chapterId } : {}), scenes: [{ title: requiredString(title, "场景标题", 200) }] });
+    return { revision: adopted.revision, scene: adopted.scenes[0]! };
+  }
+  addScenes(input: { projectId: string; branchId?: string; baseRevisionId: string; acceptanceId: string; chapterId?: string; scenes: Array<{ title: string; goal?: string; conflict?: string; summary?: string }> }): { revision: Revision; scenes: Scene[] } {
     if (!Array.isArray(input.scenes) || input.scenes.length < 1 || input.scenes.length > 20) throw new DomainError(400, "INVALID_INPUT", "一次应采用 1–20 个场景");
     const branch = this.projectBranch(input.projectId, input.branchId);
     const project = this.getProject(input.projectId);
     const manifest = this.getManifest(input.baseRevisionId);
-    const chapter = manifest.chapters[0];
+    const chapter = input.chapterId ? manifest.chapters.find(item => item.chapterId === input.chapterId) : manifest.chapters[0];
     if (!chapter) throw new DomainError(400, "INVALID_INPUT", "当前作品没有可用章节");
     const firstOrder = Math.max(0, ...manifest.scenes.map(scene => scene.narrationOrder)) + 1;
     const scenes = input.scenes.map((item, index): Scene => ({

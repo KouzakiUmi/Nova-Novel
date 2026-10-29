@@ -262,6 +262,21 @@ async function start(server: Server): Promise<string> {
 }
 async function stop(server: Server): Promise<void> { server.closeIdleConnections(); await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())); }
 
+test("HTTP revision preview returns the selected immutable scene content", async () => {
+  const f = fixture();
+  const scene = f.store.listScenes(f.project.projectId)[0]!;
+  f.store.saveScene(scene.sceneId, { baseRevisionId: scene.baseRevisionId, body: "现稿已经改变" });
+  const server = createApp(services(f.store));
+  try {
+    const base = await start(server);
+    const response = await fetch(`${base}/api/revisions/${scene.baseRevisionId}`);
+    assert.equal(response.status, 200);
+    const preview = await response.json() as { scenes: Array<{ body: string }> };
+    assert.equal(preview.scenes[0]?.body, scene.body);
+    assert.notEqual(preview.scenes[0]?.body, "现稿已经改变");
+  } finally { await stop(server); f.close(); }
+});
+
 test("HTTP bootstrap, empty example ideas, saving, JSON errors and same-origin protection", async () => {
   const f = fixture();
   const server = createApp(services(f.store));

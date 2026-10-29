@@ -63,12 +63,12 @@ FTS 是派生数据，不因和权威表位于同一 SQLite 库就成为事实�
 
 | 表 | 主键/关键列 | 说明 |
 | --- | --- | --- |
-| `projects` | `project_id` | 作品容器；API 使用 projectId |
+| `projects` | `project_id`, `archivedAt` | 作品容器；归档是元数据状态，不删除正文或历史 |
 | `branches` | `branch_id`, `head_revision_id` | 作者修订头；CAS 目标列 |
 | `story_routes` | `route_id` | 故事内假设路线，不是 Pi fork |
 | `revisions` | `revision_id` **不可变** | 清单引用各 blob |
 | `revision_manifests` | `revision_id`, `kind`, `blob_id` | `kind∈{body,facts,events,plot_graph,structure,writing_intent}` |
-| `changesets` | `changeset_id`, `base_revision_id` | 原子提交记录 |
+| `changesets` | `changeset_id`, `base_revision_id` | 原子提交记录；可含正文、事实、剧情、场景新增与 `structureChanges`（章节新增/重命名、场景移动） |
 | `scenes` | `scene_id` | **仅稳定身份**（所属作品等）；无时间/顺序真值 |
 | `scene_revisions` | `scene_id`, `revision_id`, `story_time`, `narration_order` | 场景时间与叙述顺序**随作品 revision 版本化** |
 | `elements` / `element_facts` / `world_events` | 时态账本 | 见[元素数据模型](<ELEMENTS-RAG.md>) |
@@ -83,11 +83,15 @@ FTS 是派生数据，不因和权威表位于同一 SQLite 库就成为事实�
 | `context_evidence` | `snapshot_id`, `evidence_id`, `selection_reason` | 每次检索实际使用的证据 |
 | `artifacts` | `artifact_id`, `node_run_id`, `blob_id`, `completeness`, `artifact_kind` | 候选和部分输出的持久归档；卡片、批次与选择快照是不可变产物 |
 | `authoring_drafts` | `draft_id`, `project_id`, `branch_id`, `base_revision_id`, `selection_version`, `selection_artifact_id` | 选择草稿协调记录，只存指针与 CAS 版本，不复制场景或事实 |
+| `notes` | `note_id`, `project_id`, `status`, `scene_id`, `element_id` | 创作便签与组织关系；默认不进入修订、事实或 RAG，转为场景时复用 ChangeSet/CAS |
+| `annotations` | `annotation_id`, `scene_id`, `status`, `range.from/to/baseText/textHash` | 正文批注与选区锚点；解决/重开不创建修订，原文变化只影响锚点状态 |
+| `character_arcs` | `entity_id`, `project_id`, `motivation`, `goal`, `conflict`, `epiphany`, `notes` | 人物弧线计划；可编辑但不自动成为世界事实，实际事件用于对照 |
+| `domain_events` | `seq`, `kind`, `json` | SSE 游标与交互回放；回放仅读取白名单事件及作品/场景、时间、操作来源和有限元数据，不保存正文或提示词 |
 | `task_events` | `task_id`, `seq` | SSE 游标 |
 | `outbox` / `index_jobs` | `knowledge_version` | 向量投递 |
 | `adapters` / `capability_manifests` | 默认仅 Pi | 签名探测，禁止跨版本沿用 |
 
-`story_time` / `narration_order` 从作品 revision 清单引用的场景修订读取，包含继承内容，不要求每个版本复制所有场景行。Pi `entryId`/`leafId` 只作会话游标；API 驼峰名与表字段下划线名在映射层统一。
+`story_time` / `narration_order` 从作品 revision 清单引用的场景修订读取，包含继承内容，不要求每个版本复制所有场景行。Pi `entryId`/`leafId` 只作会话游标；API 驼峰名与表字段下划线名在映射层统一。正文 `evidenceId` 按作品、修订、场景、段落与内容确定，JSON 备份恢复后的重索引复用同一 ID，保持事实/事件引用可回查；POV 在查询与恢复时统一解析为实体 ID。`GET /api/revisions/:id` 返回所选修订的真实章节、场景和事实清单，供历史预览使用。
 
 ## 5. Revision、ChangeSet 与 CAS
 

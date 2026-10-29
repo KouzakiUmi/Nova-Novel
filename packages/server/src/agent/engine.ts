@@ -5,7 +5,9 @@ import type { GenerationProgress, PiConnection, ProviderApi, ProviderTestResult 
 import type { KnowledgeService, PiGenerationInput, PiGenerationResult, PiHost } from "../contracts.js";
 import type { DomainStore } from "../store.js";
 import { DomainError } from "../domain.js";
-import { AgentSettings } from "./settings.js";
+import { AgentSettings, secretOf } from "./settings.js";
+import { AgentUsageService } from "./usage.js";
+import type { VolcengineService } from "./volcengine/service.js";
 import { composePrompt, NOVEL_SYSTEM_PROMPT, parseOutput } from "./prompts.js";
 import { novelTools, type WorkflowCatalog } from "./tools.js";
 
@@ -18,7 +20,9 @@ export class EmbeddedAgentHost implements PiHost {
   private cancelled = new Set<string>();
   private workflowCatalog?: WorkflowCatalog;
   private closed = false;
-  private constructor(readonly settings: AgentSettings, readonly store: DomainStore, readonly knowledge: KnowledgeService) {}
+  readonly usage: AgentUsageService;
+  volcengine?: VolcengineService;
+  private constructor(readonly settings: AgentSettings, readonly store: DomainStore, readonly knowledge: KnowledgeService) { this.usage = new AgentUsageService(settings); }
   static async create(options: { dataDir: string; store: DomainStore; knowledge: KnowledgeService }) {
     return new EmbeddedAgentHost(await AgentSettings.create(options.dataDir), options.store, options.knowledge);
   }
@@ -114,7 +118,7 @@ export class EmbeddedAgentHost implements PiHost {
     if (run.session) await run.session.abort();
     await run.done;
   }
-  async close(): Promise<void> { this.closed = true; await Promise.all([...this.runs.keys()].map(taskId => this.cancel(taskId))); }
+  async close(): Promise<void> { this.closed = true; this.volcengine?.close(); await Promise.all([...this.runs.keys()].map(taskId => this.cancel(taskId))); }
   async testProvider(id: string, modelId?: string): Promise<ProviderTestResult> {
     const provider = this.settings.provider(id);
     const runtime = this.settings.runtime;
@@ -132,13 +136,13 @@ export class EmbeddedAgentHost implements PiHost {
   }
   async discoverProvider(id: string, input: Record<string, unknown>) {
     // 添加表单中尚未保存的 provider 只使用本次请求提供的地址与密钥。
-    const provider: { api?: unknown; baseUrl?: unknown; apiKey?: unknown } = this.settings.hasProvider(id) ? this.settings.provider(id) : {};
+    const provider: { api?: unknown; baseUrl?: unknown; apiKey?: unknown; keySource?: "manual" | "environment"; apiKeyEnv?: string } = this.settings.hasProvider(id) ? this.settings.provider(id) : {};
     const api = input.api ?? provider.api;
     if (!["openai-completions", "openai-responses"].includes(api as ProviderApi)) throw new DomainError(400, "DISCOVERY_UNSUPPORTED", "仅 OpenAI 兼容服务支持读取模型列表");
     let url: URL;
     try { url = new URL(String(input.baseUrl ?? provider.baseUrl)); } catch { throw new DomainError(400, "INVALID_BASE_URL", "服务地址无效"); }
     if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw new DomainError(400, "INVALID_BASE_URL", "服务地址无效");
-    const key = input.apiKey ?? provider.apiKey ?? "";
+    const key = input.apiKey ?? secretOf({ apiKey: typeof provider.apiKey === "string" ? provider.apiKey : "", ...(provider.keySource ? { keySource: provider.keySource } : {}), ...(provider.apiKeyEnv ? { apiKeyEnv: provider.apiKeyEnv } : {}) });
     if (typeof key !== "string" || /[\r\n]/.test(key)) throw new DomainError(400, "INVALID_API_KEY", "API Key 格式无效");
     try {
       const response = await fetch(`${url.href.replace(/\/$/, "")}/models`, { headers: key ? { Authorization: `Bearer ${key}` } : {}, signal: AbortSignal.timeout(15000), redirect: "error" });

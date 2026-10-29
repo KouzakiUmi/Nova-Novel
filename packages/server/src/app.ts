@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { timingSafeEqual } from "node:crypto";
 import type {
-  ContextQuery, GenerationRequest, IdeaCardFields, SelectionAction, WorkspaceSnapshot, ProviderUpsert, TaskRoute, WorkflowDefinition,
+  ContextQuery, GenerationRequest, IdeaCardFields, SelectionAction, WorkspaceSnapshot, ProviderUpsert, TaskRoute, WorkflowDefinition, SceneAnnotation, AuthoringEvent,
 } from "@nova-novel/shared";
 import type { KnowledgeService, PiHost, WorkflowService } from "./contracts.js";
 import { DomainError, EXAMPLE_IDEAS, requiredString, versionNumber } from "./domain.js";
@@ -9,6 +10,7 @@ import { newId, stableHash } from "./utils.js";
 import { parseStoryOrderFromTime } from "./knowledge/index.js";
 import type { GuidedOutlineService } from "./guide.js";
 import type { GuidedWorkflowService } from "./workflow-guide.js";
+import { exportBackup, exportMarkdown, parseBackup, parseManuscript } from "./transfer.js";
 
 export interface AppServices { store: DomainStore; knowledge: KnowledgeService; workflow: WorkflowService; pi: PiHost; guide?: GuidedOutlineService; workflowGuide?: GuidedWorkflowService }
 const MAX_BODY_BYTES = 1_048_576;
@@ -21,6 +23,11 @@ function json(response: ServerResponse, status: number, value: unknown): void {
 function protectLoopback(request: IncomingMessage): void {
   const remote = request.socket.remoteAddress;
   if (remote && !["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(remote)) throw new DomainError(403, "LOOPBACK_ONLY", "仅允许本机连接");
+  const pairToken = process.env.NOVA_NOVEL_PAIR_TOKEN;
+  if (pairToken) {
+    const supplied = request.headers["x-nova-novel-token"];
+    if (typeof supplied !== "string" || supplied.length !== pairToken.length || !timingSafeEqual(Buffer.from(supplied), Buffer.from(pairToken))) throw new DomainError(403, "INVALID_PAIR_TOKEN", "本机配对令牌无效");
+  }
   const host = request.headers.host;
   if (!host || !/^(?:localhost|127\.0\.0\.1|\[::1\])(?::(?:[1-9][0-9]{0,4}))?$/.test(host)) throw new DomainError(403, "INVALID_HOST", "Host 不在本机白名单内");
   const port = host.match(/:(\d+)$/)?.[1];
@@ -31,11 +38,11 @@ function protectLoopback(request: IncomingMessage): void {
   if (request.headers["sec-fetch-site"] === "cross-site") throw new DomainError(403, "INVALID_ORIGIN", "不允许跨站请求");
   if (request.headers["transfer-encoding"] && request.headers["content-length"]) throw new DomainError(400, "INVALID_BODY", "请求长度不明确");
 }
-async function body(request: IncomingMessage): Promise<Body> {
+async function body(request: IncomingMessage, maxBytes = MAX_BODY_BYTES): Promise<Body> {
   const contentType = request.headers["content-type"]?.split(";")[0]?.trim().toLowerCase();
   if (contentType !== undefined && contentType !== "application/json") throw new DomainError(415, "JSON_REQUIRED", "请使用 application/json");
   const declared = request.headers["content-length"];
-  if (declared && (!/^\d+$/.test(declared) || Number(declared) > MAX_BODY_BYTES)) throw new DomainError(413, "BODY_TOO_LARGE", "请求正文超过 1 MiB");
+  if (declared && (!/^\d+$/.test(declared) || Number(declared) > maxBytes)) throw new DomainError(413, "BODY_TOO_LARGE", "请求正文超过允许大小");
   const text = await new Promise<string>((resolve, reject) => {
     const chunks: Buffer[] = [];
     let size = 0;
@@ -43,7 +50,7 @@ async function body(request: IncomingMessage): Promise<Body> {
     request.on("data", (chunk: Buffer) => {
       if (failed) return;
       size += chunk.length;
-      if (size > MAX_BODY_BYTES) { failed = true; reject(new DomainError(413, "BODY_TOO_LARGE", "请求正文超过 1 MiB")); chunks.length = 0; return; }
+      if (size > maxBytes) { failed = true; reject(new DomainError(413, "BODY_TOO_LARGE", "请求正文超过允许大小")); chunks.length = 0; return; }
       chunks.push(chunk);
     });
     request.on("end", () => { if (!failed) resolve(Buffer.concat(chunks).toString("utf8")); });
@@ -81,10 +88,10 @@ export function createApp({ store, knowledge, workflow, pi, guide, workflowGuide
     const guided = guide?.current(project.projectId);
     const guidedWorkflow = workflowGuide?.current(project.projectId);
     return {
-      projects: store.listProjects(), activeProject: project, branches: store.listBranches(project.projectId), routes: store.listRoutes(project.projectId),
-      chapters: store.listChapters(project.projectId, branch.headRevisionId), scenes: store.listScenes(project.projectId, branch.headRevisionId),
+      projects: store.listProjects(), archivedProjects: store.listProjects(true).filter(item => item.archivedAt), activeProject: project, branches: store.listBranches(project.projectId), routes: store.listRoutes(project.projectId),
+      chapters: store.listChapters(project.projectId, branch.headRevisionId), scenes: store.listScenes(project.projectId, branch.headRevisionId), notes: store.listNotes(project.projectId), annotations: store.listAnnotations(project.projectId), characterArcs: store.listCharacterArcs(project.projectId),
       elements: knowledge.listEntities(project.projectId), facts: knowledge.listFacts(project.projectId), events: knowledge.listEvents(project.projectId),
-      evidence: store.listEvidence(project.projectId, branch.headRevisionId), authoringDraft: store.getAuthoringDraft(project.projectId),
+      evidence: store.listKnowledgeEvidence(project.projectId), authoringDraft: store.getAuthoringDraft(project.projectId),
       revisions: store.listRevisions(project.projectId), workflows: workflow.listDefinitions(), workflowRuns: workflow.listRuns(project.projectId),
       storyGraph: store.getStoryGraph(project.projectId, branch.headRevisionId), tasks: store.listTasks(project.projectId), connection: pi.getConnection(),
       ...(guided ? { guide: guided } : {}),
@@ -96,7 +103,8 @@ export function createApp({ store, knowledge, workflow, pi, guide, workflowGuide
     const branch = store.getBranch(project.activeBranchId);
     const scene = request.sceneId ? store.getScene(request.sceneId, branch.headRevisionId) : undefined;
     const storyOrder = scene ? parseStoryOrderFromTime(scene.storyTime) : undefined;
-    return { projectId: project.projectId, branchId: branch.branchId, routeId: scene?.routeId ?? project.activeRouteId, revisionId: branch.headRevisionId, query: request.input, purpose: request.kind === "consistency" ? "fact_check" : request.kind === "ideas" ? "planning" : "scene_writing", ...(scene ? { narrationOrder: scene.narrationOrder, ...(scene.pov ? { povEntityId: scene.pov } : {}) } : {}), ...(storyOrder !== undefined ? { storyOrder } : {}) };
+    const povEntityId = scene?.pov ? knowledge.listEntities(project.projectId).find(entity => entity.entityId === scene.pov || entity.name === scene.pov || entity.aliases.includes(scene.pov!))?.entityId : undefined;
+    return { projectId: project.projectId, branchId: branch.branchId, routeId: scene?.routeId ?? project.activeRouteId, revisionId: branch.headRevisionId, query: request.input, purpose: request.kind === "consistency" ? "fact_check" : request.kind === "ideas" ? "planning" : "scene_writing", ...(scene ? { narrationOrder: scene.narrationOrder, ...(povEntityId ? { povEntityId } : {}) } : {}), ...(storyOrder !== undefined ? { storyOrder } : {}) };
   }
   function indexRevision(projectId: string, revisionId: string): void {
     // Indexing is derived: a failed rebuild must not undo a durable author save.
@@ -136,7 +144,29 @@ export function createApp({ store, knowledge, workflow, pi, guide, workflowGuide
     const method = request.method ?? "GET";
     if (method === "GET" && path === "/api/health") { json(response, 200, { ok: true, storage: "sqlite", connection: pi.getConnection() }); return; }
     if (method === "GET" && path === "/api/bootstrap") { json(response, 200, snapshot(url.searchParams.get("projectId") ?? undefined)); return; }
+    if (method === "GET" && path === "/api/export/markdown") { const projectId = requiredString(url.searchParams.get("projectId"), "projectId"); response.writeHead(200, { "Content-Type": "text/markdown; charset=utf-8", "Content-Disposition": `attachment; filename="nova-novel-${projectId}.md"`, "Cache-Control": "no-store" }); response.end(exportMarkdown(snapshot(projectId))); return; }
+    if (method === "GET" && path === "/api/export/backup") { const projectId = requiredString(url.searchParams.get("projectId"), "projectId"); response.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Content-Disposition": `attachment; filename="nova-novel-${projectId}.json"`, "Cache-Control": "no-store" }); response.end(JSON.stringify(exportBackup(snapshot(projectId)), null, 2)); return; }
+    if (path === "/api/events" && method === "GET" && url.searchParams.has("projectId")) { json(response, 200, { events: store.listInteractionEvents(requiredString(url.searchParams.get("projectId"), "projectId"), Number(url.searchParams.get("cursor") ?? 0), Number(url.searchParams.get("limit") ?? 200)) }); return; }
+    if (path === "/api/events/export" && method === "GET") { const projectId = requiredString(url.searchParams.get("projectId"), "projectId"); response.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Content-Disposition": `attachment; filename="nova-novel-interactions-${projectId}.json"`, "Cache-Control": "no-store" }); response.end(JSON.stringify({ format: "nova-novel-interactions/1", events: store.listAllInteractionEvents(projectId) }, null, 2)); return; }
+    if (path === "/api/notes" && method === "GET") { json(response, 200, { notes: store.listNotes(requiredString(url.searchParams.get("projectId"), "projectId")) }); return; }
+    if (path === "/api/annotations" && method === "GET") { json(response, 200, { annotations: store.listAnnotations(requiredString(url.searchParams.get("projectId"), "projectId"), url.searchParams.get("sceneId") ?? undefined) }); return; }
+    if (path === "/api/character-arcs" && method === "GET") { const entityId = url.searchParams.get("entityId"); json(response, 200, { arcs: entityId ? [store.getCharacterArc(entityId)] : store.listCharacterArcs(requiredString(url.searchParams.get("projectId"), "projectId")) }); return; }
     if (method === "GET" && path === "/api/agent/settings" && pi.settings) { json(response, 200, pi.settings.view()); return; }
+    if (method === "GET" && path === "/api/agent/usage" && pi.usage) { json(response, 200, { reports: await pi.usage.list(url.searchParams.get("refresh") === "true") }); return; }
+    const oauth = path.match(/^\/api\/agent\/oauth\/([^/]+)$/);
+    if (oauth && decodeURIComponent(oauth[1]!) === "volcengine" && pi.volcengine) {
+      if (method === "GET") { json(response, 200, pi.volcengine.loginStatus()); return; }
+      if (method === "POST") { json(response, 200, pi.volcengine.startLogin()); return; }
+      if (method === "DELETE") { pi.volcengine.cancelLogin(); json(response, 200, { ok: true }); return; }
+    }
+    if (oauth && pi.settings) {
+      const id = decodeURIComponent(oauth[1]!);
+      if (method === "GET") { json(response, 200, pi.settings.oauthStatus(id)); return; }
+      if (method === "POST") { json(response, 200, pi.settings.startOAuth(id)); return; }
+      if (method === "DELETE") { pi.settings.oauthCancel(id); json(response, 200, { ok: true }); return; }
+    }
+    const oauthCode = path.match(/^\/api\/agent\/oauth\/([^/]+)\/code$/);
+    if (oauthCode && method === "POST" && pi.settings) { const codeInput = await body(request); pi.settings.oauthCode(decodeURIComponent(oauthCode[1]!), requiredString(codeInput.code, "code", 4000)); json(response, 200, { ok: true }); return; }
     if (method === "GET" && path === "/api/generate/progress") {
       const key = requiredString(url.searchParams.get("key"), "key", 200);
       const task = store.taskByKey(key);
@@ -169,8 +199,32 @@ export function createApp({ store, knowledge, workflow, pi, guide, workflowGuide
     if (cancelTask && method === "GET") { json(response, 200, { task: store.getTask(cancelTask[1]!) }); return; }
     const getTask = path.match(/^\/api\/tasks\/([^/]+)$/);
     if (getTask && method === "GET") { json(response, 200, store.getGeneration(getTask[1]!)); return; }
+    const revisionRoute = path.match(/^\/api\/revisions\/([^/]+)$/);
+    if (revisionRoute && method === "GET") { const revision = store.getRevision(revisionRoute[1]!); const manifest = store.getManifest(revision.revisionId); json(response, 200, { revision, chapters: manifest.chapters, scenes: manifest.scenes, facts: manifest.facts }); return; }
     if (!["POST", "PATCH", "DELETE", "PUT"].includes(method)) throw new DomainError(404, "NOT_FOUND", "接口不存在");
+    if (path === "/api/import/backup" && method === "POST") { const backupInput = await body(request, 20 * 1024 * 1024); const restored = store.restoreBackup(parseBackup(backupInput.backup)); indexRevision(restored.project.projectId, restored.revision.revisionId); json(response, 201, { ...restored, snapshot: snapshot(restored.project.projectId) }); return; }
     const input = await body(request);
+    if (path === "/api/events" && method === "POST") { const seq = store.recordInteraction({ projectId: requiredString(input.projectId, "projectId"), kind: requiredString(input.kind, "kind", 100), ...(typeof input.sceneId === "string" ? { sceneId: input.sceneId } : {}), ...(input.actor === "system" || input.actor === "author" ? { actor: input.actor } : {}), ...(input.meta && typeof input.meta === "object" && !Array.isArray(input.meta) ? { meta: input.meta as AuthoringEvent["meta"] } : {}) }); json(response, 201, { seq }); return; }
+    if (path === "/api/import" && method === "POST") { const parsed = parseManuscript(requiredString(input.text, "text", 1_000_000)); const imported = store.importProject({ ...(typeof input.title === "string" ? { title: input.title } : {}), ...(typeof input.premise === "string" ? { premise: input.premise } : {}), chapterTitle: parsed.chapterTitle, scenes: parsed.scenes }); indexRevision(imported.project.projectId, imported.revision.revisionId); json(response, 201, { ...imported, snapshot: snapshot(imported.project.projectId) }); return; }
+    const arcRoute = path.match(/^\/api\/character-arcs\/([^/]+)$/);
+    if (arcRoute && method === "PUT") { json(response, 200, { arc: store.saveCharacterArc(arcRoute[1]!, { motivation: typeof input.motivation === "string" ? input.motivation : "", goal: typeof input.goal === "string" ? input.goal : "", conflict: typeof input.conflict === "string" ? input.conflict : "", epiphany: typeof input.epiphany === "string" ? input.epiphany : "", notes: typeof input.notes === "string" ? input.notes : "" }) }); return; }
+    if (path === "/api/annotations" && method === "POST") { const created = store.createAnnotation({ projectId: requiredString(input.projectId, "projectId"), sceneId: requiredString(input.sceneId, "sceneId"), kind: input.kind as "comment" | "question" | "todo", body: requiredString(input.body, "body", 20_000), ...(input.range && typeof input.range === "object" ? { range: input.range as SceneAnnotation["range"] } : {}) }); json(response, 201, { annotation: created }); return; }
+    const annotationRoute = path.match(/^\/api\/annotations\/([^/]+)$/);
+    if (annotationRoute && method === "PATCH") { json(response, 200, { annotation: store.updateAnnotation(annotationRoute[1]!, { ...(typeof input.body === "string" ? { body: input.body } : {}), ...(typeof input.status === "string" ? { status: input.status as "open" | "resolved" } : {}) }) }); return; }
+    if (path === "/api/notes" && method === "POST") { const created = store.createNote({ projectId: requiredString(input.projectId, "projectId"), title: requiredString(input.title, "title", 200), body: typeof input.body === "string" ? input.body : "", ...(typeof input.sceneId === "string" ? { sceneId: input.sceneId } : {}), ...(typeof input.elementId === "string" ? { elementId: input.elementId } : {}), ...(Array.isArray(input.tags) ? { tags: input.tags.map((tag: unknown) => requiredString(tag, "tag", 40)) } : {}) }); json(response, 201, { note: created }); return; }
+    const noteRoute = path.match(/^\/api\/notes\/([^/]+)(?:\/(promote))?$/);
+    if (noteRoute) {
+      const noteId = noteRoute[1]!, action = noteRoute[2];
+      if (method === "PATCH" && !action) { json(response, 200, { note: store.updateNote(noteId, { ...(typeof input.title === "string" ? { title: input.title } : {}), ...(typeof input.body === "string" ? { body: input.body } : {}), ...(typeof input.status === "string" ? { status: input.status as "inbox" | "linked" | "archived" } : {}), ...(Object.hasOwn(input, "sceneId") ? { sceneId: typeof input.sceneId === "string" ? input.sceneId : null } : {}), ...(Object.hasOwn(input, "elementId") ? { elementId: typeof input.elementId === "string" ? input.elementId : null } : {}), ...(Array.isArray(input.tags) ? { tags: input.tags.map((tag: unknown) => requiredString(tag, "tag", 40)) } : {}) }) }); return; }
+      if (method === "DELETE" && !action) { json(response, 200, { note: store.updateNote(noteId, { status: "archived" }) }); return; }
+      if (method === "POST" && action === "promote") { const promoted = store.promoteNote(noteId); indexRevision(promoted.revision.projectId, promoted.revision.revisionId); json(response, 200, { ...promoted, snapshot: snapshot(promoted.revision.projectId) }); return; }
+    }
+    if (path === "/api/chapters" && method === "POST") { const created = store.addChapter(requiredString(input.projectId, "projectId"), requiredString(input.title, "title", 200)); indexRevision(created.revision.projectId, created.revision.revisionId); json(response, 201, { ...created, snapshot: snapshot(created.revision.projectId) }); return; }
+    const chapterRoute = path.match(/^\/api\/chapters\/([^/]+)$/);
+    if (chapterRoute && method === "PATCH") { const revision = store.renameChapter(chapterRoute[1]!, requiredString(input.title, "title", 200), requiredString(input.baseRevisionId, "baseRevisionId")); indexRevision(revision.projectId, revision.revisionId); json(response, 200, { revision, snapshot: snapshot(revision.projectId) }); return; }
+    if (path === "/api/scenes" && method === "POST") { const created = store.createScene(requiredString(input.projectId, "projectId"), typeof input.chapterId === "string" ? input.chapterId : undefined, requiredString(input.title, "title", 200)); indexRevision(created.revision.projectId, created.revision.revisionId); json(response, 201, { ...created, snapshot: snapshot(created.revision.projectId) }); return; }
+    const moveRoute = path.match(/^\/api\/scenes\/([^/]+)\/move$/);
+    if (moveRoute && method === "POST") { const revision = store.moveScene(moveRoute[1]!, requiredString(input.chapterId, "chapterId"), Number(input.narrationOrder), requiredString(input.baseRevisionId, "baseRevisionId")); indexRevision(revision.projectId, revision.revisionId); json(response, 200, { revision, snapshot: snapshot(revision.projectId) }); return; }
     if (path === "/api/guide/sessions" && method === "POST" && guide) { json(response, 201, { session: await guide.create(requiredString(input.projectId, "projectId")) }); return; }
     const guideRoute = path.match(/^\/api\/guide\/sessions\/([^/]+)\/(next|answer|back|cancel|apply|proposal)$/);
     if (guideRoute && guide) {
@@ -182,7 +236,7 @@ export function createApp({ store, knowledge, workflow, pi, guide, workflowGuide
       if (method === "POST" && action === "back") { json(response, 200, { session: guide.back(sessionId) }); return; }
       if (method === "POST" && action === "cancel") { json(response, 200, { session: guide.cancel(sessionId) }); return; }
       if (method === "POST" && action === "apply") {
-        const adopted = guide.apply(sessionId);
+        const adopted = guide.apply(sessionId, input.proposalIds === undefined ? undefined : Array.isArray(input.proposalIds) ? input.proposalIds.map((id: unknown) => requiredString(id, "proposalId", 100)) : (() => { throw new DomainError(400, "GUIDE_INVALID_SELECTION", "proposalIds 必须是数组"); })());
         indexRevision(adopted.revision.projectId, adopted.revision.revisionId);
         json(response, 200, { ...adopted, snapshot: snapshot(adopted.revision.projectId) }); return;
       }
@@ -221,6 +275,10 @@ export function createApp({ store, knowledge, workflow, pi, guide, workflowGuide
       indexRevision(project.projectId, head);
       json(response, 201, snapshot(project.projectId)); return;
     }
+    const duplicateProject = path.match(/^\/api\/projects\/([^/]+)\/duplicate$/);
+    if (duplicateProject && method === "POST") { const duplicated = store.duplicateProject(duplicateProject[1]!); indexRevision(duplicated.project.projectId, duplicated.revision.revisionId); json(response, 201, { ...duplicated, snapshot: snapshot(duplicated.project.projectId) }); return; }
+    const projectRoute = path.match(/^\/api\/projects\/([^/]+)$/);
+    if (projectRoute && method === "PATCH") { const project = store.updateProject(projectRoute[1]!, { ...(typeof input.title === "string" ? { title: input.title } : {}), ...(typeof input.archived === "boolean" ? { archived: input.archived } : {}) }); json(response, 200, { project, snapshot: snapshot(project.archivedAt ? undefined : project.projectId) }); return; }
     const ideas = path.match(/^\/api\/projects\/([^/]+)\/ideas$/);
     if (ideas && method === "POST") {
       const project = store.getProject(ideas[1]!);
@@ -283,6 +341,7 @@ export function createApp({ store, knowledge, workflow, pi, guide, workflowGuide
       indexRevision(result.revision.projectId, result.revision.revisionId);
       json(response, 200, { scene: result.scene, revisionId: result.revision.revisionId }); return;
     }
+
     const revisions = path.match(/^\/api\/projects\/([^/]+)\/revisions$/);
     if (revisions && method === "POST") {
       const project = store.getProject(revisions[1]!);
@@ -334,7 +393,7 @@ export function createApp({ store, knowledge, workflow, pi, guide, workflowGuide
     }
     const decision = path.match(/^\/api\/workflow-runs\/([^/]+)\/decision$/);
     if (decision && method === "POST") {
-      json(response, 200, { run: workflow.decide(decision[1]!, requiredString(input.todoId, "todoId"), requiredString(input.answer, "answer"), requiredString(input.inputHash, "inputHash")) }); return;
+      json(response, 200, { run: workflow.decide(decision[1]!, requiredString(input.todoId, "todoId"), requiredString(input.answer, "answer"), requiredString(input.inputHash, "inputHash"), input.reviewNote === undefined ? undefined : requiredString(input.reviewNote, "reviewNote", 4000)) }); return;
     }
     const cancelRun = path.match(/^\/api\/workflow-runs\/([^/]+)\/cancel$/);
     if (cancelRun && method === "POST") { json(response, 200, { run: workflow.cancel(cancelRun[1]!) }); return; }

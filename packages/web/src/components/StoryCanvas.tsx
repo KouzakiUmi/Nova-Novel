@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { Background, Controls, MiniMap, ReactFlow, applyNodeChanges, type Node, type NodeChange } from "@xyflow/react";
-import type { StoryGraph, WorkspaceSnapshot } from "@nova-novel/shared";
-import { ArrowRight, Circle, Clock3, GitBranch, LayoutList, Network, Route, Scan, Sparkles } from "lucide-react";
+import type { StoryGraph, WorkspaceSnapshot, Scene } from "@nova-novel/shared";
+import { ArrowRight, Circle, Clock3, GitBranch, LayoutList, Network, Plus, Route, Scan, Sparkles } from "lucide-react";
+import { api } from "../lib/api";
 import { Badge } from "./UI";
 
 interface StoryCanvasProps {
@@ -9,14 +10,32 @@ interface StoryCanvasProps {
   selectedSceneId: string;
   onSelectScene: (sceneId: string) => void;
   onOpenGuide: () => void;
+  onChanged: () => Promise<unknown>;
 }
 
 type StoryNode = Node<{ label: string; subtitle: string; status: string; kind: string }>;
 
-export function StoryCanvas({ snapshot, selectedSceneId, onSelectScene, onOpenGuide }: StoryCanvasProps) {
+export function StoryCanvas({ snapshot, selectedSceneId, onSelectScene, onOpenGuide, onChanged }: StoryCanvasProps) {
   const [mode, setMode] = useState<"graph" | "outline" | "timeline">("graph");
   const [activeSceneId, setActiveSceneId] = useState(selectedSceneId);
   const [layoutNote, setLayoutNote] = useState(false);
+  const [newChapterTitle, setNewChapterTitle] = useState("");
+  const [newSceneTitle, setNewSceneTitle] = useState("");
+  const [newSceneChapterId, setNewSceneChapterId] = useState(snapshot.chapters[0]?.chapterId ?? "");
+  const [editingChapterId, setEditingChapterId] = useState<string | null>(null);
+  const [editingChapterTitle, setEditingChapterTitle] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [inspectorOpen, setInspectorOpen] = useState(false);
+  useEffect(() => {
+    setActiveSceneId(snapshot.scenes.some(scene => scene.sceneId === selectedSceneId) ? selectedSceneId : snapshot.scenes[0]?.sceneId ?? "");
+    setNewSceneChapterId(snapshot.chapters[0]?.chapterId ?? "");
+    setEditingChapterId(null);
+    setError("");
+  }, [snapshot.activeProject.projectId]);
+  useEffect(() => {
+    if (snapshot.scenes.some(scene => scene.sceneId === selectedSceneId)) setActiveSceneId(selectedSceneId);
+  }, [selectedSceneId]);
   const graph = snapshot.storyGraph;
 
   const initialNodes = useMemo<StoryNode[]>(() => graph.nodes.map((node, index) => {
@@ -44,6 +63,20 @@ export function StoryCanvas({ snapshot, selectedSceneId, onSelectScene, onOpenGu
   })), [graph.edges]);
 
   const activeScene = snapshot.scenes.find((scene) => scene.sceneId === activeSceneId) ?? snapshot.scenes[0];
+  const headRevisionId = snapshot.branches.find(branch => branch.branchId === snapshot.activeProject.activeBranchId)?.headRevisionId ?? "";
+  const run = async (action: () => Promise<unknown>) => { setBusy(true); setError(""); try { await action(); await onChanged(); } catch (cause) { setError(cause instanceof Error ? cause.message : "结构操作失败，请重试"); } finally { setBusy(false); } };
+  const addChapter = () => {
+    if (!newChapterTitle.trim()) return;
+    void run(async () => { await api.createChapter(snapshot.activeProject.projectId, newChapterTitle.trim()); setNewChapterTitle(""); });
+  };
+  const addScene = () => {
+    if (!newSceneTitle.trim() || !newSceneChapterId) return;
+    void run(async () => { const result = await api.createScene(snapshot.activeProject.projectId, newSceneChapterId, newSceneTitle.trim()); setNewSceneTitle(""); onSelectScene(result.scene.sceneId); });
+  };
+  const renameChapter = (chapterId: string) => {
+    if (!editingChapterTitle.trim()) return;
+    void run(async () => { await api.renameChapter(chapterId, editingChapterTitle.trim(), headRevisionId); setEditingChapterId(null); });
+  };
   const onNodesChange = (changes: NodeChange<StoryNode>[]) => {
     setNodes((current) => applyNodeChanges(changes, current));
     if (changes.some((change) => change.type === "position" && change.dragging)) setLayoutNote(true);
@@ -53,13 +86,16 @@ export function StoryCanvas({ snapshot, selectedSceneId, onSelectScene, onOpenGu
     <div className="canvas-page">
       <header className="page-toolbar">
         <div><p className="eyebrow">STORY MAP · {graph.revisionId.slice(0, 10)}</p><h1>故事画布</h1><p>看清故事如何发生，也保留尚未选择的岔路。</p></div>
-        <div className="toolbar-actions"><button className="button secondary" onClick={onOpenGuide}><Sparkles size={14} />交互式大纲</button><div className="segmented-control"><button className={mode === "graph" ? "active" : ""} onClick={() => setMode("graph")}><Network size={14} />情节图</button><button className={mode === "outline" ? "active" : ""} onClick={() => setMode("outline")}><LayoutList size={14} />大纲</button><button className={mode === "timeline" ? "active" : ""} onClick={() => setMode("timeline")}><Clock3 size={14} />时间轴</button></div><span className="branch-chip"><GitBranch size={15} />{snapshot.branches.find((branch) => branch.branchId === snapshot.activeProject.activeBranchId)?.name ?? "主稿"}</span></div>
+        <div className="toolbar-actions"><button className="button secondary" onClick={onOpenGuide}><Sparkles size={14} />交互式大纲</button><div className="segmented-control"><button className={mode === "graph" ? "active" : ""} onClick={() => setMode("graph")}><Network size={14} />情节图</button><button className={mode === "outline" ? "active" : ""} onClick={() => setMode("outline")}><LayoutList size={14} />大纲</button><button className={mode === "timeline" ? "active" : ""} onClick={() => setMode("timeline")}><Clock3 size={14} />时间轴</button></div><button className="button ghost small" onClick={() => setInspectorOpen(open => !open)}><Scan size={14} />{inspectorOpen ? "收起检查器" : "场景检查器"}</button><span className="branch-chip"><GitBranch size={15} />{snapshot.branches.find((branch) => branch.branchId === snapshot.activeProject.activeBranchId)?.name ?? "主稿"}</span></div>
       </header>
+      {error && <p className="inline-note error">{error}</p>}
       <div className="canvas-workspace">
         <aside className="canvas-outline">
           <div className="pane-heading"><span>故事结构</span><Badge>{snapshot.scenes.length}</Badge></div>
           <div className="outline-volume"><span>当前作品</span><strong>{snapshot.activeProject.title}</strong></div>
-          {snapshot.chapters.map((chapter) => <section key={chapter.chapterId}><p className="outline-chapter">{chapter.title}</p>{snapshot.scenes.filter((scene) => scene.chapterId === chapter.chapterId).map((scene) => <button key={scene.sceneId} className={scene.sceneId === activeSceneId ? "active" : ""} onClick={() => setActiveSceneId(scene.sceneId)}><span>{String(scene.narrationOrder).padStart(2, "0")}</span>{scene.title}<i className={`scene-status-mark ${scene.status}`} /></button>)}</section>)}
+          <div className="structure-create"><input aria-label="新章节标题" value={newChapterTitle} onChange={event => setNewChapterTitle(event.target.value)} placeholder="新章节标题" /><button className="button ghost small" disabled={busy || !newChapterTitle.trim()} onClick={addChapter}><Plus size={13} />新建章节</button></div>
+          {snapshot.chapters.map((chapter) => <section key={chapter.chapterId}><div className="outline-chapter-row">{editingChapterId === chapter.chapterId ? <><input aria-label="章节标题" value={editingChapterTitle} onChange={event => setEditingChapterTitle(event.target.value)} /><button className="text-button" disabled={busy} onClick={() => renameChapter(chapter.chapterId)}>保存</button><button className="text-button" onClick={() => setEditingChapterId(null)}>取消</button></> : <><p className="outline-chapter">{chapter.title}</p><button className="icon-button" aria-label={`编辑章节 ${chapter.title}`} onClick={() => { setEditingChapterId(chapter.chapterId); setEditingChapterTitle(chapter.title); }}>✎</button></>}</div>{snapshot.scenes.filter((scene) => scene.chapterId === chapter.chapterId).map((scene) => <button key={scene.sceneId} className={scene.sceneId === activeSceneId ? "active" : ""} onClick={() => setActiveSceneId(scene.sceneId)}><span>{String(scene.narrationOrder).padStart(2, "0")}</span>{scene.title}<i className={`scene-status-mark ${scene.status}`} /></button>)}</section>)}
+          <div className="structure-create scene-create"><input aria-label="新场景标题" value={newSceneTitle} onChange={event => setNewSceneTitle(event.target.value)} placeholder="新场景标题" /><select aria-label="新场景所属章节" value={newSceneChapterId} onChange={event => setNewSceneChapterId(event.target.value)}>{snapshot.chapters.map(chapter => <option key={chapter.chapterId} value={chapter.chapterId}>{chapter.title}</option>)}</select><button className="button secondary small" disabled={busy || !newSceneTitle.trim() || !newSceneChapterId} onClick={addScene}><Plus size={13} />新建场景</button></div>
           <div className="route-card"><Route size={16} /><div><strong>故事路线</strong><p>{snapshot.routes.map((route) => route.name).join(" · ")}</p></div></div>
         </aside>
 
@@ -93,12 +129,22 @@ export function StoryCanvas({ snapshot, selectedSceneId, onSelectScene, onOpenGu
           {mode === "timeline" && <TimelineView snapshot={snapshot} activeSceneId={activeSceneId} onSelect={setActiveSceneId} />}
         </main>
 
-        <aside className="canvas-inspector">
-          {activeScene ? <><p className="eyebrow">SCENE {String(activeScene.narrationOrder).padStart(2, "0")}</p><h2>{activeScene.title}</h2><div className="inspector-tags"><Badge tone="green">{activeScene.status === "review" ? "待审阅" : "写作中"}</Badge><Badge>{activeScene.pov ?? "视角待定"}</Badge></div><p className="inspector-summary">{activeScene.summary || "这张场景卡还很轻，只留下真正确定的内容即可。"}</p><dl className="scene-metadata"><div><dt>场景目标</dt><dd>{activeScene.goal || "尚未确定"}</dd></div><div><dt>阻碍</dt><dd>{activeScene.conflict || "尚未确定"}</dd></div><div><dt>故事时间</dt><dd>{activeScene.storyTime ?? "未知"}</dd></div><div><dt>叙述顺序</dt><dd>第 {activeScene.narrationOrder} 位</dd></div></dl><div className="plan-notice"><Sparkles size={14} /><p>选定计划是“拟发生”的创作方向，不会自动写成已发生事实。</p></div><button className="button primary full" onClick={() => onSelectScene(activeScene.sceneId)}>打开这个场景<ArrowRight size={15} /></button></> : <p>选择一张场景卡查看详情。</p>}
+        <aside className={`canvas-inspector ${inspectorOpen ? "inspector-open" : ""}`}>
+          {activeScene ? <><p className="eyebrow">SCENE {String(activeScene.narrationOrder).padStart(2, "0")}</p><h2>{activeScene.title}</h2><div className="inspector-tags"><Badge tone="green">{activeScene.status === "review" ? "待审阅" : "写作中"}</Badge><Badge>{activeScene.pov ?? "视角待定"}</Badge></div><p className="inspector-summary">{activeScene.summary || "这张场景卡还很轻，只留下真正确定的内容即可。"}</p><dl className="scene-metadata"><div><dt>场景目标</dt><dd>{activeScene.goal || "尚未确定"}</dd></div><div><dt>阻碍</dt><dd>{activeScene.conflict || "尚未确定"}</dd></div><div><dt>故事时间</dt><dd>{activeScene.storyTime ?? "未知"}</dd></div><div><dt>叙述顺序</dt><dd>第 {activeScene.narrationOrder} 位</dd></div></dl><div className="plan-notice"><Sparkles size={14} /><p>选定计划是“拟发生”的创作方向，不会自动写成已发生事实。</p></div><button className="button primary full" onClick={() => onSelectScene(activeScene.sceneId)}>打开这个场景<ArrowRight size={15} /></button><SceneStructureEditor key={activeScene.sceneId} scene={activeScene} snapshot={snapshot} headRevisionId={headRevisionId} onChanged={onChanged} /></> : <p>选择一张场景卡查看详情。</p>}
         </aside>
       </div>
     </div>
   );
+}
+
+function SceneStructureEditor({ scene, snapshot, headRevisionId, onChanged }: { scene: Scene; snapshot: WorkspaceSnapshot; headRevisionId: string; onChanged: () => Promise<unknown> }) {
+  const [title, setTitle] = useState(scene.title);
+  const [chapterId, setChapterId] = useState(scene.chapterId);
+  const [order, setOrder] = useState(scene.narrationOrder);
+  const [busy, setBusy] = useState(false);
+  const saveTitle = async () => { setBusy(true); try { await api.saveScene({ ...scene, title: title.trim() }); await onChanged(); } finally { setBusy(false); } };
+  const move = async () => { setBusy(true); try { await api.moveScene(scene.sceneId, chapterId, order, headRevisionId); await onChanged(); } finally { setBusy(false); } };
+  return <section className="scene-structure-editor"><h3>场景结构</h3><label>场景标题<input aria-label="场景标题" value={title} disabled={busy} onChange={event => setTitle(event.target.value)} /></label><button className="button ghost small" disabled={busy || !title.trim()} onClick={() => void saveTitle()}>保存标题</button><div className="structure-move-grid"><label>所属章节<select aria-label="场景所属章节" value={chapterId} disabled={busy} onChange={event => setChapterId(event.target.value)}>{snapshot.chapters.map(chapter => <option key={chapter.chapterId} value={chapter.chapterId}>{chapter.title}</option>)}</select></label><label>叙述顺序<input aria-label="场景叙述顺序" type="number" min={1} value={order} disabled={busy} onChange={event => setOrder(Math.max(1, Number(event.target.value)))} /></label></div><button className="button secondary small" disabled={busy || order < 1} onClick={() => void move()}>保存结构</button></section>;
 }
 
 function OutlineView({ snapshot, activeSceneId, onSelect }: { snapshot: WorkspaceSnapshot; activeSceneId: string; onSelect: (id: string) => void }) {

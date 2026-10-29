@@ -73,6 +73,29 @@ test("guided outline persists choices, resumes, goes back without regeneration a
   } finally { db.close(); }
 });
 
+test("guided outline applies only selected scenes with the same idempotent changeset", async () => {
+  const db = new Database(":memory:");
+  try {
+    const store = new DomainStore(db);
+    const project = store.getProject();
+    const service = new GuidedOutlineService(db, store, knowledge, piHost());
+    const created = await service.create(project.projectId);
+    await service.answer(created.sessionId, { optionId: "a" });
+    await service.answer(created.sessionId, { optionId: "a" });
+    const ready = await service.answer(created.sessionId, { skip: true });
+    assert.equal(ready.status, "ready");
+    const adopted = service.apply(created.sessionId, ["scene-2"]);
+    assert.equal(adopted.scenes.length, 1);
+    assert.equal(adopted.scenes[0]?.title, "第二场");
+    assert.deepEqual(adopted.session.appliedProposalIds, ["scene-2"]);
+    assert.equal(store.listScenes(project.projectId).length, 2);
+    assert.equal(store.listRevisions(project.projectId).length, 2);
+    const again = service.apply(created.sessionId, ["scene-2"]);
+    assert.equal(again.revision.revisionId, adopted.revision.revisionId);
+    assert.equal(store.listScenes(project.projectId).length, 2);
+  } finally { db.close(); }
+});
+
 test("late generation cannot revive a cancelled guided session", async () => {
   const db = new Database(":memory:");
   try {

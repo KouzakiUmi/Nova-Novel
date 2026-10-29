@@ -196,13 +196,17 @@ export class GuidedOutlineService {
     session.proposal = parseGuideProposal(JSON.stringify({ scenes }));
     return this.save(session);
   }
-  apply(sessionId: string): { session: GuidedSession; revision: Revision; scenes: Scene[] } {
+  apply(sessionId: string, proposalIds?: string[]): { session: GuidedSession; revision: Revision; scenes: Scene[] } {
     const session = this.get(sessionId);
     if (session.status === "applied" && session.appliedRevisionId) return { session, revision: this.store.getRevision(session.appliedRevisionId), scenes: [] };
     if (session.status !== "ready" || !session.proposal) throw new DomainError(409, "GUIDE_STATE", "大纲提案尚未就绪");
-    const adopted = this.store.addScenes({ projectId: session.projectId, branchId: session.branchId, baseRevisionId: session.baseRevisionId, acceptanceId: `guide_${session.sessionId}`, scenes: session.proposal });
+    const selected = proposalIds === undefined ? session.proposal : session.proposal.filter(scene => proposalIds.includes(scene.proposalId));
+    if (selected.length === 0) throw new DomainError(400, "GUIDE_EMPTY_SELECTION", "请至少选择一个要加入作品的场景");
+    if (proposalIds && (new Set(proposalIds).size !== proposalIds.length || selected.length !== proposalIds.length)) throw new DomainError(400, "GUIDE_INVALID_SELECTION", "选择的场景不属于当前提案");
+    const adopted = this.store.addScenes({ projectId: session.projectId, branchId: session.branchId, baseRevisionId: session.baseRevisionId, acceptanceId: `guide_${session.sessionId}`, scenes: selected });
     session.status = "applied";
     session.appliedRevisionId = adopted.revision.revisionId;
+    session.appliedProposalIds = selected.map(scene => scene.proposalId);
     delete session.pending;
     this.save(session);
     return { session, ...adopted };

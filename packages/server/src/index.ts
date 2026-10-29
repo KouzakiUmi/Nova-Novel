@@ -6,6 +6,7 @@ import { dirname, extname, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { GenerationRequest } from "@nova-novel/shared";
 import { createApp } from "./app.js";
+import { VolcengineService } from "./agent/volcengine/service.js";
 import { DomainStore } from "./store.js";
 import { SqliteKnowledgeService, parseStoryOrderFromTime } from "./knowledge/index.js";
 import { PersistentWorkflowService, type WorkflowHooks } from "./workflow/index.js";
@@ -55,6 +56,9 @@ function prepareProject(projectId: string): void {
 for (const project of store.listProjects()) prepareProject(project.projectId);
 
 const pi = await EmbeddedAgentHost.create({ dataDir, store, knowledge });
+const volcengine = await VolcengineService.create(dataDir, pi.settings);
+pi.volcengine = volcengine;
+pi.usage.setVolcBackend(volcengine);
 
 function generationRequest(input: { projectId: string; sceneId?: string; kind: GenerationRequest["kind"]; input: string }): GenerationRequest {
   return { ...input, idempotencyKey: newId("workflow_generation") };
@@ -169,9 +173,11 @@ server.headersTimeout = 30_000;
 const host = process.env.NOVA_NOVEL_HOST ?? "127.0.0.1";
 if (!["127.0.0.1", "localhost", "::1"].includes(host)) throw new Error("Nova Novel 仅允许监听本机回环地址");
 const port = Number(process.env.NOVA_NOVEL_PORT ?? 43110);
-if (!Number.isSafeInteger(port) || port < 1 || port > 65535) throw new Error("NOVA_NOVEL_PORT 无效");
+if (!Number.isSafeInteger(port) || port < 0 || port > 65535) throw new Error("NOVA_NOVEL_PORT 无效");
 server.listen(port, host, () => {
-  console.log(`Nova Novel ready at http://${host}:${port}`);
+  const address = server.address();
+  const actualPort = address && typeof address === "object" ? address.port : port;
+  console.log(`Nova Novel ready at http://${host}:${actualPort}`);
   console.log(`SQLite: ${databasePath}; Pi: ${pi.getConnection().state}`);
 });
 

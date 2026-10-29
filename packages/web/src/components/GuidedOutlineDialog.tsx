@@ -21,11 +21,12 @@ export function GuidedOutlineDialog({ projectId, session, aiReady, onChanged, on
   const [selected, setSelected] = useState("");
   const [custom, setCustom] = useState("");
   const [draft, setDraft] = useState<OutlineProposalScene[]>([]);
+  const [adoptIds, setAdoptIds] = useState<Set<string>>(new Set());
   const dirtyProposal = useRef(false);
   const pending = session?.pending;
 
   useEffect(() => { setSelected(""); setCustom(""); setError(""); dirtyProposal.current = false; }, [session?.sessionId, pending?.stepId]);
-  useEffect(() => { if (session?.proposal && !dirtyProposal.current) setDraft(structuredClone(session.proposal)); }, [session?.proposal]);
+  useEffect(() => { if (session?.proposal && !dirtyProposal.current) { setDraft(structuredClone(session.proposal)); setAdoptIds(new Set(session.proposal.map(scene => scene.proposalId))); } }, [session?.proposal]);
 
   const run = async (action: () => Promise<unknown>) => {
     if (busy) return;
@@ -48,7 +49,7 @@ export function GuidedOutlineDialog({ projectId, session, aiReady, onChanged, on
   const saveProposal = () => { if (session) void run(async () => { await api.updateGuideProposal(session.sessionId, draft); dirtyProposal.current = false; }); };
   const applyProposal = () => {
     if (!session) return;
-    void run(async () => { await api.updateGuideProposal(session.sessionId, draft); dirtyProposal.current = false; await api.applyGuide(session.sessionId); });
+    void run(async () => { await api.updateGuideProposal(session.sessionId, draft); dirtyProposal.current = false; await api.applyGuide(session.sessionId, [...adoptIds]); });
   };
 
   return (
@@ -83,13 +84,13 @@ export function GuidedOutlineDialog({ projectId, session, aiReady, onChanged, on
 
           {session?.status === "ready" && session.proposal && (
             <div className="guide-proposal">
-              <div className="guide-proposal-heading"><Badge tone="green">提案已就绪</Badge><h3>这三场只是建议，还没有进入作品。</h3><p>可以逐场修改并保存。采用时会作为一个新修订一次性加入当前章节。</p></div>
-              <div className="guide-proposal-scenes">{draft.map((scene, index) => <article key={scene.proposalId}><span>0{index + 1}</span><input className="proposal-scene-title" aria-label={`第 ${index + 1} 场标题`} value={scene.title} disabled={busy} onChange={event => updateScene(index, "title", event.target.value)} /><label>目标<textarea aria-label={`第 ${index + 1} 场目标`} value={scene.goal} disabled={busy} onChange={event => updateScene(index, "goal", event.target.value)} rows={3} /></label><label>阻碍<textarea aria-label={`第 ${index + 1} 场阻碍`} value={scene.conflict} disabled={busy} onChange={event => updateScene(index, "conflict", event.target.value)} rows={3} /></label><label>结果 / 变化<textarea aria-label={`第 ${index + 1} 场结果`} value={scene.summary} disabled={busy} onChange={event => updateScene(index, "summary", event.target.value)} rows={3} /></label></article>)}</div>
-              <div className="guide-answer-actions"><button className="button ghost" disabled={busy} onClick={() => void run(() => api.backGuide(session.sessionId))}><ArrowLeft size={14} />修改上一个回答</button><button className="button secondary" disabled={busy} onClick={saveProposal}>保存提案修改</button><button className="button primary" disabled={busy} onClick={applyProposal}>{busy ? <LoaderCircle size={14} className="spin" /> : <Check size={14} />}采用为三场景</button></div>
+              <div className="guide-proposal-heading"><Badge tone="green">提案已就绪</Badge><h3>这三场只是建议，还没有进入作品。</h3><p>将新增 {adoptIds.size} 个场景，不修改已有正文或场景；未选提案只保留在本次会话。</p></div>
+              <div className="guide-proposal-scenes">{draft.map((scene, index) => <article key={scene.proposalId} className={adoptIds.has(scene.proposalId) ? "" : "not-adopted"}><span>0{index + 1}</span><label className="proposal-adopt-toggle"><input type="checkbox" aria-label={`采用第 ${index + 1} 场`} checked={adoptIds.has(scene.proposalId)} disabled={busy} onChange={() => setAdoptIds(current => { const next = new Set(current); if (next.has(scene.proposalId)) next.delete(scene.proposalId); else next.add(scene.proposalId); return next; })} />加入作品</label><input className="proposal-scene-title" aria-label={`第 ${index + 1} 场标题`} value={scene.title} disabled={busy} onChange={event => updateScene(index, "title", event.target.value)} /><label>目标<textarea aria-label={`第 ${index + 1} 场目标`} value={scene.goal} disabled={busy} onChange={event => updateScene(index, "goal", event.target.value)} rows={3} /></label><label>阻碍<textarea aria-label={`第 ${index + 1} 场阻碍`} value={scene.conflict} disabled={busy} onChange={event => updateScene(index, "conflict", event.target.value)} rows={3} /></label><label>结果 / 变化<textarea aria-label={`第 ${index + 1} 场结果`} value={scene.summary} disabled={busy} onChange={event => updateScene(index, "summary", event.target.value)} rows={3} /></label></article>)}</div>
+              <div className="guide-answer-actions"><button className="button ghost" disabled={busy} onClick={() => void run(() => api.backGuide(session.sessionId))}><ArrowLeft size={14} />修改上一个回答</button><button className="button secondary" disabled={busy} onClick={saveProposal}>保存提案修改</button><button className="button primary" disabled={busy || adoptIds.size === 0} onClick={applyProposal}>{busy ? <LoaderCircle size={14} className="spin" /> : <Check size={14} />}采用 {adoptIds.size} 个场景</button></div>
             </div>
           )}
 
-          {session?.status === "applied" && <div className="guide-empty"><Check size={26} /><h3>三场景已经加入作品</h3><p>新场景仍以“拟发生”计划存在，正文由你继续决定。可以打开故事画布查看，或开始新的交互式大纲。</p><div className="guide-complete-actions"><button className="button ghost" disabled={busy} onClick={() => void start()}>再生成一组</button><button className="button primary" onClick={onClose}>查看作品<ArrowRight size={14} /></button></div></div>}
+          {session?.status === "applied" && <div className="guide-empty"><Check size={26} /><h3>{session.appliedProposalIds?.length ?? 3} 个场景已经加入作品</h3><p>新场景仍以“拟发生”计划存在，正文由你继续决定。可以打开故事画布查看，或开始新的交互式大纲。</p><div className="guide-complete-actions"><button className="button ghost" disabled={busy} onClick={() => void start()}>再生成一组</button><button className="button primary" onClick={onClose}>查看作品<ArrowRight size={14} /></button></div></div>}
           {error && <p className="inline-note error" role="alert"><CircleAlert size={14} />{error}</p>}
         </div>
         <footer><p><ShieldCheck size={13} />关闭会保留进度。Agent 只能读取资料并提出建议，不能直接写入大纲。</p>{session && session.status !== "applied" && <button className="text-button" disabled={busy} onClick={() => { if (window.confirm("放弃这次交互式大纲？已产生的场景提案不会加入作品。")) void run(async () => { await api.cancelGuide(session.sessionId); onClose(); }); }}>放弃本次</button>}</footer>

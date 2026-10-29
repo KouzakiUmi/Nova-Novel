@@ -76,7 +76,7 @@ async function fixture() {
   }
   async function configure() { return call("/api/agent/providers", "POST", { providerId: "local-test", name: "本地测试", api: "openai-completions", baseUrl: `http://127.0.0.1:${fakeAddress.port}/v1`, apiKey: secret, models: [{ id: "writer", maxTokens: 1024 }] }); }
   const request = (kind: GenerationRequest["kind"], key = `test-${kind}`): GenerationRequest => ({ projectId: project.projectId, sceneId: scene.sceneId, kind, input: "继续当前场景", idempotencyKey: key, ...(kind === "polish" ? { range: { from: 5, to: 9, baseText: "原来如此" } } : {}) });
-  return { directory, db, store, knowledge, host, project, scene, requests, call, configure, request, setAnswer(value: string) { answer = value; }, setTool() { useTool = true; }, setToolError() { useTool = true; toolError = true; }, setLength() { finishReason = "length"; }, setSlow() { slow = true; }, setFailure() { failure = true; }, async close() {
+  return { directory, db, store, knowledge, host, project, scene, requests, fakePort: fakeAddress.port, call, configure, request, setAnswer(value: string) { answer = value; }, setTool() { useTool = true; }, setToolError() { useTool = true; toolError = true; }, setLength() { finishReason = "length"; }, setSlow() { slow = true; }, setFailure() { failure = true; }, async close() {
     await host.close();
     for (const response of sockets) response.end();
     api.closeAllConnections(); fake.closeAllConnections();
@@ -123,6 +123,82 @@ test("provider rejects invalid URL, reserved ID, shell key and malformed routes"
     for (const patch of [{ baseUrl: "file:///private" }, { baseUrl: "https://user:pass@example.invalid" }, { apiKey: "!execute" }, { models: [] }, { models: [{ id: "bad", maxTokens: 500, contextWindow: 2 }] }]) assert.equal((await f.call("/api/agent/providers/local-test", "PATCH", patch)).status, 400);
     assert.equal((await f.call("/api/agent/providers", "POST", { ...f.host.settings.provider("local-test"), providerId: "openai" })).status, 400);
     assert.equal((await f.call("/api/agent/routes", "PUT", { routes: [{ kind: "scene", thinkingLevel: "bogus" }] })).status, 400);
+  } finally { await f.close(); }
+});
+
+test("Pi and plugin provider catalogs preserve model metadata", async () => {
+  const f = await fixture();
+  try {
+    const view = (await f.call("/api/agent/settings")).value as AgentSettingsView;
+    assert.ok(view.builtinProviders.some(provider => provider.providerId === "deepseek" && provider.models.length > 0));
+    assert.ok(view.builtinProviders.some(provider => provider.providerId === "openrouter" && provider.models.length > 0));
+    assert.ok(view.builtinProviders.some(provider => provider.providerId === "opencode-go" && provider.baseUrl.includes("/go")));
+    assert.ok(view.builtinProviders.some(provider => provider.providerId === "mistral" && provider.api === "mistral-conversations"));
+    assert.ok(view.builtinProviders.some(provider => provider.providerId === "azure" && provider.api === "azure-openai-responses"));
+    const codex = view.builtinProviders.find(provider => provider.providerId === "openai-codex");
+    assert.equal(codex?.oauth, true);
+    assert.ok(codex?.models.some(model => model.id === "gpt-6.1-terra" && model.input?.includes("image")));
+    const plan = view.builtinProviders.find(provider => provider.providerId === "opendesign-plan");
+    const paid = view.builtinProviders.find(provider => provider.providerId === "opendesign-paid");
+    assert.equal(plan?.source, "plugin");
+    assert.equal(paid?.source, "plugin");
+    assert.ok(plan?.models.some(model => model.id === "gpt-6-luna"));
+    assert.ok(paid?.models.some(model => model.id === "gpt-6.1-sol"));
+  } finally { await f.close(); }
+});
+
+test("environment API keys are resolved at runtime without persisting the secret", async () => {
+  const f = await fixture();
+  const previous = process.env.NOVA_TEST_PROVIDER_KEY;
+  process.env.NOVA_TEST_PROVIDER_KEY = secret;
+  try {
+    const created = await f.call("/api/agent/providers", "POST", { providerId: "env-test", name: "环境变量测试", api: "openai-completions", baseUrl: `http://127.0.0.1:${f.fakePort}/v1`, keySource: "environment", apiKeyEnv: "NOVA_TEST_PROVIDER_KEY", models: [{ id: "writer" }] });
+    assert.equal(created.status, 201);
+    assert.equal(created.value.providers[0].keySource, "environment");
+    assert.equal(created.value.providers[0].apiKeyEnv, "NOVA_TEST_PROVIDER_KEY");
+    assert.equal(created.value.providers[0].hasApiKey, true);
+    const models = readFileSync(join(f.directory, "agent/models.json"), "utf8");
+    const settings = readFileSync(join(f.directory, "agent/settings.json"), "utf8");
+    assert.ok(models.includes("$NOVA_TEST_PROVIDER_KEY"));
+    assert.ok(!models.includes(secret));
+    assert.ok(!settings.includes(secret));
+    assert.ok(!JSON.stringify(created.value).includes(secret));
+  } finally {
+    if (previous === undefined) delete process.env.NOVA_TEST_PROVIDER_KEY; else process.env.NOVA_TEST_PROVIDER_KEY = previous;
+    await f.close();
+  }
+});
+
+test("OAuth login exposes only interaction events and accepts a manual code", async () => {
+  const f = await fixture();
+  try {
+    const runtime = f.host.settings.runtime;
+    const originalGetProvider = runtime.getProvider.bind(runtime);
+    const originalLogin = runtime.login.bind(runtime);
+    runtime.getProvider = ((id: string) => id === "anthropic" ? { auth: { oauth: {} } } : originalGetProvider(id)) as typeof runtime.getProvider;
+    runtime.login = (async (_id: string, _type: "oauth", interaction: { notify(event: { type: "auth_url"; url: string } | { type: "progress"; message: string }): void; prompt(prompt: { type: "manual_code"; message: string }): Promise<string> }) => {
+      interaction.notify({ type: "auth_url", url: "https://example.invalid/oauth" });
+      const code = await interaction.prompt({ type: "manual_code", message: "code" });
+      assert.equal(code, "test-oauth-code");
+      interaction.notify({ type: "progress", message: "done" });
+      return { type: "oauth", refresh: "refresh", access: "access", expires: Date.now() + 60_000 };
+    }) as typeof runtime.login;
+    const started = await f.call("/api/agent/oauth/anthropic", "POST", {});
+    assert.equal(started.status, 200);
+    assert.equal(started.value.status, "pending");
+    for (let index = 0; index < 20; index++) {
+      const status = await f.call("/api/agent/oauth/anthropic");
+      if (status.value.events.length > 0) break;
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.equal((await f.call("/api/agent/oauth/anthropic/code", "POST", { code: "test-oauth-code" })).status, 200);
+    for (let index = 0; index < 30; index++) {
+      const status = await f.call("/api/agent/oauth/anthropic");
+      if (status.value.status !== "pending") { assert.equal(status.value.status, "success"); break; }
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    runtime.getProvider = originalGetProvider;
+    runtime.login = originalLogin;
   } finally { await f.close(); }
 });
 

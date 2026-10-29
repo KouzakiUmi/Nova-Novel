@@ -638,6 +638,7 @@ export class SqliteKnowledgeService implements KnowledgeService {
     for (const block of effectiveBlocks) {
       index += 1;
       this.addEvidence({
+        evidenceId: `evidence_${createHash("sha256").update(`${scene.projectId}:${revisionId}:${scene.sceneId}:${scene.sceneId}_b${index}:${block}`).digest("hex").slice(0, 24)}`,
         projectId: scene.projectId,
         sourceRevisionId: revisionId,
         sceneId: scene.sceneId,

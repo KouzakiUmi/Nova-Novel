@@ -8,9 +8,12 @@ import type {
   GenerationResultPayload,
   GenerationProgress,
   AgentSettingsView,
+  OAuthStatusView,
   ProviderUpsert,
   ProviderTestResult,
   ProviderModelInput,
+  UsageReportView,
+  UsageWindowView,
   TaskRoute,
   PiConnection,
   Scene,
@@ -41,7 +44,7 @@ export interface WorkflowService {
   listDefinitions(): WorkflowDefinition[];
   listRuns(projectId: string): WorkflowRun[];
   startRun(projectId: string, workflowVersionId: string, input: Record<string, unknown>): WorkflowRun;
-  decide(runId: string, todoId: string, answer: string, inputHash: string): WorkflowRun;
+  decide(runId: string, todoId: string, answer: string, inputHash: string, reviewNote?: string): WorkflowRun;
   cancel(runId: string): WorkflowRun;
 }
 
@@ -67,11 +70,23 @@ export interface PiHost {
   generate(input: PiGenerationInput): Promise<PiGenerationResult>;
   cancel(taskId: string): Promise<void>;
   progress?(key: string): GenerationProgress;
+  usage?: { list(force?: boolean): Promise<UsageReportView[]> };
+  volcengine?: {
+    loginStatus(): OAuthStatusView;
+    startLogin(): OAuthStatusView;
+    cancelLogin(): void;
+    hasBinding(providerId: string): boolean;
+    usageFor(providerId: string): Promise<UsageWindowView[] | undefined>;
+  };
   settings?: {
     view(): AgentSettingsView;
     upsert(id: string, input: ProviderUpsert, patch?: boolean): Promise<AgentSettingsView>;
     delete(id: string): Promise<AgentSettingsView>;
     routes(routes: TaskRoute[]): Promise<AgentSettingsView>;
+    oauthStatus(id: string): OAuthStatusView;
+    startOAuth(id: string): OAuthStatusView;
+    oauthCode(id: string, code: string): void;
+    oauthCancel(id: string): void;
   };
   testProvider?(id: string, modelId?: string): Promise<ProviderTestResult>;
   discoverProvider?(id: string, input: Record<string, unknown>): Promise<{ models: ProviderModelInput[] }>;

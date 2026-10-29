@@ -4,12 +4,13 @@ import type { Scene, WorkflowDefinition, WorkflowNode, WorkflowRun, WorkspaceSna
 import { ArrowRight, Check, CheckCircle2, CircleAlert, CircleDashed, Clock3, FileInput, GitCompareArrows, UserRound, LibraryBig, ListChecks, LoaderCircle, Play, Search, ShieldCheck, Square, Workflow, WandSparkles, X } from "lucide-react";
 import { Badge } from "./UI";
 import { IconOrbit } from "./icons";
+import { api } from "../lib/api";
 
 interface WorkflowViewProps {
   snapshot: WorkspaceSnapshot;
   scene?: Scene;
   onRun: (workflowVersionId: string) => Promise<void>;
-  onDecide: (runId: string, todoId: string, answer: string, inputHash: string) => Promise<void>;
+  onDecide: (runId: string, todoId: string, answer: string, inputHash: string, reviewNote?: string) => Promise<void>;
   onCancelRun: (runId: string) => Promise<void>;
   onRefresh: () => void;
   onOpenGuide: () => void;
@@ -25,6 +26,7 @@ export function WorkflowView({ snapshot, scene, onRun, onDecide, onCancelRun, on
   const [showAllRuns, setShowAllRuns] = useState(false);
   const [reviewRunId, setReviewRunId] = useState<string | null>(null);
   const [checked, setChecked] = useState<string | null>(null);
+  const [nodeInspectorOpen, setNodeInspectorOpen] = useState(false);
   const definition = snapshot.workflows.find((workflow) => workflow.workflowVersionId === selectedId) ?? snapshot.workflows[0];
   const runs = snapshot.workflowRuns.filter((run) => run.workflowVersionId === definition?.workflowVersionId);
   const selectedNode = definition?.nodes.find((node) => node.id === selectedNodeId) ?? definition?.nodes[0];
@@ -65,6 +67,7 @@ export function WorkflowView({ snapshot, scene, onRun, onDecide, onCancelRun, on
         <div className="toolbar-actions">
           <button className="button secondary" onClick={onOpenGuide}><WandSparkles size={14} />交互编排</button>
           <button className="button ghost" onClick={checkConnections}><GitCompareArrows size={14} />检查连接</button>
+          <button className="button ghost" onClick={() => setNodeInspectorOpen(open => !open)}><ListChecks size={14} />{nodeInspectorOpen ? "收起节点详情" : "节点详情"}</button>
           <button className="button primary" disabled={!scene} onClick={() => void onRun(definition.workflowVersionId)}><Play size={15} />运行到审阅</button>
         </div>
       </header>
@@ -105,7 +108,8 @@ export function WorkflowView({ snapshot, scene, onRun, onDecide, onCancelRun, on
             )) : <div className="run-empty"><CircleDashed size={18} /><p>还没有运行。执行前会冻结当前作品与场景版本，不会暗中重跑整部作品。</p></div>}
           </section>
         </main>
-        <aside className="node-inspector">
+        <aside className={`node-inspector ${nodeInspectorOpen ? "inspector-open" : ""}`}>
+          <button className="icon-button node-inspector-close" aria-label="收起节点详情" onClick={() => setNodeInspectorOpen(false)}><X size={14} /></button>
           {selectedNode && <>
             <p className="eyebrow">NODE SETTINGS</p>
             <div className="node-inspector-title"><NodeIcon type={selectedNode.type} /><div><h3>{selectedNode.name}</h3><p>{selectedNode.type} · v{selectedNode.typeVersion}</p></div></div>
@@ -121,9 +125,9 @@ export function WorkflowView({ snapshot, scene, onRun, onDecide, onCancelRun, on
           run={reviewRun}
           definition={definition}
           onClose={() => setReviewRunId(null)}
-          onDecide={async (answer) => {
+          onDecide={async (answer, reviewNote) => {
             const pending = reviewRun.pendingDecision!;
-            await onDecide(reviewRun.runId, pending.todoId, answer, pending.inputHash);
+            await onDecide(reviewRun.runId, pending.todoId, answer, pending.inputHash, reviewNote);
             setReviewRunId(null);
           }}
         />
@@ -167,35 +171,40 @@ function issuesOf(value: unknown): IssueLike[] {
   return Array.isArray(report.issues) ? report.issues as IssueLike[] : [];
 }
 
-function ReviewDialog({ run, definition, onClose, onDecide }: { run: WorkflowRun; definition: WorkflowDefinition; onClose: () => void; onDecide: (answer: string) => Promise<void> }) {
+function ReviewDialog({ run, definition, onClose, onDecide }: { run: WorkflowRun; definition: WorkflowDefinition; onClose: () => void; onDecide: (answer: string, reviewNote?: string) => Promise<void> }) {
   const pending = run.pendingDecision!;
   const [deciding, setDeciding] = useState<string | null>(null);
   const [failed, setFailed] = useState("");
+  const [reviewNote, setReviewNote] = useState("");
   const node = run.nodeRuns.find((item) => item.nodeRunId === pending.nodeRunId);
   const nodeName = definition.nodes.find((item) => item.id === node?.nodeId)?.name ?? "人工审阅";
   const finished = run.nodeRuns.filter((item) => item.state === "succeeded" && item.output !== undefined);
   const pendingNode = definition.nodes.find(item => item.id === node?.nodeId);
+  useEffect(() => { void api.recordInteraction({ projectId: run.projectId, kind: "review-open" }).catch(() => undefined); }, [run.runId]);
   // 只展示当前待办实际绑定的候选，避免作者看到 A 却提交 B。
   const candidateInput = pendingNode ? pendingInputOf(run, pendingNode, "candidate") : undefined;
   const candidate = previewOf(candidateInput);
   const issues = finished.flatMap((item) => issuesOf(item.output));
   const decide = (option: string) => {
+    if (option === "revise" && !reviewNote.trim()) { setFailed("退回修改前，请写一句希望保留什么、需要调整什么。"); return; }
     setDeciding(option);
     setFailed("");
-    void onDecide(option).catch((cause: unknown) => setFailed(cause instanceof Error ? cause.message : "决定未提交")).finally(() => setDeciding(null));
+    void onDecide(option, reviewNote.trim() || undefined).catch((cause: unknown) => setFailed(cause instanceof Error ? cause.message : "决定未提交")).finally(() => setDeciding(null));
   };
+  const close = () => { void api.recordInteraction({ projectId: run.projectId, kind: "review-dismiss" }).catch(() => undefined); onClose(); };
   return (
-    <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
+    <div className="modal-backdrop" role="presentation" onMouseDown={close}>
       <section className="review-dialog" role="dialog" aria-modal="true" aria-label="审阅工作流产物" onMouseDown={(event) => event.stopPropagation()}>
-        <header><div><p className="eyebrow">AUTHOR REVIEW · {nodeName}</p><h3>{pending.question}</h3></div><button className="icon-button" onClick={onClose} aria-label="关闭"><X size={16} /></button></header>
+        <header><div><p className="eyebrow">AUTHOR REVIEW · {nodeName}</p><h3>{pending.question}</h3></div><button className="icon-button" onClick={close} aria-label="关闭"><X size={16} /></button></header>
         <div className="review-body">
-          <span className="review-label">待审阅的产物</span>
-          {candidate ? <p className="review-candidate">{candidate}</p> : <p className="quiet-empty">该节点没有可预览的文字产物。</p>}
+          <div className="review-summary"><Badge tone="green">{nodeName}</Badge><span>基础修订 · {run.baseRevisionId.slice(0, 12)}</span><span>{issues.filter(issue => issue.severity === "conflict").length} 个冲突 · {issues.filter(issue => issue.severity === "unknown").length} 个未知</span></div>
           {issues.length > 0 && <>
-            <span className="review-label">检查发现</span>
+            <span className="review-label">先核对这些问题</span>
             <ul className="review-issues">{issues.slice(0, 8).map((issue, index) => <li key={index}><Badge tone={issue.severity === "conflict" ? "red" : issue.severity === "unknown" ? "amber" : "violet"}>{issue.severity === "conflict" ? "冲突" : issue.severity === "unknown" ? "未知" : "建议"}</Badge><span>{issue.title ?? issue.detail}</span></li>)}</ul>
           </>}
-          {failed && <p className="inline-note error"><CircleAlert size={13} />{failed}</p>}
+          <details className="review-candidate-details" open={issues.length === 0}><summary>查看完整候选{candidate ? `（${candidate.length} 字）` : ""}</summary>{candidate ? <p className="review-candidate">{candidate}</p> : <p className="quiet-empty">该节点没有可预览的文字产物。</p>}</details>
+          {pending.options.includes("revise") && <label className="field-label review-note">退回修改说明<textarea value={reviewNote} rows={2} onChange={event => setReviewNote(event.target.value)} placeholder="例如：保留当前结果，只减少解释性对白；不要改变人物决定。" /><small>仅在选择“退回修改”时必填，会随人工决定保存并供后续返修使用。</small></label>}
+          {failed && <p className="inline-note error" role="alert"><CircleAlert size={13} />{failed}</p>}
         </div>
         <footer>
           <p><ShieldCheck size={13} />接受后才会生成新的修订；原稿始终保留。</p>

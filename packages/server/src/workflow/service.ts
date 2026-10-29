@@ -253,7 +253,7 @@ export class PersistentWorkflowService implements WorkflowExecutorService {
   }
 
   /** 提交人工决定：校验输入哈希后恢复运行；重复提交不产生第二次提交。 */
-  decide(runId: string, todoId: string, answer: string, inputHash: string): WorkflowRun {
+  decide(runId: string, todoId: string, answer: string, inputHash: string, reviewNote?: string): WorkflowRun {
     const todo = this.getTodoRow(todoId);
     if (!todo) throw new Error(`待办不存在：${todoId}`);
     if (todo.run_id !== runId) throw new Error("待办不属于该运行");
@@ -283,6 +283,7 @@ export class PersistentWorkflowService implements WorkflowExecutorService {
       approved: isApproval(answer),
       inputHash: todo.input_hash,
       decidedAt: now(),
+      ...(reviewNote?.trim() ? { reviewNote: reviewNote.trim() } : {}),
       ...(candidate && typeof candidate.text === "string" ? { candidate: { ...(candidate.taskId ? { taskId: candidate.taskId } : {}), ...(candidate.artifactId ? { artifactId: candidate.artifactId } : {}), textHash: sha256(candidate.text) } } : {}),
     };
     this.statement(
@@ -845,7 +846,7 @@ export class PersistentWorkflowService implements WorkflowExecutorService {
         : "作者是否接受该结果？";
     const options = Array.isArray(node.config?.options)
       ? (node.config.options as string[])
-      : ["accept", "reject"];
+      : ["accept", "revise", "reject"];
     this.statement(
       `INSERT INTO todos (
         todo_id, run_id, node_run_id, question, options_json, input_hash, state, created_at, updated_at

@@ -18,6 +18,14 @@ import type {
   WorkflowRun,
   WorkflowGuideSession,
   WorkflowDefinition,
+  OAuthStatusView,
+  UsageReportView,
+  AuthorNote,
+  Chapter,
+  Revision,
+  SceneAnnotation,
+  CharacterArcProfile,
+  AuthoringEvent,
 } from "@nova-novel/shared";
 
 export class ApiError extends Error {
@@ -31,11 +39,17 @@ export class ApiError extends Error {
   }
 }
 
+function pairingHeaders(): Record<string, string> {
+  const pairToken = new URLSearchParams(window.location.hash.slice(1)).get("pair");
+  return pairToken ? { "X-Nova-Novel-Token": pairToken } : {};
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
     ...init,
     headers: {
       "Content-Type": "application/json",
+      ...pairingHeaders(),
       ...init?.headers,
     },
   });
@@ -53,12 +67,58 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  download: async (path: string, filename: string) => {
+    const response = await fetch(path, { headers: pairingHeaders() });
+    if (!response.ok) {
+      const details = await response.json().catch(() => null) as { error?: { message?: string } } | null;
+      throw new ApiError(details?.error?.message ?? `下载失败（${response.status}）`, response.status, details);
+    }
+    const url = URL.createObjectURL(await response.blob());
+    const anchor = document.createElement("a");
+    anchor.href = url; anchor.download = filename; anchor.click();
+    URL.revokeObjectURL(url);
+  },
   bootstrap: (projectId?: string) => request<WorkspaceSnapshot>(`/api/bootstrap${projectId ? `?projectId=${encodeURIComponent(projectId)}` : ""}`),
+  listNotes: (projectId: string) => request<{ notes: AuthorNote[] }>(`/api/notes?projectId=${encodeURIComponent(projectId)}`),
+  createNote: (input: { projectId: string; title: string; body?: string; sceneId?: string; elementId?: string; tags?: string[] }) =>
+    request<{ note: AuthorNote }>("/api/notes", { method: "POST", body: JSON.stringify(input) }),
+  updateNote: (noteId: string, patch: { title?: string; body?: string; status?: AuthorNote["status"]; sceneId?: string | null; elementId?: string | null; tags?: string[] }) =>
+    request<{ note: AuthorNote }>(`/api/notes/${noteId}`, { method: "PATCH", body: JSON.stringify(patch) }),
+  archiveNote: (noteId: string) => request<{ note: AuthorNote }>(`/api/notes/${noteId}`, { method: "DELETE" }),
+  promoteNote: (noteId: string) => request<{ note: AuthorNote; scene: Scene; revision: Revision; snapshot: WorkspaceSnapshot }>(`/api/notes/${noteId}/promote`, { method: "POST", body: "{}" }),
+  listAnnotations: (projectId: string, sceneId?: string) => request<{ annotations: SceneAnnotation[] }>(`/api/annotations?projectId=${encodeURIComponent(projectId)}${sceneId ? `&sceneId=${encodeURIComponent(sceneId)}` : ""}`),
+  createAnnotation: (input: { projectId: string; sceneId: string; kind: SceneAnnotation["kind"]; body: string; range?: SceneAnnotation["range"] }) =>
+    request<{ annotation: SceneAnnotation }>("/api/annotations", { method: "POST", body: JSON.stringify(input) }),
+  updateAnnotation: (annotationId: string, patch: { body?: string; status?: SceneAnnotation["status"] }) =>
+    request<{ annotation: SceneAnnotation }>(`/api/annotations/${annotationId}`, { method: "PATCH", body: JSON.stringify(patch) }),
+  characterArc: (entityId: string) => request<{ arcs: CharacterArcProfile[] }>(`/api/character-arcs?entityId=${encodeURIComponent(entityId)}`),
+  saveCharacterArc: (entityId: string, input: Pick<CharacterArcProfile, "motivation" | "goal" | "conflict" | "epiphany" | "notes">) =>
+    request<{ arc: CharacterArcProfile }>(`/api/character-arcs/${entityId}`, { method: "PUT", body: JSON.stringify(input) }),
+  listInteractions: async (projectId: string, cursor = 0) => {
+    const events: AuthoringEvent[] = [];
+    let nextCursor = cursor;
+    while (true) {
+      const result = await request<{ events: AuthoringEvent[] }>(`/api/events?projectId=${encodeURIComponent(projectId)}&cursor=${nextCursor}&limit=500`);
+      events.push(...result.events);
+      if (result.events.length < 500) return { events };
+      nextCursor = result.events.at(-1)!.seq;
+    }
+  },
+  recordInteraction: (input: { projectId: string; kind: string; sceneId?: string; actor?: AuthoringEvent["actor"]; meta?: AuthoringEvent["meta"] }) =>
+    request<{ seq: number }>("/api/events", { method: "POST", body: JSON.stringify(input) }),
   createProject: (input: { title: string; premise: string; body?: string }) =>
     request<WorkspaceSnapshot>("/api/projects", {
       method: "POST",
       body: JSON.stringify(input),
     }),
+  importProject: (input: { title: string; premise?: string; text: string }) =>
+    request<{ project: WorkspaceSnapshot["activeProject"]; revision: Revision; snapshot: WorkspaceSnapshot }>("/api/import", { method: "POST", body: JSON.stringify(input) }),
+  restoreBackup: (backup: unknown) =>
+    request<{ project: WorkspaceSnapshot["activeProject"]; revision: Revision; warnings: string[]; snapshot: WorkspaceSnapshot }>("/api/import/backup", { method: "POST", body: JSON.stringify({ backup }) }),
+  updateProject: (projectId: string, patch: { title?: string; archived?: boolean }) =>
+    request<{ project: WorkspaceSnapshot["activeProject"]; snapshot: WorkspaceSnapshot }>(`/api/projects/${projectId}`, { method: "PATCH", body: JSON.stringify(patch) }),
+  duplicateProject: (projectId: string) =>
+    request<{ project: WorkspaceSnapshot["activeProject"]; revision: Revision; snapshot: WorkspaceSnapshot }>(`/api/projects/${projectId}/duplicate`, { method: "POST", body: "{}" }),
   ideas: (projectId: string, input: string, mode: "example" | "pi" = "example", idempotencyKey: string = crypto.randomUUID()) =>
     request<{ draft: AuthoringSelection }>(`/api/projects/${projectId}/ideas`, {
       method: "POST",
@@ -74,6 +134,14 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ expectedVersion, baseRevisionId }),
     }),
+  createChapter: (projectId: string, title: string) =>
+    request<{ chapter: Chapter; revision: Revision; snapshot: WorkspaceSnapshot }>("/api/chapters", { method: "POST", body: JSON.stringify({ projectId, title }) }),
+  renameChapter: (chapterId: string, title: string, baseRevisionId: string) =>
+    request<{ revision: Revision; snapshot: WorkspaceSnapshot }>(`/api/chapters/${chapterId}`, { method: "PATCH", body: JSON.stringify({ title, baseRevisionId }) }),
+  createScene: (projectId: string, chapterId: string | undefined, title: string) =>
+    request<{ scene: Scene; revision: Revision; snapshot: WorkspaceSnapshot }>("/api/scenes", { method: "POST", body: JSON.stringify({ projectId, chapterId, title }) }),
+  moveScene: (sceneId: string, chapterId: string, narrationOrder: number, baseRevisionId: string) =>
+    request<{ revision: Revision; snapshot: WorkspaceSnapshot }>(`/api/scenes/${sceneId}/move`, { method: "POST", body: JSON.stringify({ chapterId, narrationOrder, baseRevisionId }) }),
   saveScene: (scene: Scene) =>
     request<{ scene: Scene; revisionId: string }>(`/api/scenes/${scene.sceneId}`, {
       method: "PATCH",
@@ -102,6 +170,8 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ projectId, input: { sceneId } }),
     }),
+  revision: (revisionId: string) =>
+    request<{ revision: Revision; chapters: Chapter[]; scenes: Scene[]; facts: WorkspaceSnapshot["facts"] }>(`/api/revisions/${revisionId}`),
   createRevision: (projectId: string, name: string) =>
     request<WorkspaceSnapshot>(`/api/projects/${projectId}/revisions`, {
       method: "POST",
@@ -119,10 +189,10 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ idempotencyKey }),
     }),
-  decideWorkflow: (runId: string, todoId: string, answer: string, inputHash: string) =>
+  decideWorkflow: (runId: string, todoId: string, answer: string, inputHash: string, reviewNote?: string) =>
     request<{ run: WorkflowRun }>(`/api/workflow-runs/${runId}/decision`, {
       method: "POST",
-      body: JSON.stringify({ todoId, answer, inputHash }),
+      body: JSON.stringify({ todoId, answer, inputHash, ...(reviewNote ? { reviewNote } : {}) }),
     }),
   cancelWorkflow: (runId: string) =>
     request<{ run: WorkflowRun }>(`/api/workflow-runs/${runId}/cancel`, { method: "POST", body: "{}" }),
@@ -154,6 +224,16 @@ export const api = {
       method: "PUT",
       body: JSON.stringify({ routes }),
     }),
+  startOAuth: (providerId: string) =>
+    request<OAuthStatusView>(`/api/agent/oauth/${encodeURIComponent(providerId)}`, { method: "POST", body: "{}" }),
+  oauthStatus: (providerId: string) =>
+    request<OAuthStatusView>(`/api/agent/oauth/${encodeURIComponent(providerId)}`),
+  submitOAuthCode: (providerId: string, code: string) =>
+    request<{ ok: boolean }>(`/api/agent/oauth/${encodeURIComponent(providerId)}/code`, { method: "POST", body: JSON.stringify({ code }) }),
+  cancelOAuth: (providerId: string) =>
+    request<{ ok: boolean }>(`/api/agent/oauth/${encodeURIComponent(providerId)}`, { method: "DELETE" }),
+  usageReports: (refresh = false) =>
+    request<{ reports: UsageReportView[] }>(`/api/agent/usage${refresh ? "?refresh=true" : ""}`),
   createGuide: (projectId: string) =>
     request<{ session: GuidedSession }>("/api/guide/sessions", { method: "POST", body: JSON.stringify({ projectId }) }),
   nextGuide: (sessionId: string) =>
@@ -164,8 +244,8 @@ export const api = {
     request<{ session: GuidedSession }>(`/api/guide/sessions/${sessionId}/back`, { method: "POST", body: "{}" }),
   cancelGuide: (sessionId: string) =>
     request<{ session: GuidedSession }>(`/api/guide/sessions/${sessionId}/cancel`, { method: "POST", body: "{}" }),
-  applyGuide: (sessionId: string) =>
-    request<{ snapshot: WorkspaceSnapshot }>(`/api/guide/sessions/${sessionId}/apply`, { method: "POST", body: "{}" }),
+  applyGuide: (sessionId: string, proposalIds?: string[]) =>
+    request<{ snapshot: WorkspaceSnapshot }>(`/api/guide/sessions/${sessionId}/apply`, { method: "POST", body: JSON.stringify(proposalIds ? { proposalIds } : {}) }),
   updateGuideProposal: (sessionId: string, scenes: GuidedSession["proposal"]) =>
     request<{ session: GuidedSession }>(`/api/guide/sessions/${sessionId}/proposal`, { method: "PATCH", body: JSON.stringify({ scenes }) }),
   createWorkflowGuide: (projectId: string) =>

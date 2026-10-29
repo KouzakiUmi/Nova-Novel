@@ -1,3 +1,5 @@
+export * from "./next-action.js";
+export * from "./revision-insights.js";
 export type Id = string;
 export type ISODateTime = string;
 export type SourceKind = "candidate" | "selected_plan" | "manuscript" | "author_setting";
@@ -15,6 +17,7 @@ export interface Project {
   updatedAt: ISODateTime;
   activeBranchId: Id;
   activeRouteId: RouteId;
+  archivedAt?: ISODateTime;
 }
 
 export interface Branch {
@@ -302,6 +305,11 @@ export interface Revision {
   wordCount: number;
 }
 
+export type StructureChange =
+  | { kind: "chapter.add"; chapter: Chapter }
+  | { kind: "chapter.rename"; chapterId: Id; title: string }
+  | { kind: "scene.move"; sceneId: Id; chapterId: Id; narrationOrder: number };
+
 export interface ChangeSet {
   changeSetId: Id;
   projectId: Id;
@@ -312,6 +320,7 @@ export interface ChangeSet {
   factChanges: FactAssertion[];
   graphChanges: Array<{ sceneId: Id; patch: Partial<Scene> }>;
   sceneAdditions?: Scene[];
+  structureChanges?: StructureChange[];
   status: "pending" | "committed" | "rejected" | "stale";
   sourceTaskId?: Id;
 }
@@ -376,7 +385,13 @@ export type TaskKind = AgentTask["kind"];
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 export const THINKING_LEVELS: readonly ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 export const TASK_KINDS: readonly TaskKind[] = ["ideas", "rehearsal", "scene", "polish", "consistency", "guide"];
-export type ProviderApi = "openai-completions" | "openai-responses" | "anthropic-messages" | "google-generative-ai";
+export type ProviderApi = "openai-completions" | "openai-responses" | "anthropic-messages" | "google-generative-ai" | "openai-codex-responses" | "mistral-conversations" | "bedrock-converse-stream" | "google-vertex" | "azure-openai-responses" | "pi-messages";
+
+export interface ProviderCompat {
+  allowEmptySignature?: boolean;
+  forceAdaptiveThinking?: boolean;
+  supportsTemperature?: boolean;
+}
 
 export interface ProviderModelInput {
   id: string;
@@ -386,6 +401,7 @@ export interface ProviderModelInput {
   maxTokens?: number;
   input?: Array<"text" | "image">;
   thinkingLevelMap?: Partial<Record<ThinkingLevel, string | null>>;
+  compat?: ProviderCompat;
 }
 
 /** 对外视图永不包含 API Key 原文。 */
@@ -394,7 +410,12 @@ export interface ProviderConfigView {
   name: string;
   api: ProviderApi;
   baseUrl: string;
+  compat?: ProviderCompat;
   hasApiKey: boolean;
+  keySource?: "manual" | "environment";
+  apiKeyEnv?: string;
+  quotaAccessKeyEnv?: string;
+  quotaSecretKeyEnv?: string;
   models: ProviderModelInput[];
   createdAt: ISODateTime;
   updatedAt: ISODateTime;
@@ -404,6 +425,11 @@ export interface ProviderUpsert {
   name: string;
   api: ProviderApi;
   baseUrl: string;
+  compat?: ProviderCompat;
+  keySource?: "manual" | "environment";
+  apiKeyEnv?: string;
+  quotaAccessKeyEnv?: string;
+  quotaSecretKeyEnv?: string;
   /** 省略：保留已存密钥；空字符串：清除密钥。 */
   apiKey?: string;
   models: ProviderModelInput[];
@@ -435,8 +461,34 @@ export interface AgentSettingsView {
   providers: ProviderConfigView[];
   models: ModelOption[];
   routes: TaskRoute[];
+  builtinProviders: BuiltinProviderPreset[];
   engine: { name: string; version: string; mode: "embedded" };
   dataDir: string;
+}
+
+export interface BuiltinProviderPreset {
+  providerId: string;
+  name: string;
+  api: ProviderApi;
+  baseUrl: string;
+  compat?: ProviderCompat;
+  models: ProviderModelInput[];
+  oauth: boolean;
+  source?: "pi" | "plugin";
+}
+
+export interface OAuthEventView { type: string; message?: string; url?: string; userCode?: string }
+export interface OAuthStatusView { providerId: string; status: "pending" | "success" | "error" | "cancelled"; events: OAuthEventView[]; error?: string }
+
+export interface UsageWindowView { kind: string; percentUsed: number; resetAt?: ISODateTime; used?: number; limit?: number; unit?: string }
+export interface UsageReportView {
+  providerId: string;
+  label: string;
+  state: "ok" | "no-key" | "error" | "disabled";
+  windows: UsageWindowView[];
+  balance?: { value: number; currency: string };
+  coverage: "complete" | "partial";
+  error?: string;
 }
 
 export interface ProviderTestResult {
@@ -480,13 +532,65 @@ export interface GenerationResultPayload {
   artifactId?: Id;
 }
 
+export interface AuthorNote {
+  noteId: Id;
+  projectId: Id;
+  title: string;
+  body: string;
+  status: "inbox" | "linked" | "archived";
+  sceneId?: Id;
+  elementId?: Id;
+  tags: string[];
+  source: "author" | "candidate";
+  createdAt: ISODateTime;
+  updatedAt: ISODateTime;
+}
+
+export interface SceneAnnotation {
+  annotationId: Id;
+  projectId: Id;
+  sceneId: Id;
+  kind: "comment" | "question" | "todo";
+  body: string;
+  status: "open" | "resolved";
+  range?: { from: number; to: number; baseText: string; textHash: string };
+  createdAt: ISODateTime;
+  updatedAt: ISODateTime;
+  resolvedAt?: ISODateTime;
+}
+
+export interface CharacterArcProfile {
+  entityId: Id;
+  projectId: Id;
+  motivation: string;
+  goal: string;
+  conflict: string;
+  epiphany: string;
+  notes: string;
+  updatedAt: ISODateTime;
+}
+
+export interface AuthoringEvent {
+  seq: number;
+  kind: string;
+  projectId: Id;
+  sceneId?: Id;
+  actor: "author" | "system";
+  createdAt: ISODateTime;
+  meta?: Record<string, string | number | boolean>;
+}
+
 export interface WorkspaceSnapshot {
   projects: Project[];
+  archivedProjects: Project[];
   activeProject: Project;
   branches: Branch[];
   routes: StoryRoute[];
   chapters: Chapter[];
   scenes: Scene[];
+  notes: AuthorNote[];
+  annotations: SceneAnnotation[];
+  characterArcs: CharacterArcProfile[];
   elements: Entity[];
   facts: FactAssertion[];
   events: WorldEvent[];
@@ -536,6 +640,7 @@ export interface GuidedSession {
   pending?: GuidedQuestion;
   proposal?: OutlineProposalScene[];
   appliedRevisionId?: Id;
+  appliedProposalIds?: Id[];
   createdAt: ISODateTime;
   updatedAt: ISODateTime;
 }

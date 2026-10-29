@@ -2,14 +2,54 @@ import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync } from "
 import { resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { ModelRuntime, VERSION } from "@earendil-works/pi-coding-agent";
-import { TASK_KINDS, THINKING_LEVELS, type AgentSettingsView, type ModelOption, type ProviderUpsert, type ProviderConfigView, type TaskKind, type TaskRoute, type ThinkingLevel } from "@nova-novel/shared";
+import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
+import { extraProviderPresets } from "./provider-metadata.js";
+import { VOLC_LABELS, VOLC_ROUTES, volcBaseUrl, volcCompat, volcSnapshotModels, type VolcPlan } from "./volcengine/models.js";
+import { TASK_KINDS, THINKING_LEVELS, type AgentSettingsView, type ModelOption, type ProviderUpsert, type ProviderConfigView, type TaskKind, type TaskRoute, type ThinkingLevel, type BuiltinProviderPreset, type OAuthStatusView, type OAuthEventView, type ProviderApi, type ProviderCompat } from "@nova-novel/shared";
 import { DomainError, requiredString } from "../domain.js";
 
 type Provider = ProviderConfigView & { apiKey: string };
 interface Settings { providers: Provider[]; routes: TaskRoute[] }
 const defaults: Record<TaskKind, ThinkingLevel> = { ideas: "low", rehearsal: "low", scene: "medium", polish: "low", consistency: "high", guide: "low" };
-const apis = ["openai-completions", "openai-responses", "anthropic-messages", "google-generative-ai"];
+const apis: ProviderApi[] = ["openai-completions", "openai-responses", "anthropic-messages", "google-generative-ai", "openai-codex-responses", "mistral-conversations", "bedrock-converse-stream", "google-vertex", "azure-openai-responses", "pi-messages"];
+const BUILTIN_BASE_URLS: Record<string, string> = { azure: "https://{resource}.openai.azure.com/openai/v1" };
+const PREFERRED_APIS: Record<string, ProviderApi> = { azure: "azure-openai-responses", "openai-codex": "openai-codex-responses" };
+export function builtinProviderPresets(): BuiltinProviderPreset[] {
+  const presets: BuiltinProviderPreset[] = builtinProviders().flatMap(provider => {
+    const models = provider.getModels();
+    const baseUrl = provider.baseUrl || models.find(model => model.baseUrl)?.baseUrl || BUILTIN_BASE_URLS[provider.id];
+    if (!baseUrl || models.length === 0) return [];
+    const api = PREFERRED_APIS[provider.id] ?? apis.find(candidate => models.some(model => model.api === candidate));
+    if (!api) return [];
+    return [{ providerId: provider.id, name: provider.name, baseUrl, api, oauth: Boolean(provider.auth.oauth), source: "pi" as const, models: models.map(model => ({ id: model.id, ...(model.name !== model.id ? { name: model.name } : {}), reasoning: model.reasoning, contextWindow: model.contextWindow, maxTokens: model.maxTokens, input: [...model.input], ...(model.thinkingLevelMap ? { thinkingLevelMap: { ...model.thinkingLevelMap } } : {}) })) }];
+  });
+  for (const extra of extraProviderPresets()) {
+    const existing = presets.find(preset => preset.providerId === extra.providerId);
+    if (existing) {
+      const models = new Map(existing.models.map(model => [model.id, model]));
+      for (const model of extra.models) models.set(model.id, model);
+      existing.models = [...models.values()];
+      existing.source = "plugin";
+      existing.name = extra.name;
+      existing.oauth ||= extra.oauth;
+    } else presets.push(extra);
+  }
+  for (const plan of ["agent-plan", "coding-plan"] as VolcPlan[]) {
+    const providerId = VOLC_ROUTES[plan];
+    if (!presets.some(preset => preset.providerId === providerId)) presets.push({ providerId, name: VOLC_LABELS[plan], api: "anthropic-messages", baseUrl: volcBaseUrl(plan), compat: volcCompat(plan), oauth: true, source: "plugin", models: volcSnapshotModels(plan) });
+  }
+  return presets;
+}
+export function secretOf(provider: { apiKey: string; keySource?: "manual" | "environment"; apiKeyEnv?: string }): string {
+  return provider.keySource === "environment" && provider.apiKeyEnv ? process.env[provider.apiKeyEnv] ?? "" : provider.apiKey;
+}
 function invalid(message: string): never { throw new DomainError(400, "INVALID_AGENT_SETTINGS", message); }
+function validateCompat(input: ProviderCompat | undefined): ProviderCompat | undefined {
+  if (input === undefined) return undefined;
+  if (!input || typeof input !== "object" || Array.isArray(input)) invalid("兼容参数格式无效");
+  for (const key of ["allowEmptySignature", "forceAdaptiveThinking", "supportsTemperature"] as const) if (input[key] !== undefined && typeof input[key] !== "boolean") invalid("兼容参数必须是布尔值");
+  return Object.fromEntries(Object.entries(input).filter(([key, value]) => ["allowEmptySignature", "forceAdaptiveThinking", "supportsTemperature"].includes(key) && value !== undefined));
+}
 export function thinkingLevels(model: { reasoning: boolean; thinkingLevelMap?: Partial<Record<ThinkingLevel, unknown>> }): ThinkingLevel[] {
   if (!model.reasoning) return ["off"];
   return THINKING_LEVELS.filter(level => model.thinkingLevelMap?.[level] !== null && (THINKING_LEVELS.indexOf(level) <= 4 || model.thinkingLevelMap?.[level] !== undefined));
@@ -31,6 +71,8 @@ export class AgentSettings {
   private builtins = new Set<string>();
   private models: ModelOption[] = [];
   private tail: Promise<unknown> = Promise.resolve();
+  private oauthRuns = new Map<string, { controller: AbortController; events: OAuthEventView[]; resolveCode: ((code: string) => void) | undefined; done: Promise<OAuthStatusView> }>();
+  private oauthResults = new Map<string, OAuthStatusView>();
   private constructor(readonly dataDir: string) {
     this.agentDir = resolve(dataDir, "agent");
     mkdirSync(resolve(this.agentDir, "workspace"), { recursive: true });
@@ -45,7 +87,7 @@ export class AgentSettings {
     settings.builtins = new Set(builtin.getProviders().map(provider => provider.id));
     if (!Array.isArray(settings.data.providers) || !Array.isArray(settings.data.routes)) invalid("模型设置格式无效");
     settings.data.routes = TASK_KINDS.map(kind => settings.data.routes.find(route => route.kind === kind) ?? { kind, thinkingLevel: defaults[kind] });
-    settings.data.providers = settings.data.providers.map(provider => { const clean = settings.validate(provider.providerId, provider); return { providerId: provider.providerId, ...clean, apiKey: clean.apiKey ?? "", hasApiKey: Boolean(clean.apiKey), createdAt: provider.createdAt, updatedAt: provider.updatedAt }; });
+    settings.data.providers = settings.data.providers.map(provider => { const clean = settings.validate(provider.providerId, provider); return { providerId: provider.providerId, ...clean, apiKey: clean.apiKey ?? "", hasApiKey: clean.keySource === "environment" ? Boolean(process.env[clean.apiKeyEnv!]) : Boolean(clean.apiKey), createdAt: provider.createdAt, updatedAt: provider.updatedAt }; });
     await settings.reload();
     return settings;
   }
@@ -57,6 +99,12 @@ export class AgentSettings {
     if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash) invalid("baseUrl 必须是无凭据与查询参数的 HTTP(S) 地址");
     const apiKey = input.apiKey;
     if (apiKey !== undefined && (typeof apiKey !== "string" || apiKey.length > 16000 || /^[!$]/.test(apiKey) || /[\r\n]/.test(apiKey))) invalid("API Key 格式无效");
+    const keySource = input.keySource ?? "manual";
+    if (!["manual", "environment"].includes(keySource)) invalid("密钥来源无效");
+    const apiKeyEnv = input.apiKeyEnv;
+    if (keySource === "environment" && (typeof apiKeyEnv !== "string" || !/^[A-Z][A-Z0-9_]{1,80}$/.test(apiKeyEnv))) invalid("环境变量名必须是 2–81 位大写字母、数字或下划线，且以字母开头");
+    if (keySource === "environment" && apiKey) invalid("使用环境变量时不能同时填写密钥");
+    for (const [field, value] of [["quotaAccessKeyEnv", input.quotaAccessKeyEnv], ["quotaSecretKeyEnv", input.quotaSecretKeyEnv]] as const) if (value !== undefined && (typeof value !== "string" || !/^[A-Z][A-Z0-9_]{1,80}$/.test(value))) invalid(`${field} 环境变量名无效`);
     if (!Array.isArray(input.models) || input.models.length < 1 || input.models.length > 500) invalid("请至少添加一个模型");
     const ids = new Set<string>();
     const models = input.models.map(model => {
@@ -70,13 +118,15 @@ export class AgentSettings {
       if (!Number.isSafeInteger(contextWindow) || !Number.isSafeInteger(maxTokens) || maxTokens < 1 || contextWindow < maxTokens) invalid("模型 token 上限无效");
       if (model.input !== undefined && (!Array.isArray(model.input) || model.input.length === 0 || model.input.some(item => !["text", "image"].includes(item)))) invalid("模型输入类型无效");
       if (model.thinkingLevelMap !== undefined && (!model.thinkingLevelMap || typeof model.thinkingLevelMap !== "object" || Array.isArray(model.thinkingLevelMap) || Object.entries(model.thinkingLevelMap).some(([level, value]) => !THINKING_LEVELS.includes(level as ThinkingLevel) || (value !== null && (typeof value !== "string" || value.length > 100))))) invalid("思考强度映射无效");
-      return { id: modelId, name: model.name === undefined ? modelId : requiredString(model.name, "模型名称", 200), reasoning: model.reasoning ?? false, contextWindow, maxTokens, input: model.input ?? ["text" as const], ...(model.thinkingLevelMap ? { thinkingLevelMap: { ...model.thinkingLevelMap } } : {}) };
+      const compat = validateCompat(model.compat);
+      return { id: modelId, name: model.name === undefined ? modelId : requiredString(model.name, "模型名称", 200), reasoning: model.reasoning ?? false, contextWindow, maxTokens, input: model.input ?? ["text" as const], ...(model.thinkingLevelMap ? { thinkingLevelMap: { ...model.thinkingLevelMap } } : {}), ...(compat ? { compat } : {}) };
     });
-    return { name: requiredString(input.name, "服务名称", 200), api: input.api, baseUrl: url.href.replace(/\/$/, ""), ...(apiKey !== undefined ? { apiKey } : {}), models };
+    const compat = validateCompat(input.compat);
+    return { name: requiredString(input.name, "服务名称", 200), api: input.api, baseUrl: url.href.replace(/\/$/, ""), ...(compat ? { compat } : {}), keySource, ...(keySource === "environment" ? { apiKeyEnv: apiKeyEnv!, apiKey: "" } : apiKey !== undefined ? { apiKey } : {}), ...(input.quotaAccessKeyEnv !== undefined ? { quotaAccessKeyEnv: input.quotaAccessKeyEnv } : {}), ...(input.quotaSecretKeyEnv !== undefined ? { quotaSecretKeyEnv: input.quotaSecretKeyEnv } : {}), models };
   }
   private async reload(): Promise<void> {
     // 无密钥的服务（Ollama、LM Studio 等本机模型）写入占位值，Pi 才会把它视为可用；占位值不会回显给页面。
-    const providers = Object.fromEntries(this.data.providers.map(({ providerId, name, baseUrl, api, apiKey, models }) => [providerId, { name, baseUrl, api, apiKey: apiKey ? apiKey.split("$").join("$$") : "no-key", models }]));
+    const providers = Object.fromEntries(this.data.providers.map(({ providerId, name, baseUrl, api, apiKey, keySource, apiKeyEnv, models, compat }) => [providerId, { name, baseUrl, api, ...(compat ? { compat } : {}), apiKey: keySource === "environment" ? `$${apiKeyEnv}` : apiKey ? apiKey.split("$").join("$$") : "no-key", models }]));
     atomic(this.modelsPath, { providers });
     const runtime = await ModelRuntime.create({ authPath: resolve(this.agentDir, "auth.json"), modelsPath: this.modelsPath, allowModelNetwork: false, refreshOnCreate: false });
     if (runtime.getError()) throw new DomainError(400, "INVALID_AGENT_SETTINGS", "模型配置无法加载");
@@ -85,8 +135,67 @@ export class AgentSettings {
     this.models = runtime.getModels().filter(model => custom.has(model.provider) || available.some(item => item.provider === model.provider && item.id === model.id)).map(model => ({ provider: model.provider, modelId: model.id, name: model.name, reasoning: model.reasoning, thinkingLevels: thinkingLevels(model), contextWindow: model.contextWindow, maxTokens: model.maxTokens, costInput: model.cost.input, costOutput: model.cost.output, available: available.some(item => item.provider === model.provider && item.id === model.id), source: custom.has(model.provider) ? "custom" : "builtin" }));
     this.runtime = runtime;
   }
+  oauthStatus(id: string): OAuthStatusView {
+    const run = this.oauthRuns.get(id);
+    return run ? { providerId: id, status: "pending", events: run.events } : this.oauthResults.get(id) ?? { providerId: id, status: "cancelled", events: [] };
+  }
+  startOAuth(id: string): OAuthStatusView {
+    if (!this.builtins.has(id)) throw new DomainError(400, "INVALID_PROVIDER", "OAuth 只支持 Pi 内置服务");
+    const existing = this.oauthRuns.get(id);
+    if (existing) return { providerId: id, status: "pending", events: existing.events };
+    this.oauthResults.delete(id);
+    const provider = this.runtime.getProvider(id);
+    if (!provider?.auth.oauth) throw new DomainError(400, "OAUTH_UNSUPPORTED", "该服务不支持 OAuth 登录");
+    const controller = new AbortController();
+    const events: OAuthEventView[] = [];
+    let resolveCode: ((code: string) => void) | undefined;
+    const run = { controller, events, resolveCode, done: undefined as unknown as Promise<OAuthStatusView> };
+    run.done = (async () => {
+      try {
+        await this.runtime.login(id, "oauth", {
+          signal: controller.signal,
+          prompt: async prompt => {
+            if (prompt.type === "manual_code") return new Promise<string>(resolve => { run.resolveCode = resolve; });
+            if (prompt.type === "select") return prompt.options[0]?.id ?? "";
+            return "";
+          },
+          notify: event => {
+            if (event.type === "auth_url") events.push({ type: event.type, url: event.url, ...(event.instructions ? { message: event.instructions } : {}) });
+            else if (event.type === "device_code") events.push({ type: event.type, url: event.verificationUri, userCode: event.userCode });
+            else events.push({ type: event.type, message: event.message });
+          },
+        });
+        await this.reload();
+        this.oauthRuns.delete(id);
+        const result: OAuthStatusView = { providerId: id, status: "success", events };
+        this.oauthResults.set(id, result);
+        return result;
+      } catch (error) {
+        this.oauthRuns.delete(id);
+        const message = this.redact(error instanceof Error ? error.message : String(error));
+        const result: OAuthStatusView = { providerId: id, status: "error", events, error: message };
+        this.oauthResults.set(id, result);
+        return result;
+      }
+    })();
+    this.oauthRuns.set(id, run);
+    void run.done;
+    return { providerId: id, status: "pending", events };
+  }
+  oauthCode(id: string, code: string): void {
+    const run = this.oauthRuns.get(id);
+    if (!run?.resolveCode) throw new DomainError(409, "OAUTH_STATE", "当前没有等待授权码的登录");
+    run.resolveCode(code);
+  }
+  oauthCancel(id: string): void {
+    const run = this.oauthRuns.get(id);
+    if (!run) return;
+    run.controller.abort();
+    this.oauthRuns.delete(id);
+    this.oauthResults.set(id, { providerId: id, status: "cancelled", events: run.events });
+  }
   view(): AgentSettingsView {
-    return { providers: this.data.providers.map(({ apiKey, ...provider }) => ({ ...provider, hasApiKey: Boolean(apiKey) })), models: structuredClone(this.models), routes: this.data.routes.map(route => { const model = this.resolveModel(route.kind); return { ...route, thinkingLevel: model ? clampThinking(route.thinkingLevel, model.thinkingLevels) : route.thinkingLevel }; }), engine: { name: "Pi", version: VERSION, mode: "embedded" }, dataDir: this.dataDir };
+    return { providers: this.data.providers.map(({ apiKey, ...provider }) => ({ ...provider, hasApiKey: provider.keySource === "environment" ? Boolean(process.env[provider.apiKeyEnv!]) : Boolean(apiKey) })), models: structuredClone(this.models), routes: this.data.routes.map(route => { const model = this.resolveModel(route.kind); return { ...route, thinkingLevel: model ? clampThinking(route.thinkingLevel, model.thinkingLevels) : route.thinkingLevel }; }), builtinProviders: builtinProviderPresets(), engine: { name: "Pi", version: VERSION, mode: "embedded" }, dataDir: this.dataDir };
   }
   resolveModel(kind: TaskKind): ModelOption | undefined {
     const route = this.data.routes.find(item => item.kind === kind);
@@ -95,8 +204,19 @@ export class AgentSettings {
   route(kind: TaskKind) { const model = this.resolveModel(kind); return { model, thinkingLevel: model ? clampThinking(this.data.routes.find(item => item.kind === kind)?.thinkingLevel ?? defaults[kind], model.thinkingLevels) : "off" as const }; }
   hasProvider(id: string): boolean { return this.data.providers.some(item => item.providerId === id); }
   provider(id: string): Provider { const provider = this.data.providers.find(item => item.providerId === id); if (!provider) throw new DomainError(404, "PROVIDER_NOT_FOUND", "服务不存在"); return structuredClone(provider); }
+  dataProviders(): Provider[] { return this.data.providers; }
   redact(text: string): string {
-    for (const provider of this.data.providers) if (provider.apiKey) text = text.split(provider.apiKey).join("[已隐藏]");
+    for (const provider of this.data.providers) {
+      if (provider.apiKey) text = text.split(provider.apiKey).join("[已隐藏]");
+      if (provider.keySource === "environment" && provider.apiKeyEnv) {
+        const secret = process.env[provider.apiKeyEnv];
+        if (secret) text = text.split(secret).join("[已隐藏]");
+      }
+      for (const name of [provider.quotaAccessKeyEnv, provider.quotaSecretKeyEnv]) {
+        const secret = name ? process.env[name] : undefined;
+        if (secret) text = text.split(secret).join("[已隐藏]");
+      }
+    }
     return text.replace(/Bearer\s+\S+|\b(?:sk|pk|rk)-[\w-]+/gi, "[已隐藏]").slice(0, 400);
   }
   private mutate(action: () => void): Promise<AgentSettingsView> {
@@ -111,7 +231,7 @@ export class AgentSettings {
       if (!patch && current) throw new DomainError(409, "PROVIDER_EXISTS", "服务 ID 已存在");
       const clean = this.validate(id, { ...current, ...input });
       const date = new Date().toISOString();
-      const provider: Provider = { providerId: id, ...clean, apiKey: clean.apiKey ?? current?.apiKey ?? "", hasApiKey: Boolean(clean.apiKey ?? current?.apiKey), createdAt: current?.createdAt ?? date, updatedAt: date };
+      const provider: Provider = { providerId: id, ...clean, apiKey: clean.apiKey ?? current?.apiKey ?? "", hasApiKey: clean.keySource === "environment" ? Boolean(process.env[clean.apiKeyEnv!]) : Boolean(clean.apiKey ?? current?.apiKey), createdAt: current?.createdAt ?? date, updatedAt: date };
       this.data.providers = [...this.data.providers.filter(item => item.providerId !== id), provider];
     });
   }

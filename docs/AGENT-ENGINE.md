@@ -23,22 +23,36 @@
 ```text
 <data>/agent/settings.json   provider（含密钥）与任务路由，应用自有格式，原子写入
 <data>/agent/models.json     由 settings.json 生成，交给 Pi ModelRuntime 读取
-<data>/agent/auth.json       Pi 凭据存储路径（应用当前不写入）
+<data>/agent/auth.json       Pi OAuth/API Key 凭据存储路径
+<data>/agent/volcengine.json 火山方舟套餐 profile 与公开身份摘要，不含密钥
+<data>/agent/volcengine/accounts/<id>/ 每次登录独立的 ArkCli 身份目录
 <data>/agent/sessions/<projectId>/   每个任务一份会话 JSONL
 <data>/agent/workspace/      Pi 会话使用的空工作目录（cwd）
 ```
 
-API Key 只保存在 `settings.json` 和生成的 `models.json` 中，不出现在任何 HTTP 响应、日志或诊断里。对外只返回 `hasApiKey`。
+手动填写的 API Key 保存在 `settings.json` 和生成的 `models.json` 中；选择环境变量时只保存变量名，生成的 `models.json` 使用 `$ENV_VAR` 引用。两者都不出现在任何 HTTP 响应、日志或诊断里，对外只返回 `hasApiKey`、`keySource` 与 `apiKeyEnv`。
 
 ## 3. Provider 管理
 
 - `providerId`：`^[a-z0-9][a-z0-9-]{1,40}$`，不能与 Pi 内置 provider 同名，避免悄悄覆盖内置配置。
-- `api`：`openai-completions`、`openai-responses`、`anthropic-messages`、`google-generative-ai`。
+- `api`：`openai-completions`、`openai-responses`、`anthropic-messages`、`google-generative-ai`、`openai-codex-responses`、`mistral-conversations`、`bedrock-converse-stream`、`google-vertex`、`azure-openai-responses`、`pi-messages`。Pi provider 缺少顶层 `baseUrl` 时，从模型目录回退；Azure 使用带 `{resource}` 的可编辑占位地址。
 - `baseUrl` 必须是 http(s) URL。`models` 至少一项；`contextWindow` 默认 128000，`maxTokens` 默认 8192，`reasoning` 默认 false。
+- `keySource` 支持 `manual` 与 `environment`；环境变量名只接受大写字母、数字和下划线，值在使用时解析，不复制进设置文件。
+- 设置页通过 `builtinProviders()` 展示 Pi 自带 provider/model 目录。`agent/provider-metadata.ts` 独立保存 Pi 没有的插件元数据，目前合并 Command Code 模型扩展以及 OpenDesign CoRouter 的 plan/paid 模型目录、模态、容量和思考档位；这些分组是插件视图，不是上游计费承诺。
+- 支持 OAuth 的内置 provider 直接调用 `ModelRuntime.login`；授权链接、设备码、手动授权码、取消和完成状态经本机接口交互，凭据由 Pi 写入 `auth.json`，不进入页面响应或日志。
 - 修改后重新生成 `models.json` 并重建 `ModelRuntime`；正在运行的任务继续使用旧实例。
 - 模型列表 `models` 包含：所有自定义模型，加上已有可用凭据的内置模型（例如通过环境变量提供 Key），后者标记 `source: "builtin"`。不列出没有凭据的内置模型。自定义模型可选 `thinkingLevelMap` 显式映射思考档位，`null` 表示不支持。
 - “测试连接”：用该 provider 的指定模型（或第一个模型）发一条不含作品内容的极短请求，15 秒超时，返回耗时和截短的回复。失败时返回脱敏后的错误。
 - “读取模型列表”：仅限 OpenAI 兼容类型，`GET {baseUrl}/models`，返回模型 ID 供用户勾选，不自动保存。
+
+### 火山方舟双套餐
+
+- `volcengine-agent-plan` 与 `volcengine-coding-plan` 使用独立模型快照和 `/api/plan`、`/api/coding` Anthropic Messages 端点。模型模态、上下文、输出、思考映射以及 `forceAdaptiveThinking`、`allowEmptySignature` 等兼容参数会写入 `models.json`。
+- 可手动填写套餐 API Key，或使用环境变量。OAuth 复用官方 ArkCli `auth login --login-mode broker --credential-store encrypted-file`，当前仅开放 Windows ArkCli 1.0.37；CLI 启动系统默认浏览器，Nova 核验 `whoami/status` 后分别绑定个人套餐 profile，不读取其他应用的登录态。
+- 每次登录使用 `agent/volcengine/accounts/<uuid>` 隔离 HOME/USERPROFILE/XDG_CONFIG_HOME，并清除继承的 Ark/Volc/AWS 凭据变量。`volcengine.json` 只保存 profile、目录和公开身份摘要，不保存 token。
+- 同步模型时，Nova 在内存中执行 `profile apikey get`，将值放入当前进程的 `NOVA_VOLC_*_API_KEY`，settings/models 文件只保存变量引用。官方 CLI 自己负责其加密身份存储。
+- OAuth 额度通过 `arkcli api usage.get_afp_usage/get_coding_plan_usage`；手动/环境变量模式通过 IAM AK/SK 签名 `GetAFPUsage/GetCodingPlanUsage`。推理 API Key 不用于管控面签名。Coding 保留 0–100 已用百分比，Agent 保留 AFP used/limit 与文本/全能力/日窗口分组。
+- `NOVA_NOVEL_ARKCLI_PATH` 可指定官方原生可执行文件绝对路径；未配置时只在 PATH 查找，不自动安装 CLI。
 
 ### HTTP 接口
 
@@ -51,8 +65,17 @@ API Key 只保存在 `settings.json` 和生成的 `models.json` 中，不出现�
 | `POST /api/agent/providers/:id/test` | `{ modelId? }` | `ProviderTestResult` |
 | `POST /api/agent/providers/:id/discover` | `{ baseUrl?, api?, apiKey? }`（未传的项用已存配置） | `{ models: ProviderModelInput[] }` |
 | `PUT /api/agent/routes` | `{ routes: TaskRoute[] }` | `AgentSettingsView` |
+| `POST /api/agent/oauth/:id` | — | 启动 OAuth，返回 `OAuthStatusView` |
+| `GET /api/agent/oauth/:id` | — | 查询授权事件与状态 |
+| `POST /api/agent/oauth/:id/code` | `{ code }` | 提交手动授权码 |
+| `DELETE /api/agent/oauth/:id` | — | 取消登录 |
+| `GET /api/agent/usage?refresh=true` | `refresh` 可选 | 脱敏的订阅窗口/余额；普通结果缓存 60 秒 |
 | `GET /api/generate/progress?key=<idempotencyKey>` | — | `GenerationProgress` |
 | `POST /api/generate/cancel` | `{ idempotencyKey }` | `{ task?: AgentTask }` |
+
+### 只读订阅用量
+
+`AgentUsageService` 使用 Nova 自己保存的 provider 配置、Pi OAuth 凭据或火山方舟套餐身份读取 DeepSeek、OpenRouter、MiniMax、Z.ai、Kimi、OpenDesign、Codex、火山方舟 Agent/Coding Plan、OpenCode Go、SiliconFlow、Synthetic、NanoGPT、Novita、Hyperbolic、DeepInfra、Chutes、Ollama Cloud、Vercel AI Gateway、ZenMux 与 LiteLLM 的额度窗口/余额。仅返回脱敏的 `UsageReportView`，60 秒缓存，手动刷新可跳过缓存；没有凭据、接口不支持或读取失败只影响额度卡片，不改变模型路由。它不读取 DSH、Codex CLI、OpenDesign 桌面端或其他应用的凭据文件。
 
 ## 4. 任务路由
 
@@ -124,9 +147,9 @@ JSON 解析失败时，任务失败并保留原始产物，不把原文硬塞进
 | `POST /api/guide/sessions/:id/back` | 返回上一步并恢复缓存问题，不重新生成 |
 | `POST /api/guide/sessions/:id/cancel` | 取消会话，保留历史记录 |
 | `PATCH /api/guide/sessions/:id/proposal` | 校验并持久化逐场编辑，不改变提案 ID |
-| `POST /api/guide/sessions/:id/apply` | 采用提案，经 ChangeSet 与基础修订 CAS 新增场景并返回作品快照 |
+| `POST /api/guide/sessions/:id/apply` | 采用全部或指定 `proposalIds`，经同一 ChangeSet 与基础修订 CAS 新增场景并返回快照 |
 
-`guide_sessions` 保存项目、分支、基础修订、步骤、答案、问题缓存和提案。`sceneAdditions` 是 ChangeSet 的可选部分，采用时校验场景、章节、路线与重复 ID；新增场景和剧情节点在同一修订中写入。采用使用稳定 `acceptanceId`，重复请求返回同一修订。两类会话都用 single-flight 与 revision 防止并发/迟到覆盖；迟到产物先按原任务终结归档，不写回旧会话。Agent 没有新增场景或修改工作流定义的工具。
+`guide_sessions` 保存项目、分支、基础修订、步骤、答案、问题缓存和提案。采用可只选部分场景，至少一场；未选提案不进入作品。`sceneAdditions` 是 ChangeSet 的可选部分，采用时校验场景、章节、路线与重复 ID；新增场景和剧情节点在同一修订中写入。采用使用稳定 `acceptanceId`，重复请求返回同一修订。两类会话都用 single-flight 与 revision 防止并发/迟到覆盖；迟到产物先按原任务终结归档，不写回旧会话。Agent 没有新增场景或修改工作流定义的工具。
 
 ## 10. 交互式工作流编排
 
@@ -143,3 +166,7 @@ JSON 解析失败时，任务失败并保留原始产物，不把原文硬塞进
 | `POST /api/workflow-guide/sessions/:id/publish` | 再次校验并注册不可变版本，不自动运行 |
 
 宿主分配稳定的工作流与版本 ID，重复发布返回同一定义。缺少 `sceneId` 输入、生成、人工审阅或提交节点的提案不能注册；未知节点、端口不匹配、断开的输入和环同样拒绝。既有运行不受新发布版本影响。
+
+## 11. 人工审阅与退回说明
+
+人工节点默认提供 `accept / revise / reject`。`POST /api/workflow-runs/:id/decision` 除 `todoId / answer / inputHash` 外可携带 `reviewNote`；退回修改说明随 `DecisionRecord` 持久化。`agent.generate` 新增可选 `decision` 输入，连接后可读取该说明，未连接时行为不变。接受提交仍必须通过真实人工决定、同源 candidate/draft、文本哈希和 decisionId 校验；退回或拒绝不会提交正文。

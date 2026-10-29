@@ -269,10 +269,11 @@ export function registerBuiltinNodeTypes(registry: NodeTypeRegistry): void {
     type: "agent.generate",
     typeVersion: 1,
     kind: "normal",
-    inputs: { context: { type: "ContextBundle", required: true } },
+    inputs: { context: { type: "ContextBundle", required: true }, decision: { type: "DecisionRecord", required: false } },
     outputs: { draft: { type: "DraftArtifact" } },
     execute: async (ctx) => {
       const context = ctx.inputs.context as ContextBundle | undefined;
+      const reviewNote = (ctx.inputs.decision as DecisionRecordValue | undefined)?.reviewNote;
       const kind = (ctx.config.kind as AgentTask["kind"]) ?? "scene";
       const instruction =
         typeof ctx.config.prompt === "string" && ctx.config.prompt.length > 0
@@ -283,6 +284,7 @@ export function registerBuiltinNodeTypes(registry: NodeTypeRegistry): void {
         snapshotId: context?.snapshotId,
         facts: context?.facts ?? [],
         selectedPlans: context?.selectedPlans ?? [],
+        ...(reviewNote ? { reviewNote } : {}),
       });
       const sceneId = sceneIdOf(ctx);
       const result = await ctx.hooks.generate({

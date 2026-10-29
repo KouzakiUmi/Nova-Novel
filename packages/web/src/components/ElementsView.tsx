@@ -2,10 +2,11 @@ import { useMemo, useState } from "react";
 import type { Entity, Evidence, FactAssertion, Scene, WorkspaceSnapshot, WorldEvent } from "@nova-novel/shared";
 import { ArrowRight, Box, CheckCircle2, ChevronDown, CircleAlert, Clock3, FileText, History, Link2, MapPin, Network, Search, Shield, UserRound } from "lucide-react";
 import { Badge, EmptyState } from "./UI";
+import { CharacterArcPanel } from "./CharacterArcPanel";
 
 const typeNames: Record<Entity["type"], string> = { character: "角色", item: "物品", location: "地点", organization: "组织", ability: "能力", rule: "规则", event: "事件", secret: "秘密", custom: "自定义" };
 
-export function ElementsView({ snapshot, selectedElementId, onSelect, onOpenScene }: { snapshot: WorkspaceSnapshot; selectedElementId: string; onSelect: (id: string) => void; onOpenScene: (id: string) => void }) {
+export function ElementsView({ snapshot, selectedElementId, onSelect, onOpenScene, onChanged }: { snapshot: WorkspaceSnapshot; selectedElementId: string; onSelect: (id: string) => void; onOpenScene: (id: string) => void; onChanged: () => Promise<unknown> }) {
   const [filter, setFilter] = useState<"all" | Entity["type"]>("all");
   const [query, setQuery] = useState("");
   const [tab, setTab] = useState<"overview" | "relations" | "timeline" | "evidence" | "history">("overview");
@@ -31,6 +32,7 @@ export function ElementsView({ snapshot, selectedElementId, onSelect, onOpenScen
           {selected ? <><header className="element-detail-header"><EntityIcon entity={selected} large /><div><p className="eyebrow">{typeNames[selected.type]} · {selected.entityId.slice(0, 14)}</p><h2>{selected.name}</h2><p>{selected.aliases.length ? `也称 ${selected.aliases.join("、")}` : selected.summary}</p></div><div className="element-review"><Badge tone={selected.reviewState === "confirmed" ? "green" : "amber"}>{selected.reviewState === "confirmed" ? "作者已确认" : "待确认"}</Badge><small>{selected.sourceKind === "author_setting" ? "作者设定" : "正文与事件"}</small></div></header><nav className="detail-tabs">{([{ id: "overview", label: "概览" }, { id: "relations", label: "关系" }, { id: "timeline", label: "时间线" }, { id: "evidence", label: `出场证据 ${evidence.length}` }, { id: "history", label: "修改历史" }] as const).map((item) => <button key={item.id} className={tab === item.id ? "active" : ""} onClick={() => setTab(item.id)}>{item.label}</button>)}</nav>
             <div className="element-tab-content">
               {tab === "overview" && <Overview entity={selected} facts={facts} events={events} {...(timeScene?.storyTime ? { storyTime: timeScene.storyTime } : {})} />}
+              {tab === "overview" && selected.type === "character" && <CharacterArcPanel key={selected.entityId} snapshot={snapshot} entity={selected} events={events} onOpenScene={onOpenScene} onChanged={onChanged} />}
               {tab === "relations" && <Relations entity={selected} facts={facts} elements={snapshot.elements} onSelect={onSelect} />}
               {tab === "timeline" && <EntityTimeline events={events} scenes={snapshot.scenes} onOpenScene={onOpenScene} />}
               {tab === "evidence" && <EvidenceList evidence={evidence} scenes={snapshot.scenes} onOpenScene={onOpenScene} />}

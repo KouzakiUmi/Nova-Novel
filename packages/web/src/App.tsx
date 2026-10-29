@@ -17,11 +17,13 @@ import { ElementsView } from "./components/ElementsView";
 import { WorkflowView } from "./components/WorkflowView";
 import { RevisionsView } from "./components/RevisionsView";
 import { ContextView } from "./components/ContextView";
+import { NotesView } from "./components/NotesView";
 import { SettingsView } from "./components/SettingsView";
 import { Toast } from "./components/UI";
 import type { NewProjectInput } from "./components/NewProjectDialog";
 import { GuidedOutlineDialog } from "./components/GuidedOutlineDialog";
 import { GuidedWorkflowDialog } from "./components/GuidedWorkflowDialog";
+import { ProjectManagerDialog } from "./components/ProjectManagerDialog";
 
 export interface GenerationHandle {
   receipt: Promise<GenerationReceipt>;
@@ -39,23 +41,33 @@ export function App() {
   const [focusMode, setFocusMode] = useState(false);
   const [guideOpen, setGuideOpen] = useState(false);
   const [workflowGuideOpen, setWorkflowGuideOpen] = useState(false);
+  const [projectManagerOpen, setProjectManagerOpen] = useState(false);
   const [saveStatus, setSaveStatus] = useState<SaveStatus>("saved");
   const pendingSave = useRef<Promise<unknown>>(Promise.resolve());
   /** 当前分支头；自动保存串行执行并总以最新头为基准。 */
   const headRef = useRef<string>("");
+  const headsRef = useRef(new Map<string, string>());
+  const flushEditorRef = useRef<(() => Promise<void>) | null>(null);
   const saveSeq = useRef(0);
   const projectIdRef = useRef("");
   const projectSeq = useRef(0);
+  const refreshSeq = useRef(0);
 
   useEffect(() => {
     const head = snapshot?.branches.find((branch) => branch.branchId === snapshot.activeProject.activeBranchId)?.headRevisionId;
-    if (head) headRef.current = head;
+    if (head && snapshot) {
+      headRef.current = head;
+      headsRef.current.set(snapshot.activeProject.projectId, head);
+    }
   }, [snapshot]);
 
   const refresh = useCallback(async (projectId?: string) => {
+    const targetProjectId = projectId ?? projectIdRef.current;
+    const seq = ++refreshSeq.current;
+    const activationAtStart = projectSeq.current;
     try {
-      if (projectId) projectIdRef.current = projectId;
-      const next = await api.bootstrap(projectIdRef.current || undefined);
+      const next = await api.bootstrap(targetProjectId || undefined);
+      if (seq !== refreshSeq.current || activationAtStart !== projectSeq.current || (targetProjectId && projectIdRef.current !== targetProjectId)) return null;
       projectIdRef.current = next.activeProject.projectId;
       setSnapshot(next);
       setSelectedSceneId((current) => (current && next.scenes.some((scene) => scene.sceneId === current) ? current : next.scenes[0]?.sceneId || ""));
@@ -96,9 +108,15 @@ export function App() {
     }
   }, []);
 
-  /** 写入类操作前等待在途自动保存，并以服务端最新作品头为基准。 */
+  const flushPending = useCallback(async () => {
+    if (flushEditorRef.current) await flushEditorRef.current();
+    await pendingSave.current;
+  }, []);
+  const registerEditorFlush = useCallback((flush: (() => Promise<void>) | null) => { flushEditorRef.current = flush; }, []);
+
+  /** 写入类操作前先刷新编辑器并等待在途自动保存。 */
   const latest = useCallback(async () => {
-    await pendingSave.current.catch(() => undefined);
+    await flushPending();
     const next = await api.bootstrap(projectIdRef.current || undefined);
     projectIdRef.current = next.activeProject.projectId;
     setSnapshot(next);
@@ -106,7 +124,7 @@ export function App() {
   }, []);
 
   const activateProject = useCallback(async (projectId: string) => {
-    await pendingSave.current.catch(() => undefined);
+    await flushPending();
     const seq = ++projectSeq.current;
     saveSeq.current += 1;
     const next = await api.bootstrap(projectId);
@@ -121,7 +139,7 @@ export function App() {
   }, []);
 
   const createProject = useCallback(async (input: NewProjectInput) => {
-    await pendingSave.current.catch(() => undefined);
+    await flushPending();
     const seq = ++projectSeq.current;
     saveSeq.current += 1;
     const next = await api.createProject({ title: input.title, premise: input.premise, ...(input.body ? { body: input.body } : {}) });
@@ -140,7 +158,8 @@ export function App() {
   const handleSaveScene = useCallback(async (scene: Scene) => {
     setSaveStatus("saving");
     saveSeq.current += 1;
-    const task = pendingSave.current.catch(() => undefined).then(() => api.saveScene({ ...scene, baseRevisionId: headRef.current || scene.baseRevisionId })).then((result) => {
+    const task = pendingSave.current.catch(() => undefined).then(() => api.saveScene({ ...scene, baseRevisionId: headsRef.current.get(scene.projectId) || scene.baseRevisionId })).then((result) => {
+      headsRef.current.set(scene.projectId, result.revisionId);
       if (projectIdRef.current === scene.projectId) headRef.current = result.revisionId;
       setSnapshot((current) => {
         if (!current || current.activeProject.projectId !== scene.projectId) return current;
@@ -186,7 +205,7 @@ export function App() {
   }
 
   const updateDraft = (draft: AuthoringSelection) => {
-    setSnapshot((current) => current ? { ...current, authoringDraft: draft } : current);
+    setSnapshot((current) => current && current.activeProject.projectId === draft.projectId ? { ...current, authoringDraft: draft } : current);
   };
 
   const ideasMode = snapshot.connection.state === "connected" ? "pi" as const : "example" as const;
@@ -228,6 +247,7 @@ export function App() {
       onOpenStart={() => setView("start")}
       onOpenScene={openScene}
       onProjectChange={(projectId) => run(() => activateProject(projectId), "已打开作品")}
+      onManageProjects={() => setProjectManagerOpen(true)}
       saveStatus={saveStatus}
     >
       {view === "start" && (
@@ -288,6 +308,8 @@ export function App() {
           }}
           onOpenReview={() => setView("revisions")}
           onOpenSettings={() => setView("settings")}
+          onChanged={refresh}
+          onRegisterFlush={registerEditorFlush}
         />
       )}
       {view === "story" && (
@@ -296,6 +318,7 @@ export function App() {
           selectedSceneId={selectedScene?.sceneId ?? ""}
           onSelectScene={openScene}
           onOpenGuide={() => setGuideOpen(true)}
+          onChanged={refresh}
         />
       )}
       {view === "elements" && (
@@ -304,9 +327,11 @@ export function App() {
           selectedElementId={selectedElementId}
           onSelect={setSelectedElementId}
           onOpenScene={openScene}
+          onChanged={refresh}
         />
       )}
       {view === "context" && <ContextView snapshot={snapshot} {...(selectedScene ? { scene: selectedScene } : {})} onOpenScene={openScene} />}
+      {view === "notes" && <NotesView snapshot={snapshot} onChanged={refresh} onOpenScene={openScene} />}
       {view === "workflow" && (
         <WorkflowView
           snapshot={snapshot}
@@ -317,8 +342,9 @@ export function App() {
             await api.runWorkflow(workflowVersionId, snapshot.activeProject.projectId, selectedScene.sceneId);
             await refresh();
           }, "工作流已开始，已完成的节点会自动保留")}
-          onDecide={(runId, todoId, answer, inputHash) => run(async () => {
-            await api.decideWorkflow(runId, todoId, answer, inputHash);
+          onDecide={(runId, todoId, answer, inputHash, reviewNote) => run(async () => {
+            await api.decideWorkflow(runId, todoId, answer, inputHash, reviewNote);
+            void api.recordInteraction({ projectId: snapshot.activeProject.projectId, ...(selectedScene ? { sceneId: selectedScene.sceneId } : {}), kind: "review-decided", actor: "author", meta: { answer } }).catch(() => undefined);
             await refresh();
           }, "审阅决定已记录")}
           onCancelRun={(runId) => run(async () => {
@@ -344,9 +370,13 @@ export function App() {
             const next = await api.restore(current.activeProject.projectId, revisionId, branch.headRevisionId);
             setSnapshot(next);
           }, "已创建恢复版本，恢复前的主稿仍保留")}
+          onActivate={activateProject}
+          onBeforeWrite={flushPending}
+          onOpenScene={openScene}
         />
       )}
       {view === "settings" && <SettingsView onChanged={() => void refresh()} onToast={setToast} />}
+      {projectManagerOpen && <ProjectManagerDialog snapshot={snapshot} onClose={() => setProjectManagerOpen(false)} onActivate={activateProject} onBeforeWrite={flushPending} />}
       {guideOpen && <GuidedOutlineDialog projectId={snapshot.activeProject.projectId} {...(snapshot.guide ? { session: snapshot.guide } : {})} aiReady={snapshot.connection.state === "connected"} onChanged={async () => { await refresh(); }} onClose={() => setGuideOpen(false)} onOpenSettings={() => { setGuideOpen(false); setView("settings"); }} />}
       {workflowGuideOpen && <GuidedWorkflowDialog projectId={snapshot.activeProject.projectId} {...(snapshot.workflowGuide ? { session: snapshot.workflowGuide } : {})} aiReady={snapshot.connection.state === "connected"} onChanged={async () => { await refresh(); }} onClose={() => setWorkflowGuideOpen(false)} onOpenSettings={() => { setWorkflowGuideOpen(false); setView("settings"); }} />}
       {toast && <Toast message={toast} onClose={() => setToast("")} />}

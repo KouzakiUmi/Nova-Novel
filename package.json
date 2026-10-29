@@ -11,6 +11,14 @@
     "build": "pnpm -r build",
     "start": "pnpm --filter @nova-novel/server start",
     "typecheck": "pnpm -r typecheck",
-    "test": "pnpm -r test"
+    "test": "pnpm -r test",
+    "test:runtime": "node scripts/test-packed-runtime.mjs",
+    "dist:win": "node scripts/package-windows.mjs",
+    "dist:win:dir": "node scripts/package-windows.mjs --dir"
+  },
+  "devDependencies": {
+    "@electron/rebuild": "^4.2.1",
+    "electron": "44.7.2",
+    "electron-builder": "^26.18.0"
   }
 }

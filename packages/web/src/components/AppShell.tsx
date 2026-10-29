@@ -18,7 +18,7 @@ import type { WorkspaceSnapshot } from "@nova-novel/shared";
 import { countWords } from "@nova-novel/shared";
 import { IconConstellation, IconCore, IconFacet, IconFolio, IconLens, IconOrbit, IconQuill, IconSpark, NovaMark, type IconProps } from "./icons";
 
-export type ViewId = "start" | "write" | "story" | "elements" | "context" | "workflow" | "revisions" | "settings";
+export type ViewId = "start" | "write" | "story" | "elements" | "context" | "notes" | "workflow" | "revisions" | "settings";
 export type SaveStatus = "saved" | "dirty" | "saving" | "error";
 
 const navigation: Array<{ id: ViewId; label: string; hint: string; icon: (props: IconProps) => React.ReactElement }> = [
@@ -27,6 +27,7 @@ const navigation: Array<{ id: ViewId; label: string; hint: string; icon: (props:
   { id: "story", label: "故事", hint: "剧情与时间线", icon: IconConstellation },
   { id: "elements", label: "元素", hint: "人物、物品与规则", icon: IconFacet },
   { id: "context", label: "资料", hint: "证据与检索", icon: IconLens },
+  { id: "notes", label: "便签", hint: "想法与笔记", icon: IconSpark },
   { id: "workflow", label: "工作流", hint: "编排与运行", icon: IconOrbit },
   { id: "revisions", label: "修订", hint: "版本与恢复", icon: IconFolio },
   { id: "settings", label: "模型与服务", hint: "Provider、模型与任务分配", icon: IconCore },
@@ -41,11 +42,12 @@ interface AppShellProps {
   onOpenStart: () => void;
   onOpenScene: (sceneId: string) => void;
   onProjectChange: (projectId: string) => Promise<void>;
+  onManageProjects: () => void;
   saveStatus: SaveStatus;
   children: ReactNode;
 }
 
-export function AppShell({ snapshot, view, onViewChange, focusMode, onFocusMode, onOpenStart, onOpenScene, onProjectChange, saveStatus, children }: AppShellProps) {
+export function AppShell({ snapshot, view, onViewChange, focusMode, onFocusMode, onOpenStart, onOpenScene, onProjectChange, onManageProjects, saveStatus, children }: AppShellProps) {
   const [commandOpen, setCommandOpen] = useState(false);
   const [commandQuery, setCommandQuery] = useState("");
 
@@ -75,19 +77,19 @@ export function AppShell({ snapshot, view, onViewChange, focusMode, onFocusMode,
           <span><strong>Nova Novel</strong><small>STORIES THAT IGNITE</small></span>
         </button>
 
-        <label className="project-switcher">
+        <div className="project-switcher-row"><label className="project-switcher">
           <span className="project-cover" aria-hidden="true">{project.title.trim().slice(0, 1) || "N"}</span>
           <span><small>当前作品</small><select aria-label="切换作品" value={project.projectId} onChange={(event) => void onProjectChange(event.target.value)}>{snapshot.projects.map((item) => <option key={item.projectId} value={item.projectId}>{item.title}</option>)}</select></span>
           <ChevronDown size={13} aria-hidden="true" />
-        </label>
+        </label><button className="icon-button" aria-label="管理作品" title="管理作品" onClick={onManageProjects}><Settings2 size={14} /></button></div>
 
         <nav className="primary-nav" aria-label="作品功能">
           <p className="nav-section-label">创作空间</p>
-          {navigation.slice(0, 5).map((item) => (
+          {navigation.slice(0, 6).map((item) => (
             <NavButton key={item.id} item={item} active={view === item.id} onClick={() => onViewChange(item.id)} />
           ))}
           <p className="nav-section-label nav-section-secondary">创作方法</p>
-          {navigation.slice(5, 7).map((item) => (
+          {navigation.slice(6, 8).map((item) => (
             <NavButton key={item.id} item={item} active={view === item.id} onClick={() => onViewChange(item.id)} />
           ))}
         </nav>

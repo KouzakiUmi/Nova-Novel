@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { EditorContent, getTextBetween, getTextSerializersFromSchema, useEditor, useEditorState, type Editor } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
 import type { ConsistencyReport, GenerationProgress, GenerationReceipt, GenerationRequest, Scene, WorkspaceSnapshot } from "@nova-novel/shared";
-import { countWords } from "@nova-novel/shared";
+import { countWords, recommendNextAction, type NextActionKind } from "@nova-novel/shared";
 import {
   AlignLeft,
   ArrowRight,
@@ -37,6 +37,9 @@ import {
 } from "lucide-react";
 import { Badge } from "./UI";
 import { IconCore } from "./icons";
+import { AnnotationPanel, type AnnotationDraftRange } from "./AnnotationPanel";
+import { RevisionPanel } from "./RevisionPanel";
+import { api } from "../lib/api";
 
 interface GenerationHandle {
   receipt: Promise<GenerationReceipt>;
@@ -56,12 +59,14 @@ interface EditorViewProps {
   onOpenElement: (entityId: string) => void;
   onOpenReview: () => void;
   onOpenSettings: () => void;
+  onChanged: () => Promise<unknown>;
+  onRegisterFlush: (flush: (() => Promise<void>) | null) => void;
 }
 
 type TaskKind = GenerationRequest["kind"];
 type Range = NonNullable<GenerationRequest["range"]>;
 
-interface LastRequest { kind: TaskKind; input: string; range?: Range; label: string }
+export interface LastRequest { kind: TaskKind; input: string; range?: Range; label: string }
 
 type Outcome =
   | { type: "continuation"; sceneId: string; text: string; proposals: string[]; baseBody: string; incomplete: boolean; stale: boolean }
@@ -80,6 +85,11 @@ function textOffset(editor: Editor, pos: number): number {
   const doc = editor.state.doc;
   const clamped = Math.max(0, Math.min(pos, doc.content.size));
   return getTextBetween(doc, { from: 0, to: clamped }, { blockSeparator: BLOCK_SEPARATOR, textSerializers: getTextSerializersFromSchema(editor.schema) }).length;
+}
+
+async function sha256Text(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return [...new Uint8Array(digest)].map(value => value.toString(16).padStart(2, "0")).join("");
 }
 
 function bodyToContent(body: string): string {
@@ -119,12 +129,13 @@ type SceneWritingIntent = keyof typeof SCENE_INTENTS;
 
 const SCENE_REVIEW_INTENT = "复盘当前场景，不改正文：开头人物追求什么或面对什么问题；结尾正文实际发生了什么结果或状态变化；若继续写下一场，人物可以作出什么决定。只依据正文明确支持的内容，不为迎合结构公式强造灾难、反转或变化。把正文未交代的因果与变化标为 unknown，把可选的表达建议标为 aesthetic，并在 summary 里用普通语言概括“结果与可能的下一步”。";
 
-export function EditorView({ snapshot, scene, focusMode, onSelectScene, onDirty, onSave, onGenerate, onProgress, onCancel, onOpenElement, onOpenReview, onOpenSettings }: EditorViewProps) {
+export function EditorView({ snapshot, scene, focusMode, onSelectScene, onDirty, onSave, onGenerate, onProgress, onCancel, onOpenElement, onOpenReview, onOpenSettings, onChanged, onRegisterFlush }: EditorViewProps) {
   const [body, setBody] = useState(scene.body);
   const [saveState, setSaveState] = useState<"saved" | "dirty" | "saving">("saved");
-  const [assistantTab, setAssistantTab] = useState<"assistant" | "context" | "scene">("assistant");
+  const [assistantTab, setAssistantTab] = useState<"assistant" | "context" | "scene" | "annotations" | "revision">("assistant");
   const [rightOpen, setRightOpen] = useState(true);
   const [outcome, setOutcome] = useState<Outcome | null>(null);
+  const [annotationDraft, setAnnotationDraft] = useState<AnnotationDraftRange | null>(null);
   const [running, setRunning] = useState<{ key: string; sceneId: string; label: string; text: string; tools: string[] } | null>(null);
   const [lastRequest, setLastRequest] = useState<LastRequest | null>(null);
   const [compare, setCompare] = useState(false);
@@ -132,14 +143,18 @@ export function EditorView({ snapshot, scene, focusMode, onSelectScene, onDirty,
   const [prompt, setPrompt] = useState("");
   const [sceneIntent, setSceneIntent] = useState<SceneWritingIntent>("action");
   const [taskNote, setTaskNote] = useState("");
+  const [lastAction, setLastAction] = useState<"accepted" | "reviewed" | null>(null);
   const [sceneFilter, setSceneFilter] = useState("");
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
   const sceneIdRef = useRef(scene.sceneId);
   const bodyRef = useRef(scene.body);
+  const sceneRef = useRef(scene);
+  if (sceneRef.current.sceneId === scene.sceneId) sceneRef.current = scene;
   // 只表示尚未被任何一次保存请求捕获的修改，避免重复提交已在途的内容。
   const unsavedChangesRef = useRef(false);
   const aiReady = snapshot.connection.state === "connected";
   const activeSceneIntent = SCENE_INTENTS[sceneIntent];
+  const nextAction = recommendNextAction({ hasBody: Boolean(body.trim()), hasPlan: Boolean((scene.goal ?? "").trim() || scene.summary.trim()), outcome: outcome ? outcome.type === "report" ? "report" : "candidate" : null, stale: outcome && outcome.type !== "report" ? outcome.stale : false, lastAction });
 
   const editor = useEditor({
     extensions: [StarterKit],
@@ -175,27 +190,56 @@ export function EditorView({ snapshot, scene, focusMode, onSelectScene, onDirty,
   });
 
   useEffect(() => {
+    if (!outcome || outcome.type === "report") return;
+    void api.recordInteraction({ projectId: scene.projectId, sceneId: scene.sceneId, kind: "candidate-presented", actor: "system" }).catch(() => undefined);
+  }, [outcome?.sceneId]);
+
+  const flushPendingChanges = useCallback(async () => {
+    if (!unsavedChangesRef.current) return;
+    const currentScene = sceneRef.current;
+    const bodyToSave = bodyRef.current;
+    unsavedChangesRef.current = false;
+    setSaveState("saving");
+    try {
+      await onSave({ ...currentScene, body: bodyToSave });
+      if (sceneIdRef.current === currentScene.sceneId) setSaveState("saved");
+    } catch (error) {
+      unsavedChangesRef.current = true;
+      if (sceneIdRef.current === currentScene.sceneId) setSaveState("dirty");
+      throw error;
+    }
+  }, [onSave]);
+
+  useEffect(() => {
+    onRegisterFlush(flushPendingChanges);
+    return () => onRegisterFlush(null);
+  }, [flushPendingChanges, onRegisterFlush]);
+
+  useEffect(() => {
     // 切换场景或离开写作页时，先让在途修改进入应用的串行保存队列。
     // effect 中捕获的 scene 仍是离开前的场景，不会被下一场景的 bodyRef 污染。
     return () => {
       if (!unsavedChangesRef.current) return;
       const bodyToSave = bodyRef.current;
       unsavedChangesRef.current = false;
-      void onSave({ ...scene, body: bodyToSave }).catch(() => undefined);
+      void onSave({ ...sceneRef.current, body: bodyToSave }).catch(() => undefined);
     };
   }, [scene.sceneId]);
 
   useEffect(() => {
     if (sceneIdRef.current === scene.sceneId) return;
+    sceneRef.current = scene;
     sceneIdRef.current = scene.sceneId;
     bodyRef.current = scene.body;
     unsavedChangesRef.current = false;
     setBody(scene.body);
     setOutcome(null);
+    setAnnotationDraft(null);
     setRunning(null);
     setLastRequest(null);
     setCompare(false);
     setTaskNote("");
+    setLastAction(null);
     setSaveState("saved");
     editor?.commands.setContent(bodyToContent(scene.body), { emitUpdate: false });
   }, [scene.sceneId, scene.body, editor]);
@@ -242,6 +286,7 @@ export function EditorView({ snapshot, scene, focusMode, onSelectScene, onDirty,
       setTaskNote("还没有接入模型。到“模型与服务”添加一个 provider 后即可生成。");
       return;
     }
+    void api.recordInteraction({ projectId: scene.projectId, sceneId: scene.sceneId, kind: "suggestion-open" }).catch(() => undefined);
     setLastRequest(request);
     setOutcome(null);
     setCompare(false);
@@ -274,6 +319,7 @@ export function EditorView({ snapshot, scene, focusMode, onSelectScene, onDirty,
       const stale = receipt.freshness === "stale" || bodyRef.current !== baseBody;
       if (request.kind === "consistency") {
         setOutcome({ type: "report", sceneId: requestSceneId, title: request.label, report: reportOf(payload), incomplete });
+        setLastAction("reviewed");
         setTaskNote("检查结果只供参考，不会改动正文。");
       } else if (request.kind === "polish" && request.range) {
         setOutcome({ type: "replacement", sceneId: requestSceneId, text, proposals: proposalsOf(payload), range: request.range, baseBody, incomplete, stale });
@@ -288,6 +334,15 @@ export function EditorView({ snapshot, scene, focusMode, onSelectScene, onDirty,
       setRunning((current) => current?.key === idempotencyKey ? null : current);
     }
   }, [aiReady, onGenerate, running, scene.sceneId, snapshot.activeProject.projectId, snapshot.authoringDraft.draftId]);
+
+  const performNextAction = (kind: NextActionKind) => {
+    if (kind === "plan") { setRightOpen(true); setAssistantTab("scene"); return; }
+    if (kind === "write") { editor?.commands.focus(); return; }
+    if (kind === "compare") { setCompare(true); return; }
+    if (kind === "review-candidate") { document.querySelector(".candidate-panel")?.scrollIntoView({ behavior: "smooth", block: "center" }); return; }
+    if (kind === "review-scene") { void generate({ kind: "consistency", label: "场景复盘", input: SCENE_REVIEW_INTENT }); return; }
+    void generate({ kind: "scene", label: activeSceneIntent.label, input: `${activeSceneIntent.instruction}${prompt.trim() ? `\n作者补充要求：${prompt.trim()}` : ""}` });
+  };
 
   const stop = async () => {
     if (!running) return;
@@ -305,10 +360,19 @@ export function EditorView({ snapshot, scene, focusMode, onSelectScene, onDirty,
     return { from, to, baseText: text.slice(from, to) };
   };
 
-  const polishSelection = (mode: "tighten" | "expand") => {
+  const createAnnotationDraft = async () => {
+    const range = selectionRange();
+    if (!range || !range.baseText.trim()) { setTaskNote("先选中要批注的一段文字，也可以使用整场想法。"); setAssistantTab("annotations"); return; }
+    const textHash = await sha256Text(range.baseText);
+    setAnnotationDraft({ ...range, textHash });
+    setRightOpen(true);
+    setAssistantTab("annotations");
+  };
+
+  const polishSelection = (mode: "tighten" | "expand", intentOverride?: string) => {
     const range = selectionRange();
     if (!range || !range.baseText.trim()) return;
-    const intent = prompt.trim() ? `作者意图：${prompt.trim()}\n` : "";
+    const intent = intentOverride?.trim() ? `作者意图：${intentOverride.trim()}\n` : prompt.trim() ? `作者意图：${prompt.trim()}\n` : "";
     void generate(mode === "tighten"
       ? { kind: "polish", label: "推敲表达", range, input: `${intent}只改表达，不新增人物、身份、死亡或物品状态变化。` }
       : { kind: "polish", label: "扩写选段", range, input: `${intent}允许扩写这一段，关键新事实必须单列为提案。` });
@@ -351,6 +415,8 @@ export function EditorView({ snapshot, scene, focusMode, onSelectScene, onDirty,
     }
     setOutcome(null);
     setCompare(false);
+    setLastAction("accepted");
+    void api.recordInteraction({ projectId: scene.projectId, sceneId: scene.sceneId, kind: "candidate-accept" }).catch(() => undefined);
     setTaskNote("已采用到正文，可以随时撤销。");
   };
 
@@ -447,7 +513,7 @@ export function EditorView({ snapshot, scene, focusMode, onSelectScene, onDirty,
 
             {outcome && outcome.sceneId === scene.sceneId && outcome.type !== "report" && (
               <section className={`candidate-panel ${outcome.stale || outcome.baseBody !== body ? "is-stale" : ""}`}>
-                <div className="candidate-heading"><div><Sparkles size={16} /><strong>{outcome.incomplete ? "不完整候选" : outcome.type === "replacement" ? "选段改写" : "接着写的候选"}</strong><Badge tone="violet">未进入正文</Badge></div><button className="icon-button" onClick={() => setOutcome(null)} aria-label="关闭候选"><X size={15} /></button></div>
+                <div className="candidate-heading"><div><Sparkles size={16} /><strong>{outcome.incomplete ? "不完整候选" : outcome.type === "replacement" ? "选段改写" : "接着写的候选"}</strong><Badge tone="violet">未进入正文</Badge></div><button className="icon-button" onClick={() => { void api.recordInteraction({ projectId: scene.projectId, sceneId: scene.sceneId, kind: "candidate-dismiss" }).catch(() => undefined); setOutcome(null); }} aria-label="关闭候选"><X size={15} /></button></div>
                 {(outcome.stale || outcome.baseBody !== body) && <p className="stale-warning"><CircleAlert size={14} />你在生成期间修改了原文。候选仍保留，请比较后决定是否采用。</p>}
                 <div className={`candidate-text ${compare ? "compare" : ""}`}>
                   {compare && <div><span>{outcome.type === "replacement" ? "原选段" : "当前结尾"}</span><p>{outcome.type === "replacement" ? outcome.range.baseText : body.slice(-600)}</p></div>}
@@ -468,7 +534,7 @@ export function EditorView({ snapshot, scene, focusMode, onSelectScene, onDirty,
         </div>
 
         {editorState?.hasSelection && !running && (
-          <div className="selection-toolbar"><Highlighter size={14} /><span>已选 {countWords(editorState.selectedText)} 字</span><button onClick={() => polishSelection("tighten")}>推敲表达</button><button onClick={() => polishSelection("expand")}>扩写</button><button onClick={checkSelection}>检查</button></div>
+          <div className="selection-toolbar"><Highlighter size={14} /><span>已选 {countWords(editorState.selectedText)} 字</span><button onClick={() => polishSelection("tighten")}>推敲表达</button><button onClick={() => polishSelection("expand")}>扩写</button><button onClick={checkSelection}>检查</button><button onClick={() => void createAnnotationDraft()}>批注</button></div>
         )}
 
         <div className="editor-bottom-bar"><span>{wordCount.toLocaleString("zh-CN")} 字</span><span>正文 18px · 行距 1.9</span><span className="editor-bottom-spacer" /><button onClick={onOpenReview}><CircleAlert size={13} />{snapshot.facts.some((fact) => fact.reviewState === "candidate") ? "有待确认变化" : "暂无待确认变化"}</button></div>
@@ -476,13 +542,14 @@ export function EditorView({ snapshot, scene, focusMode, onSelectScene, onDirty,
 
       {rightOpen && !focusMode && (
         <aside className="assistant-sidebar">
-          <div className="assistant-tabs" role="tablist"><button className={assistantTab === "assistant" ? "active" : ""} onClick={() => setAssistantTab("assistant")}>助手</button><button className={assistantTab === "context" ? "active" : ""} onClick={() => setAssistantTab("context")}>上下文 <span>{relatedEvidence.length}</span></button><button className={assistantTab === "scene" ? "active" : ""} onClick={() => setAssistantTab("scene")}>场景卡</button></div>
+          <div className="assistant-tabs" role="tablist"><button className={assistantTab === "assistant" ? "active" : ""} onClick={() => setAssistantTab("assistant")}>助手</button><button className={assistantTab === "context" ? "active" : ""} onClick={() => setAssistantTab("context")}>上下文 <span>{relatedEvidence.length}</span></button><button className={assistantTab === "scene" ? "active" : ""} onClick={() => setAssistantTab("scene")}>场景卡</button><button className={assistantTab === "annotations" ? "active" : ""} onClick={() => setAssistantTab("annotations")}>批注</button><button className={assistantTab === "revision" ? "active" : ""} onClick={() => setAssistantTab("revision")}>修订</button></div>
           {assistantTab === "assistant" && (
             <div className="assistant-content">
               <div className="assistant-intro"><span className="assistant-mark"><Sparkles size={18} /></span><div><strong>写作搭档</strong><p>基于这一场，帮你往下走。</p></div></div>
               {!aiReady && (
                 <button className="setup-callout" onClick={onOpenSettings}><IconCore size={18} /><span><strong>接入一个模型</strong><small>添加 provider 后即可续写、推敲和检查</small></span><ArrowRight size={14} /></button>
               )}
+              <section className="next-action-bar" aria-label="建议的下一步"><div><span>下一步</span><strong>{nextAction.title}</strong><p>{nextAction.reason}</p></div><button className="button secondary small" disabled={Boolean(running) && nextAction.kind !== "review-candidate" && nextAction.kind !== "compare"} onClick={() => performNextAction(nextAction.kind)}>{nextAction.buttonLabel}<ArrowRight size={13} /></button></section>
               <div className="writing-intent-picker" role="group" aria-label="选择本场写作意图">{(Object.keys(SCENE_INTENTS) as SceneWritingIntent[]).map((intent) => <button key={intent} className={sceneIntent === intent ? "active" : ""} onClick={() => setSceneIntent(intent)}>{SCENE_INTENTS[intent].label}</button>)}</div>
               <p className="writing-intent-hint">{activeSceneIntent.hint} · 只影响本次生成，不给场景贴永久标签</p>
               <div className="quick-actions">
@@ -503,6 +570,8 @@ export function EditorView({ snapshot, scene, focusMode, onSelectScene, onDirty,
           )}
           {assistantTab === "context" && <ContextPanel snapshot={snapshot} scene={scene} />}
           {assistantTab === "scene" && <ScenePanel key={scene.sceneId} scene={scene} onSave={(changes) => onSave({ ...changes, body: bodyRef.current })} />}
+          {assistantTab === "annotations" && <AnnotationPanel key={scene.sceneId} snapshot={snapshot} scene={scene} body={body} {...(annotationDraft ? { draftRange: annotationDraft } : {})} onClearDraft={() => setAnnotationDraft(null)} onChanged={onChanged} />}
+          {assistantTab === "revision" && <RevisionPanel key={scene.sceneId} snapshot={snapshot} scene={scene} body={body} hasSelection={Boolean(editorState?.hasSelection)} onSceneSave={(changes) => onSave({ ...changes, body: bodyRef.current })} onGenerate={generate} onPolish={polishSelection} onOpenAnnotations={() => setAssistantTab("annotations")} onTaskNote={setTaskNote} />}
         </aside>
       )}
     </div>
@@ -518,7 +587,7 @@ function ContextPanel({ snapshot, scene }: { snapshot: WorkspaceSnapshot; scene:
   return <div className="side-panel-content"><p className="eyebrow">VISIBLE TO THIS TASK</p><h3>这次生成能看到什么</h3><p className="panel-description">先按主稿、故事路线与人物知识边界过滤，再选择原文。候选不会混进事实清单。</p><div className="context-summary"><span><strong>{snapshot.facts.length}</strong>已确认事实</span><span><strong>{evidence.length}</strong>原文证据</span></div>{evidence.map((item) => <blockquote key={item.evidenceId}>{item.quote}<cite>{item.sourceKind} · {item.sourceRevisionId.slice(0, 10)}</cite></blockquote>)}{!evidence.length && <p className="quiet-empty">暂无历史证据。这是正常的新故事状态。</p>}</div>;
 }
 
-function ScenePanel({ scene, onSave }: { scene: Scene; onSave: (scene: Scene) => Promise<void> }) {
+export function ScenePanel({ scene, onSave }: { scene: Scene; onSave: (scene: Scene) => Promise<void> }) {
   const [goal, setGoal] = useState(scene.goal ?? "");
   const [conflict, setConflict] = useState(scene.conflict ?? "");
   const [change, setChange] = useState(scene.summary);

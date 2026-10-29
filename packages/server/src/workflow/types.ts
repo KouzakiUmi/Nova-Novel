@@ -99,6 +99,7 @@ export interface DecisionRecordValue {
   approved: boolean;
   inputHash: string;
   decidedAt: string;
+  reviewNote?: string;
   candidate?: { taskId?: string; artifactId?: string; textHash: string };
 }
 

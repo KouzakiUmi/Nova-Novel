@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import type { AgentSettingsView, ModelOption, ProviderApi, ProviderConfigView, ProviderModelInput, ProviderTestResult, TaskKind, TaskRoute, ThinkingLevel } from "@nova-novel/shared";
+import type { AgentSettingsView, ModelOption, ProviderApi, ProviderConfigView, ProviderModelInput, ProviderTestResult, TaskKind, TaskRoute, ThinkingLevel, BuiltinProviderPreset, OAuthStatusView, UsageReportView, ProviderCompat } from "@nova-novel/shared";
 import { TASK_KINDS } from "@nova-novel/shared";
 import { Check, CircleAlert, CloudDownload, KeyRound, LoaderCircle, Pencil, Plus, Save, ShieldCheck, Trash2, X, Zap } from "lucide-react";
 import { api } from "../lib/api";
@@ -11,13 +11,12 @@ const API_OPTIONS: Array<{ value: ProviderApi; label: string; hint: string; plac
   { value: "openai-responses", label: "OpenAI Responses", hint: "OpenAI 官方 Responses 接口或兼容网关", placeholder: "https://api.openai.com/v1" },
   { value: "anthropic-messages", label: "Anthropic 兼容（Messages）", hint: "Claude 官方或兼容 Messages 协议的服务", placeholder: "https://api.anthropic.com" },
   { value: "google-generative-ai", label: "Google Gemini", hint: "Gemini API（Generative Language）", placeholder: "https://generativelanguage.googleapis.com/v1beta" },
-];
-
-const PRESETS: Array<{ label: string; providerId: string; name: string; api: ProviderApi; baseUrl: string; models: ProviderModelInput[] }> = [
-  { label: "DeepSeek", providerId: "my-deepseek", name: "DeepSeek", api: "openai-completions", baseUrl: "https://api.deepseek.com/v1", models: [] },
-  { label: "OpenRouter", providerId: "my-openrouter", name: "OpenRouter", api: "openai-completions", baseUrl: "https://openrouter.ai/api/v1", models: [] },
-  { label: "Ollama（本机）", providerId: "local-ollama", name: "Ollama", api: "openai-completions", baseUrl: "http://127.0.0.1:11434/v1", models: [] },
-  { label: "LM Studio（本机）", providerId: "local-lmstudio", name: "LM Studio", api: "openai-completions", baseUrl: "http://127.0.0.1:1234/v1", models: [] },
+  { value: "openai-codex-responses", label: "OpenAI Codex / Command Code", hint: "ChatGPT OAuth 与 Codex Responses 接口", placeholder: "https://chatgpt.com/backend-api" },
+  { value: "mistral-conversations", label: "Mistral Conversations", hint: "Mistral 官方 Conversations 接口", placeholder: "https://api.mistral.ai" },
+  { value: "bedrock-converse-stream", label: "Amazon Bedrock", hint: "AWS Bedrock Converse 流式接口", placeholder: "https://bedrock-runtime.us-east-1.amazonaws.com" },
+  { value: "google-vertex", label: "Google Vertex AI", hint: "Vertex AI 项目、区域与凭据由运行环境提供", placeholder: "https://us-central1-aiplatform.googleapis.com" },
+  { value: "azure-openai-responses", label: "Azure OpenAI Responses", hint: "将 {resource} 替换为你的 Azure 资源名", placeholder: "https://{resource}.openai.azure.com/openai/v1" },
+  { value: "pi-messages", label: "Pi Messages / Radius", hint: "Pi 原生消息协议", placeholder: "https://radius.pi.dev/v1" },
 ];
 
 const TASK_META: Record<TaskKind, { label: string; hint: string; icon: (props: IconProps) => React.ReactElement }> = {
@@ -36,15 +35,20 @@ interface Draft {
   name: string;
   api: ProviderApi;
   baseUrl: string;
+  compat?: ProviderCompat;
+  keySource: "manual" | "environment";
   apiKey: string;
+  apiKeyEnv: string;
+  quotaAccessKeyEnv: string;
+  quotaSecretKeyEnv: string;
   keepKey: boolean;
   models: ProviderModelInput[];
 }
 
-const emptyDraft = (): Draft => ({ providerId: "", name: "", api: "openai-completions", baseUrl: "", apiKey: "", keepKey: false, models: [{ id: "" }] });
+const emptyDraft = (): Draft => ({ providerId: "", name: "", api: "openai-completions", baseUrl: "", keySource: "manual", apiKey: "", apiKeyEnv: "", quotaAccessKeyEnv: "", quotaSecretKeyEnv: "", keepKey: false, models: [{ id: "" }] });
 
 function draftFrom(provider: ProviderConfigView): Draft {
-  return { providerId: provider.providerId, name: provider.name, api: provider.api, baseUrl: provider.baseUrl, apiKey: "", keepKey: provider.hasApiKey, models: provider.models.length ? provider.models.map((model) => ({ ...model })) : [{ id: "" }] };
+  return { providerId: provider.providerId, name: provider.name, api: provider.api, baseUrl: provider.baseUrl, ...(provider.compat ? { compat: provider.compat } : {}), keySource: provider.keySource ?? "manual", apiKey: "", apiKeyEnv: provider.apiKeyEnv ?? "", quotaAccessKeyEnv: provider.quotaAccessKeyEnv ?? "", quotaSecretKeyEnv: provider.quotaSecretKeyEnv ?? "", keepKey: provider.hasApiKey, models: provider.models.length ? provider.models.map((model) => ({ ...model })) : [{ id: "" }] };
 }
 
 function slug(text: string): string {
@@ -54,10 +58,14 @@ function slug(text: string): string {
 export function SettingsView({ onChanged, onToast }: { onChanged: () => void; onToast: (message: string) => void }) {
   const [settings, setSettings] = useState<AgentSettingsView | null>(null);
   const [error, setError] = useState("");
-  const [editing, setEditing] = useState<{ mode: "create" | "edit"; draft: Draft } | null>(null);
+  const [editing, setEditing] = useState<{ mode: "create" | "edit"; draft: Draft; oauthProviderId?: string } | null>(null);
   const [routes, setRoutes] = useState<TaskRoute[]>([]);
   const [routesDirty, setRoutesDirty] = useState(false);
   const [tests, setTests] = useState<Record<string, ProviderTestResult | "running">>({});
+  const [oauth, setOauth] = useState<OAuthStatusView | null>(null);
+  const [oauthCode, setOauthCode] = useState("");
+  const [usage, setUsage] = useState<UsageReportView[]>([]);
+  const [usageLoading, setUsageLoading] = useState(false);
 
   const apply = useCallback((next: AgentSettingsView) => {
     setSettings(next);
@@ -75,8 +83,49 @@ export function SettingsView({ onChanged, onToast }: { onChanged: () => void; on
   }, [apply]);
 
   useEffect(() => { void load(); }, [load]);
+  const loadUsage = useCallback(async (refresh = false) => {
+    setUsageLoading(true);
+    try { setUsage((await api.usageReports(refresh)).reports); }
+    catch (cause) { onToast(cause instanceof Error ? cause.message : "额度读取失败"); }
+    finally { setUsageLoading(false); }
+  }, [onToast]);
+  useEffect(() => { void loadUsage(); }, [loadUsage]);
+  useEffect(() => {
+    if (oauth?.status !== "pending") return;
+    const timer = window.setInterval(() => {
+      void api.oauthStatus(oauth.providerId).then(setOauth).catch(() => undefined);
+    }, 1200);
+    return () => window.clearInterval(timer);
+  }, [oauth]);
+
+  const startOAuth = async (providerId: string) => {
+    try {
+      setOauthCode("");
+      setOauth(await api.startOAuth(providerId));
+    } catch (cause) {
+      onToast(cause instanceof Error ? cause.message : "OAuth 启动失败");
+    }
+  };
+  const submitCode = async () => {
+    if (!oauth) return;
+    try {
+      await api.submitOAuthCode(oauth.providerId, oauthCode.trim());
+      setOauthCode("");
+    } catch (cause) {
+      onToast(cause instanceof Error ? cause.message : "授权码提交失败");
+    }
+  };
+  const cancelOAuth = async () => {
+    if (!oauth) return;
+    await api.cancelOAuth(oauth.providerId);
+    setOauth(null);
+  };
+  const choosePreset = (preset: BuiltinProviderPreset) => {
+    setEditing({ mode: "create", draft: { ...emptyDraft(), providerId: `my-${preset.providerId}`, name: preset.name, api: preset.api, baseUrl: preset.baseUrl, ...(preset.compat ? { compat: preset.compat } : {}), models: preset.models.length ? preset.models : [{ id: "" }] }, ...(preset.oauth ? { oauthProviderId: preset.providerId } : {}) });
+  };
 
   const availableModels = useMemo(() => (settings?.models ?? []).filter((model) => model.available), [settings]);
+  useEffect(() => { if (oauth?.status === "success") onChanged(); }, [oauth?.status]);
 
   const testProvider = async (providerId: string) => {
     setTests((value) => ({ ...value, [providerId]: "running" }));
@@ -143,13 +192,22 @@ export function SettingsView({ onChanged, onToast }: { onChanged: () => void; on
               <div><h2>Provider</h2><p>可以添加任意 OpenAI、Anthropic 或 Gemini 兼容的服务，包括本机运行的模型。</p></div>
               <button className="button primary" onClick={() => setEditing({ mode: "create", draft: emptyDraft() })}><Plus size={15} />添加 provider</button>
             </div>
-
+            <div className="provider-catalog-bar"><label className="filter-select">Pi 与插件服务<select id="builtin-provider-select" defaultValue="" onChange={(event) => { const preset = settings.builtinProviders.find(item => item.providerId === event.target.value); if (preset) choosePreset(preset); event.target.value = ""; }}><option value="">选择内置或插件服务…</option>{settings.builtinProviders.map(preset => <option key={preset.providerId} value={preset.providerId}>{preset.name}{preset.source === "plugin" ? " · 插件" : ""}{preset.oauth ? " · OAuth" : ""}</option>)}</select></label></div>
             {settings.providers.length === 0 && !editing && (
               <div className="provider-empty">
                 <IconBeacon size={30} />
                 <h3>还没有接入模型</h3>
-                <p>选一个常用服务快速开始，或者手动填写地址。没有模型时，写作、保存和版本功能照常可用。</p>
-                <div className="preset-row">{PRESETS.map((preset) => <button key={preset.providerId} className="button ghost small" onClick={() => setEditing({ mode: "create", draft: { ...emptyDraft(), providerId: preset.providerId, name: preset.name, api: preset.api, baseUrl: preset.baseUrl, models: [{ id: "" }] } })}>{preset.label}</button>)}</div>
+                <p>从上方选择 Pi 或插件服务，也可以手动填写地址。没有模型时，写作、保存和版本功能照常可用。</p>
+              </div>
+            )}
+
+            {oauth && (
+              <div className="oauth-panel">
+                <div className="editor-panel-head"><div><h3>{oauth.providerId} · OAuth 登录</h3><p>授权完成后，Pi 会把凭据保存在本机应用数据目录。</p></div><button className="icon-button" aria-label="取消 OAuth" onClick={() => void cancelOAuth()}><X size={16} /></button></div>
+                {oauth.events.map((event, index) => <div className="oauth-event" key={`${event.type}:${index}`}>{event.message && <p>{event.message}</p>}{event.userCode && <p><strong>设备码：</strong><code>{event.userCode}</code></p>}{event.url && <div className="oauth-url"><input aria-label="授权地址" readOnly value={event.url} /><button className="button ghost small" onClick={() => { void navigator.clipboard.writeText(event.url!); onToast("授权地址已复制"); }}>复制地址</button></div>}</div>)}
+                {oauth.status === "pending" && <div className="oauth-code-row"><input aria-label="OAuth 授权码" value={oauthCode} onChange={event => setOauthCode(event.target.value)} placeholder="如果页面显示授权码，粘贴到这里" /><button className="button primary" disabled={!oauthCode.trim()} onClick={() => void submitCode()}>提交授权码</button></div>}
+                {oauth.status === "success" && <p className="inline-note success"><Check size={14} />登录成功，模型目录已更新。</p>}
+                {oauth.status === "error" && <p className="inline-note error"><CircleAlert size={14} />{oauth.error}</p>}
               </div>
             )}
 
@@ -159,8 +217,10 @@ export function SettingsView({ onChanged, onToast }: { onChanged: () => void; on
                 mode={editing.mode}
                 initial={editing.draft}
                 existingIds={settings.providers.map((provider) => provider.providerId)}
+                {...(editing.oauthProviderId ? { oauthProviderId: editing.oauthProviderId } : {})}
+                onOAuth={(providerId) => { setEditing(null); void startOAuth(providerId); }}
                 onCancel={() => setEditing(null)}
-                onSaved={(next, name) => { apply(next); setEditing(null); onChanged(); onToast(`已保存 ${name}`); }}
+                onSaved={(next, name) => { apply(next); setEditing(null); onChanged(); void loadUsage(true); onToast(`已保存 ${name}`); }}
               />
             )}
 
@@ -173,7 +233,7 @@ export function SettingsView({ onChanged, onToast }: { onChanged: () => void; on
                     <div className="provider-card-main">
                       <span className="provider-glyph"><IconBeacon size={18} /></span>
                       <div>
-                        <div className="provider-title"><strong>{provider.name}</strong><code>{provider.providerId}</code>{provider.hasApiKey ? <Badge tone="green"><KeyRound size={10} />已存密钥</Badge> : <Badge tone="amber">未设密钥</Badge>}</div>
+                        <div className="provider-title"><strong>{provider.name}</strong><code>{provider.providerId}</code>{provider.keySource === "environment" ? <Badge tone="green"><KeyRound size={10} />环境变量</Badge> : provider.hasApiKey ? <Badge tone="green"><KeyRound size={10} />已存密钥</Badge> : <Badge tone="amber">未设密钥</Badge>}</div>
                         <p>{apiLabel} · {provider.baseUrl}</p>
                         <div className="model-chips">{provider.models.map((model) => <span key={model.id}>{model.name || model.id}{model.reasoning && <i title="支持思考">✦</i>}</span>)}</div>
                       </div>
@@ -190,6 +250,11 @@ export function SettingsView({ onChanged, onToast }: { onChanged: () => void; on
                 );
               })}
             </div>
+          </section>
+
+          <section className="settings-section">
+            <div className="settings-section-head"><div><h2>订阅用量</h2><p>只读显示已接入服务的额度窗口和余额；查询失败不会影响模型路由。</p></div><button className="button ghost" disabled={usageLoading} onClick={() => void loadUsage(true)}><CloudDownload size={15} />{usageLoading ? "读取中…" : "刷新用量"}</button></div>
+            {usage.length === 0 ? <p className="quiet-empty">保存 provider 后，这里会显示支持查询的额度。</p> : <div className="usage-grid">{usage.map(report => <article className="usage-card" key={report.providerId}><div className="usage-card-head"><strong>{report.label}</strong><code>{report.providerId}</code></div>{report.state === "ok" ? <>{report.windows.map((item, index) => <div className="usage-window" key={`${item.kind}:${index}`}><div><span>{item.kind}</span><strong>剩余 {Math.max(0, 100 - item.percentUsed).toFixed(0)}%</strong></div><progress max={100} value={Math.max(0, 100 - item.percentUsed)} /></div>)}{report.balance && <p className="usage-balance">余额 <strong>{report.balance.value.toFixed(2)} {report.balance.currency}</strong></p>}{!report.windows.length && !report.balance && <p className="quiet-empty">当前没有可用额度窗口</p>}</> : <p className="usage-error">{report.state === "no-key" ? "未配置可用凭据" : report.state === "disabled" ? "该服务暂不支持额度读取" : report.error}</p>}</article>)}</div>}
           </section>
 
           <section className="settings-section">
@@ -237,7 +302,7 @@ export function SettingsView({ onChanged, onToast }: { onChanged: () => void; on
           <div className="aside-card">
             <KeyRound size={16} />
             <h4>密钥保存在哪里</h4>
-            <p>密钥只保存在本机数据目录，页面上不会回显。</p>
+            <p>手动填写的密钥只保存在本机数据目录；选择环境变量时只保存变量名，不把变量值写入设置文件或页面响应。</p>
             <code>{settings.dataDir}</code>
           </div>
           <div className="aside-card">
@@ -267,18 +332,19 @@ function withContext(model: ProviderModelInput, value: string): ProviderModelInp
   return value ? { ...rest, contextWindow: Number(value) } : rest;
 }
 
-function ProviderEditor({ mode, initial, existingIds, onCancel, onSaved }: { mode: "create" | "edit"; initial: Draft; existingIds: string[]; onCancel: () => void; onSaved: (settings: AgentSettingsView, name: string) => void }) {
+function ProviderEditor({ mode, initial, existingIds, oauthProviderId, onOAuth, onCancel, onSaved }: { mode: "create" | "edit"; initial: Draft; existingIds: string[]; oauthProviderId?: string; onOAuth: (providerId: string) => void; onCancel: () => void; onSaved: (settings: AgentSettingsView, name: string) => void }) {
   const [draft, setDraft] = useState<Draft>(initial);
   const [saving, setSaving] = useState(false);
   const [discovering, setDiscovering] = useState(false);
   const [discovered, setDiscovered] = useState<ProviderModelInput[] | null>(null);
   const [error, setError] = useState("");
   const apiOption = API_OPTIONS.find((option) => option.value === draft.api) ?? API_OPTIONS[0]!;
+  const isVolc = draft.providerId.includes("volcengine") || draft.baseUrl.includes("volces.com");
   const set = (patch: Partial<Draft>) => setDraft((value) => ({ ...value, ...patch }));
   const models = draft.models.filter((model) => model.id.trim());
   const idValid = /^[a-z0-9][a-z0-9-]{1,40}$/.test(draft.providerId);
   const idTaken = mode === "create" && existingIds.includes(draft.providerId);
-  const canSave = idValid && !idTaken && draft.name.trim() && /^https?:\/\//.test(draft.baseUrl.trim()) && models.length > 0 && !saving;
+  const canSave = idValid && !idTaken && draft.name.trim() && /^https?:\/\//.test(draft.baseUrl.trim()) && models.length > 0 && (draft.keySource === "manual" || /^[A-Z][A-Z0-9_]{1,80}$/.test(draft.apiKeyEnv)) && !saving;
 
   const discover = async () => {
     setDiscovering(true);
@@ -306,8 +372,13 @@ function ProviderEditor({ mode, initial, existingIds, onCancel, onSaved }: { mod
       name: draft.name.trim(),
       api: draft.api,
       baseUrl: draft.baseUrl.trim().replace(/\/+$/, ""),
+      ...(draft.compat ? { compat: draft.compat } : {}),
+      keySource: draft.keySource,
+      ...(draft.keySource === "environment" ? { apiKeyEnv: draft.apiKeyEnv } : {}),
+      ...(draft.quotaAccessKeyEnv ? { quotaAccessKeyEnv: draft.quotaAccessKeyEnv } : {}),
+      ...(draft.quotaSecretKeyEnv ? { quotaSecretKeyEnv: draft.quotaSecretKeyEnv } : {}),
       models: models.map((model) => ({ ...model, id: model.id.trim(), ...(model.name?.trim() ? { name: model.name.trim() } : {}) })),
-      ...(draft.apiKey ? { apiKey: draft.apiKey } : mode === "edit" && !draft.keepKey ? { apiKey: "" } : {}),
+      ...(draft.keySource === "manual" && (draft.apiKey ? { apiKey: draft.apiKey } : mode === "edit" && !draft.keepKey ? { apiKey: "" } : {})),
     };
     try {
       const next = mode === "create" ? await api.createProvider(draft.providerId, payload) : await api.updateProvider(draft.providerId, payload);
@@ -321,16 +392,26 @@ function ProviderEditor({ mode, initial, existingIds, onCancel, onSaved }: { mod
 
   return (
     <section className="provider-editor">
-      <header><h3>{mode === "create" ? "添加 provider" : `编辑 ${initial.name}`}</h3><button className="icon-button" onClick={onCancel} aria-label="关闭"><X size={16} /></button></header>
+      <header><h3>{mode === "create" ? "添加 provider" : `编辑 ${initial.name}`}</h3><div className="editor-header-actions">{oauthProviderId && <button className="button ghost small" onClick={() => onOAuth(oauthProviderId)}>使用 OAuth 登录</button>}<button className="icon-button" onClick={onCancel} aria-label="关闭"><X size={16} /></button></div></header>
       <div className="editor-grid">
         <label className="field-label">显示名称<input value={draft.name} onChange={(event) => set({ name: event.target.value, ...(mode === "create" && (!draft.providerId || draft.providerId === slug(draft.name)) ? { providerId: slug(event.target.value) } : {}) })} placeholder="例如：我的 DeepSeek" /></label>
         <label className="field-label">标识（ID）<input value={draft.providerId} disabled={mode === "edit"} onChange={(event) => set({ providerId: event.target.value.toLowerCase() })} placeholder="my-provider" />{draft.providerId && !idValid && <small className="field-error">只能用小写字母、数字和短横线，2–41 个字符</small>}{idTaken && <small className="field-error">这个标识已被使用</small>}</label>
         <label className="field-label span-2">接口类型<select value={draft.api} onChange={(event) => set({ api: event.target.value as ProviderApi })}>{API_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select><small>{apiOption.hint}</small></label>
         <label className="field-label span-2">服务地址（Base URL）<input value={draft.baseUrl} onChange={(event) => set({ baseUrl: event.target.value })} placeholder={apiOption.placeholder} spellCheck={false} /></label>
-        <label className="field-label span-2">API Key
-          <input type="password" autoComplete="off" value={draft.apiKey} onChange={(event) => set({ apiKey: event.target.value })} placeholder={draft.keepKey ? "已保存密钥；留空则保持不变" : "本机模型可以留空"} spellCheck={false} />
-          {mode === "edit" && initial.keepKey && <span className="checkbox-line"><input type="checkbox" checked={!draft.keepKey && !draft.apiKey} onChange={(event) => set({ keepKey: !event.target.checked, apiKey: "" })} />清除已保存的密钥</span>}
-        </label>
+        <label className="field-label span-2">密钥来源<select value={draft.keySource} onChange={(event) => set({ keySource: event.target.value as Draft["keySource"] })}><option value="manual">手动填写 API Key</option><option value="environment">读取环境变量</option></select></label>
+        {draft.keySource === "environment" ? (
+          <label className="field-label span-2">环境变量名<input id="api-key-env" value={draft.apiKeyEnv} onChange={(event) => set({ apiKeyEnv: event.target.value.toUpperCase().replace(/[^A-Z0-9_]/g, "") })} placeholder="例如 DEEPSEEK_API_KEY" spellCheck={false} /><small>应用只保存变量名；启动 Nova 前，请先在系统或终端中设置该变量。</small></label>
+        ) : (
+          <label className="field-label span-2">API Key
+            <input type="password" autoComplete="off" value={draft.apiKey} onChange={(event) => set({ apiKey: event.target.value })} placeholder={draft.keepKey ? "已保存密钥；留空则保持不变" : "本机模型可以留空"} spellCheck={false} />
+            {mode === "edit" && initial.keepKey && <span className="checkbox-line"><input type="checkbox" checked={!draft.keepKey && !draft.apiKey} onChange={(event) => set({ keepKey: !event.target.checked, apiKey: "" })} />清除已保存的密钥</span>}
+          </label>
+        )}
+        {isVolc && <>
+          <label className="field-label">额度 IAM Access Key 环境变量<input value={draft.quotaAccessKeyEnv} onChange={(event) => set({ quotaAccessKeyEnv: event.target.value.toUpperCase().replace(/[^A-Z0-9_]/g, "") })} placeholder="VOLC_ACCESSKEY" spellCheck={false} /></label>
+          <label className="field-label">额度 IAM Secret Key 环境变量<input value={draft.quotaSecretKeyEnv} onChange={(event) => set({ quotaSecretKeyEnv: event.target.value.toUpperCase().replace(/[^A-Z0-9_]/g, "") })} placeholder="VOLC_SECRETKEY" spellCheck={false} /></label>
+          <p className="field-hint span-2">推理 API Key 与额度 IAM AK/SK 是两套凭据；OAuth 登录的套餐无需填写这两项。</p>
+        </>}
       </div>
 
       <div className="models-editor">
