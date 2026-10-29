@@ -8,6 +8,7 @@ export interface ProviderMetadataExtension {
   oauth: boolean;
   source: "plugin";
   envRefs: string[];
+  apiKeyEnv?: string;
   models: ProviderModelInput[];
 }
 
@@ -74,13 +75,13 @@ const OPENDESIGN_MODELS: ProviderModelInput[] = [
 const OPENDESIGN_PLAN_IDS = ["gpt-6-luna", "claude-haiku-5.5", "deepseek-v4.1-flash", "deepseek-v4-pro", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp", "glm-5.3-flashx", "glm-5.3-flash", "kimi-k2.7-code", "mimo-v2.6-pro", "mimo-v2.6-flash", "hy4-preview", "minimax-m3.1-flash"];
 
 export const PROVIDER_METADATA_EXTENSIONS: ProviderMetadataExtension[] = [
-  { providerId: "openai-codex", name: "OpenAI Codex / Command Code", api: "openai-codex-responses", baseUrl: "https://chatgpt.com/backend-api", oauth: true, source: "plugin", envRefs: ["OPENAI_API_KEY", "CODEX_API_KEY"], models: CODEX_MODELS },
+  { providerId: "openai-codex", name: "OpenAI Codex / Command Code", api: "openai-codex-responses", baseUrl: "https://chatgpt.com/backend-api", oauth: true, source: "plugin", envRefs: [], models: CODEX_MODELS },
   { providerId: "opendesign-plan", name: "OpenDesign CoRouter · 套餐赠送", api: "openai-completions", baseUrl: "https://amr-api.open-design.ai/api/v1", oauth: false, source: "plugin", envRefs: ["OPEN_DESIGN_COOKIE", "OPEN_DESIGN_SESSION"], models: OPENDESIGN_MODELS.filter(model => OPENDESIGN_PLAN_IDS.includes(model.id)) },
   { providerId: "opendesign-paid", name: "OpenDesign CoRouter · 付费", api: "openai-completions", baseUrl: "https://amr-api.open-design.ai/api/v1", oauth: false, source: "plugin", envRefs: ["OPEN_DESIGN_COOKIE", "OPEN_DESIGN_SESSION"], models: OPENDESIGN_MODELS.filter(model => !OPENDESIGN_PLAN_IDS.includes(model.id)) },
 ];
 
 export function extraProviderPresets(): ProviderMetadataExtension[] {
-  return PROVIDER_METADATA_EXTENSIONS.map(provider => ({ ...provider, models: provider.models.map(model => ({ ...model, ...(model.input ? { input: [...model.input] } : {}) })) }));
+  return PROVIDER_METADATA_EXTENSIONS.map(provider => ({ ...provider, ...providerEnvironmentMetadata(provider.providerId), models: provider.models.map(model => ({ ...model, ...(model.input ? { input: [...model.input] } : {}) })) }));
 }
 
 export const PROVIDER_ENV_HINTS: Record<string, string[]> = {
@@ -89,9 +90,32 @@ export const PROVIDER_ENV_HINTS: Record<string, string[]> = {
   openai: ["OPENAI_API_KEY"],
   deepseek: ["DEEPSEEK_API_KEY"],
   openrouter: ["OPENROUTER_API_KEY"],
-  "kimi-coding": ["KIMI_CODING_API_KEY"],
+  "kimi-coding": ["KIMI_API_KEY", "KIMI_CODING_API_KEY"],
+  google: ["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+  "github-copilot": ["COPILOT_GITHUB_TOKEN"],
+  huggingface: ["HF_TOKEN"],
+  moonshotai: ["MOONSHOT_API_KEY"],
+  "moonshotai-cn": ["MOONSHOT_API_KEY"],
+  "vercel-ai-gateway": ["AI_GATEWAY_API_KEY"],
+  opencode: ["OPENCODE_API_KEY"],
+  "opencode-go": ["OPENCODE_GO_API_KEY"],
+  "qwen-token-plan-individual": ["QWEN_TOKEN_PLAN_API_KEY"],
   minimax: ["MINIMAX_API_KEY"],
   "minimax-cn": ["MINIMAX_CN_API_KEY"],
   "zai-coding": ["ZAI_CODING_API_KEY"],
   "zai-coding-cn": ["ZAI_CODING_CN_API_KEY"],
+  "amazon-bedrock": ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_PROFILE", "AWS_REGION"],
+  azure: ["AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT"],
+  "google-vertex": ["GOOGLE_CLOUD_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_LOCATION"],
+  "cloudflare-ai-gateway": ["CLOUDFLARE_API_KEY", "CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_GATEWAY_ID"],
+  "cloudflare-workers-ai": ["CLOUDFLARE_API_KEY", "CLOUDFLARE_ACCOUNT_ID"],
+  "volcengine-agent-plan": ["VOLC_ACCESSKEY", "VOLC_SECRETKEY"],
+  "volcengine-coding-plan": ["VOLC_ACCESSKEY", "VOLC_SECRETKEY"],
 };
+
+const NON_SINGLE_KEY_PROVIDERS = new Set(["openai-codex", "opendesign-plan", "opendesign-paid", "amazon-bedrock", "azure", "google-vertex", "cloudflare-ai-gateway", "cloudflare-workers-ai", "volcengine-agent-plan", "volcengine-coding-plan"]);
+
+export function providerEnvironmentMetadata(providerId: string, supportsApiKey = true): { envRefs: string[]; apiKeyEnv?: string } {
+  const envRefs = [...(PROVIDER_ENV_HINTS[providerId] ?? (supportsApiKey ? [`${providerId.toUpperCase().replace(/[^A-Z0-9]+/g, "_")}_API_KEY`] : []))];
+  return { envRefs, ...(supportsApiKey && !NON_SINGLE_KEY_PROVIDERS.has(providerId) && envRefs[0] ? { apiKeyEnv: envRefs[0] } : {}) };
+}

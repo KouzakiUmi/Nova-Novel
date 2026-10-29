@@ -1,4 +1,5 @@
 import type { ProviderConfigView, UsageReportView, UsageWindowView } from "@nova-novel/shared";
+import { createHash } from "node:crypto";
 import type { AgentSettings } from "./settings.js";
 import { secretOf } from "./settings.js";
 import { fetchVolcUsage } from "./volcengine/quota.js";
@@ -8,6 +9,10 @@ type UsageKind = "deepseek" | "openrouter" | "minimax" | "minimax-cn" | "zai" | 
 type UsageProvider = ProviderConfigView & { apiKey: string };
 
 function classify(provider: ProviderConfigView): UsageKind | undefined {
+  if (provider.authProviderId) {
+    const { authProviderId: _authProviderId, ...rest } = provider;
+    return classify({ ...rest, providerId: provider.authProviderId });
+  }
   if (provider.providerId === "openai-codex") return "codex";
   if (provider.providerId === "opencode-go" || provider.providerId.includes("litellm")) return provider.providerId === "opencode-go" ? "opencode-go" : "litellm";
   if (provider.providerId.startsWith("opendesign-")) return "opendesign";
@@ -41,42 +46,34 @@ function window(kind: string, percentUsed: number, resetAt?: string, detail?: Pi
 function number(value: unknown): number | undefined { return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : typeof value === "string" && /^\d+(?:\.\d+)?$/.test(value) ? Number(value) : undefined; }
 
 export class AgentUsageService {
-  private cache = new Map<string, { at: number; report: UsageReportView }>();
+  private cache = new Map<string, { at: number; fingerprint: string; report: UsageReportView }>();
   private volcBackend?: { hasBinding(providerId: string): boolean; usageFor(providerId: string): Promise<UsageWindowView[] | undefined> };
   constructor(private settings: AgentSettings, private fetcher: typeof fetch = fetch) {}
   setVolcBackend(backend: { hasBinding(providerId: string): boolean; usageFor(providerId: string): Promise<UsageWindowView[] | undefined> }): void { this.volcBackend = backend; }
   async list(force = false): Promise<UsageReportView[]> {
-    const view = this.settings.view();
-    const providers: UsageProvider[] = this.settings.dataProviders();
-    const configured = new Set(providers.map(provider => provider.providerId));
-    const reports = await Promise.all(providers.map(provider => this.report(provider, force)));
-    const available = this.settings.runtime.getAvailableSnapshot();
-    for (const model of available) {
-      if (configured.has(model.provider) || !classify({ providerId: model.provider, name: model.provider, api: model.api as ProviderConfigView["api"], baseUrl: model.baseUrl, hasApiKey: true, models: [], createdAt: "", updatedAt: "" })) continue;
-      configured.add(model.provider);
-      const preset = view.builtinProviders.find(provider => provider.providerId === model.provider);
-      if (!preset) continue;
-      reports.push(await this.report({ ...preset, hasApiKey: true, apiKey: "", models: preset.models, createdAt: "", updatedAt: "" }, force));
-    }
-    return reports;
+    const providers: UsageProvider[] = this.settings.dataProviders().filter(provider => !provider.disabled);
+    const enabledIds = new Set(providers.map(provider => provider.providerId));
+    for (const id of this.cache.keys()) if (!enabledIds.has(id)) this.cache.delete(id);
+    return Promise.all(providers.map(provider => this.report(provider, force)));
   }
   private async report(provider: UsageProvider, force: boolean): Promise<UsageReportView> {
     const kind = classify(provider);
     const base: UsageReportView = { providerId: provider.providerId, label: provider.name, state: kind ? "no-key" : "disabled", windows: [], coverage: "complete" };
     if (!kind) return base;
+    const key = provider.authProviderId ? (await this.settings.runtime.getAuth(provider.authProviderId))?.auth.apiKey ?? "" : secretOf(provider);
+    const quotaKeys = kind === "volc-agent" || kind === "volc-coding" ? [process.env[provider.quotaAccessKeyEnv ?? "VOLC_ACCESSKEY"], process.env[provider.quotaSecretKeyEnv ?? "VOLC_SECRETKEY"]] : [];
+    const fingerprint = createHash("sha256").update(JSON.stringify([provider, key, ...quotaKeys])).digest("hex");
     const cached = this.cache.get(provider.providerId);
-    if (!force && cached && Date.now() - cached.at < 60_000) return cached.report;
+    if (!force && cached && cached.fingerprint === fingerprint && Date.now() - cached.at < 60_000) return cached.report;
     try {
-      const custom = this.settings.dataProviders().some(item => item.providerId === provider.providerId);
-      const key = custom ? secretOf(provider) : (await this.settings.runtime.getAuth(provider.providerId))?.auth.apiKey ?? "";
-      if (!key) { const report = { ...base, state: "no-key" as const, error: "未配置可用凭据" }; this.cache.set(provider.providerId, { at: Date.now(), report }); return report; }
+      if (!key) { const report = { ...base, state: "no-key" as const, error: "未配置可用凭据" }; this.cache.set(provider.providerId, { at: Date.now(), fingerprint, report }); return report; }
       const result = await this.read(kind, key, provider);
       const report: UsageReportView = { ...base, state: "ok", windows: result.windows, coverage: result.coverage ?? "complete", ...(result.balance ? { balance: result.balance } : {}) };
-      this.cache.set(provider.providerId, { at: Date.now(), report });
+      this.cache.set(provider.providerId, { at: Date.now(), fingerprint, report });
       return report;
     } catch (error) {
-      const report: UsageReportView = { ...base, state: "error", coverage: "partial", error: error instanceof Error ? error.message : "额度读取失败" };
-      this.cache.set(provider.providerId, { at: Date.now(), report });
+      const report: UsageReportView = { ...base, state: "error", coverage: "partial", error: error instanceof Error ? this.settings.redact(error.message) : "额度读取失败" };
+      this.cache.set(provider.providerId, { at: Date.now(), fingerprint, report });
       return report;
     }
   }

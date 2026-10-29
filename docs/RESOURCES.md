@@ -209,7 +209,22 @@
 
 ---
 
-## 6. 实施前必须确认的事项
+## 6. 字体与模型写作参考
+
+### 6.1 内置开源字体
+
+- Inter：官方仓库 <https://github.com/rsms/inter>；许可证为 SIL Open Font License 1.1，全文随包保存于 `packages/web/public/fonts/INTER-LICENSE.txt`。用于英文、数字和界面辅助文字。
+- Noto Sans CJK / Noto Serif CJK：官方仓库 <https://github.com/notofonts/noto-cjk>；许可证为 SIL Open Font License 1.1，分别保存于 `NOTO-SANS-LICENSE.txt` 与 `NOTO-SERIF-LICENSE.txt`。本机可变字体用于 UI 与正文。
+- LXGW 文楷：官方仓库 <https://github.com/lxgw/LxgwWenKai>；许可证为 SIL Open Font License 1.1，保存于 `LXGW-LICENSE.txt`。作为正文阅读字体选项。字体文件均随应用分发，不引用运行时 CDN，保留 Reserved Font Name 条款与许可文本。
+
+### 6.2 模型写作初筛参考
+
+- 2026-10-29 检索了 [Claude 写作模型比较](<https://www.inkfluenceai.com/blog/best-claude-model-for-writing-2026#1>)、[创意写作榜单汇总](<https://www.benchleader.com/benchmarks/lmarena_text_creative>)、[中文短篇科幻生成评估](<https://openurl.ebsco.com/EPDB%3Agcd%3A3%3A40695507/detailv2?sid=ebsco%3Aplink%3Aresult-item&id=ebsco%3Adoi%3A10.1093%2Fllc%2Ffqag078&bquery=AU%20Chen%2C%20Xing&page=1&link_origin=none&searchDescription=Chen%2C%20Xing&crl=f)和[中文剧本实测](<https://m.thepaper.cn/newsDetail_forward_34318871>)。
+- 采用方式：模型旁只显示“写作推荐 / 暂不优先”的初筛建议，并明确最终由作者的短场景试写决定。4.6、Gemini、DeepSeek 等作为优先试写方向；5.5 暂不优先，不把版本号当作质量排名。上述来源用于提供比较视角，不视为官方写作承诺，也不替代中文语料和兼容性测试。
+
+---
+
+## 7. 实施前必须确认的事项
 
 1. Pi 1.4.0 的实际进程/RPC 回归；版本升级重新验证命令、事件与扩展 UI，Pi Desktop 的 alpha 状态不代表本平台已经具有相同运行能力。
 2. novelWriter 与 Manuskript 的官方 LICENSE 与文档 / 模板授权头（<https://github.com/olivierkes/manuskript>）。
@@ -221,11 +236,11 @@
 
 ---
 
-## 7. 与其他文档的对应
+## 8. 与其他文档的对应
 
 [DESIGN.md](<../DESIGN.md>) 提供产品定位、功能全景与版本模型；[CANVAS-WORKFLOW.md](<CANVAS-WORKFLOW.md>) 取用 2.5 泳道模型、2.7 编排范式、3.1 画布底座、5.1 协议承载与 n8n 许可边界；[ELEMENTS-RAG.md](<ELEMENTS-RAG.md>) 取用 2.1 注入三态与设定演进、2.2 字段依赖、2.4 引用词表、3.5 与 3.6 检索候选；[ARCHITECTURE.md](<ARCHITECTURE.md>) 取用 1.1 与 1.2 的 Pi 接入形态、3.1–3.6 组件、3.6 备份路径、5.1–5.5 适配器与第 6 章清单。
 
-## 8. 核验范围
+## 9. 核验范围
 
 调研日期为 2026-10-27。产品能力依据公开官网与帮助文档，组件许可依据官方仓库声明；未实机评测竞品。Pi 安装元数据与 1.4.0 随包的命令、事件、扩展 UI、CLI 资源选项已核对，未运行模型调用。
 

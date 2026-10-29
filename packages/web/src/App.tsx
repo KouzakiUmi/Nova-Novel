@@ -9,6 +9,7 @@ import type {
   WorkspaceSnapshot,
 } from "@nova-novel/shared";
 import { api } from "./lib/api";
+import { applyAppearance, readAppearance } from "./lib/appearance";
 import { AppShell, type SaveStatus, type ViewId } from "./components/AppShell";
 import { EditorView } from "./components/EditorView";
 import { StartView } from "./components/StartView";
@@ -78,6 +79,10 @@ export function App() {
       setError(cause instanceof Error ? cause.message : "无法连接本机项目服务");
       return null;
     }
+  }, []);
+
+  useEffect(() => {
+    void api.appearance().then(applyAppearance).catch(() => applyAppearance(readAppearance()));
   }, []);
 
   useEffect(() => {

@@ -414,6 +414,8 @@ export interface ProviderConfigView {
   hasApiKey: boolean;
   keySource?: "manual" | "environment";
   apiKeyEnv?: string;
+  disabled?: boolean;
+  authProviderId?: string;
   quotaAccessKeyEnv?: string;
   quotaSecretKeyEnv?: string;
   models: ProviderModelInput[];
@@ -428,6 +430,8 @@ export interface ProviderUpsert {
   compat?: ProviderCompat;
   keySource?: "manual" | "environment";
   apiKeyEnv?: string;
+  disabled?: boolean;
+  authProviderId?: string;
   quotaAccessKeyEnv?: string;
   quotaSecretKeyEnv?: string;
   /** 省略：保留已存密钥；空字符串：清除密钥。 */
@@ -462,6 +466,7 @@ export interface AgentSettingsView {
   models: ModelOption[];
   routes: TaskRoute[];
   builtinProviders: BuiltinProviderPreset[];
+  detectedProviders: DetectedProviderCandidate[];
   engine: { name: string; version: string; mode: "embedded" };
   dataDir: string;
 }
@@ -474,7 +479,15 @@ export interface BuiltinProviderPreset {
   compat?: ProviderCompat;
   models: ProviderModelInput[];
   oauth: boolean;
+  envRefs: string[];
+  apiKeyEnv?: string;
   source?: "pi" | "plugin";
+}
+
+export interface DetectedProviderCandidate {
+  preset: BuiltinProviderPreset;
+  apiKeyEnv: string;
+  hasApiKey: boolean;
 }
 
 export interface OAuthEventView { type: string; message?: string; url?: string; userCode?: string }

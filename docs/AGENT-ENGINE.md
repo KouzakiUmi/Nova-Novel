@@ -11,6 +11,10 @@
 
 ## 2. 目录与环境变量
 
+Pi 目录给出 provider/model 元数据，Nova 另为每个可单 API Key 使用的预设提供 `envRefs` 和可选默认 `apiKeyEnv`。OpenCode Zen 使用 `OPENCODE_API_KEY`，OpenCode Go 使用 `OPENCODE_GO_API_KEY`，MiniMax CN 使用 `MINIMAX_CN_API_KEY`；其他服务使用各自标准变量名，未知 ID 回退为大写下划线加 `_API_KEY`。OAuth-only、Cookie/Session 或需要多项凭据的服务不硬套单 Key 候选。
+
+`view.detectedProviders` 只返回 `{ preset, apiKeyEnv, hasApiKey }`，不返回变量值。检测按 provider 身份、URL 和已引用变量名排除重复项，候选必须由作者显式启用后才进入配置、模型路由和用量。
+
 | 变量 | 默认值 | 用途 |
 | --- | --- | --- |
 | `NOVA_NOVEL_DATA_DIR` | `<仓库>/data` | 应用数据根目录；打包后指向 `%APPDATA%\Nova Novel` |
@@ -37,11 +41,11 @@
 - `providerId`：`^[a-z0-9][a-z0-9-]{1,40}$`，不能与 Pi 内置 provider 同名，避免悄悄覆盖内置配置。
 - `api`：`openai-completions`、`openai-responses`、`anthropic-messages`、`google-generative-ai`、`openai-codex-responses`、`mistral-conversations`、`bedrock-converse-stream`、`google-vertex`、`azure-openai-responses`、`pi-messages`。Pi provider 缺少顶层 `baseUrl` 时，从模型目录回退；Azure 使用带 `{resource}` 的可编辑占位地址。
 - `baseUrl` 必须是 http(s) URL。`models` 至少一项；`contextWindow` 默认 128000，`maxTokens` 默认 8192，`reasoning` 默认 false。
-- `keySource` 支持 `manual` 与 `environment`；环境变量名只接受大写字母、数字和下划线，值在使用时解析，不复制进设置文件。
+- `keySource` 支持 `manual` 与 `environment`；环境变量名只接受大写字母、数字和下划线，值在使用时解析，不复制进设置文件。`disabled` 可持久化，禁用项保留在 providers 供恢复，但不进入 `models.json`、公开模型、任务路由或用量。
 - 设置页通过 `builtinProviders()` 展示 Pi 自带 provider/model 目录。`agent/provider-metadata.ts` 独立保存 Pi 没有的插件元数据，目前合并 Command Code 模型扩展以及 OpenDesign CoRouter 的 plan/paid 模型目录、模态、容量和思考档位；这些分组是插件视图，不是上游计费承诺。
 - 支持 OAuth 的内置 provider 直接调用 `ModelRuntime.login`；授权链接、设备码、手动授权码、取消和完成状态经本机接口交互，凭据由 Pi 写入 `auth.json`，不进入页面响应或日志。
 - 修改后重新生成 `models.json` 并重建 `ModelRuntime`；正在运行的任务继续使用旧实例。
-- 模型列表 `models` 包含：所有自定义模型，加上已有可用凭据的内置模型（例如通过环境变量提供 Key），后者标记 `source: "builtin"`。不列出没有凭据的内置模型。自定义模型可选 `thinkingLevelMap` 显式映射思考档位，`null` 表示不支持。
+- 模型列表 `models` 只包含未禁用的显式配置；环境候选不会隐式变成可用模型。自定义模型可选 `thinkingLevelMap` 显式映射思考档位，`null` 表示不支持。内置目录的 `maxTokens` 按 `contextWindow` 归一化，避免上游输出上限大于上下文而阻止启用。OAuth 成功后创建 `my-*` 配置并写入 `authProviderId`，该自定义 ID 不进入 `models.json`，运行时沿用内置 OAuth 身份与模型；禁用配置会同时关闭其用量。
 - “测试连接”：用该 provider 的指定模型（或第一个模型）发一条不含作品内容的极短请求，15 秒超时，返回耗时和截短的回复。失败时返回脱敏后的错误。
 - “读取模型列表”：仅限 OpenAI 兼容类型，`GET {baseUrl}/models`，返回模型 ID 供用户勾选，不自动保存。
 
@@ -75,7 +79,7 @@
 
 ### 只读订阅用量
 
-`AgentUsageService` 使用 Nova 自己保存的 provider 配置、Pi OAuth 凭据或火山方舟套餐身份读取 DeepSeek、OpenRouter、MiniMax、Z.ai、Kimi、OpenDesign、Codex、火山方舟 Agent/Coding Plan、OpenCode Go、SiliconFlow、Synthetic、NanoGPT、Novita、Hyperbolic、DeepInfra、Chutes、Ollama Cloud、Vercel AI Gateway、ZenMux 与 LiteLLM 的额度窗口/余额。仅返回脱敏的 `UsageReportView`，60 秒缓存，手动刷新可跳过缓存；没有凭据、接口不支持或读取失败只影响额度卡片，不改变模型路由。它不读取 DSH、Codex CLI、OpenDesign 桌面端或其他应用的凭据文件。
+`AgentUsageService` 只从未禁用的显式 provider 配置及其实际凭据读取 DeepSeek、OpenRouter、MiniMax、Z.ai、Kimi、OpenDesign、Codex、火山方舟 Agent/Coding Plan、OpenCode Go、SiliconFlow、Synthetic、NanoGPT、Novita、Hyperbolic、DeepInfra、Chutes、Ollama Cloud、Vercel AI Gateway、ZenMux 与 LiteLLM 的额度窗口/余额。不会从运行时环境额外补内置卡片，也不会借内置身份给无 Key 配置补额度；OAuth 配置通过 `authProviderId` 使用对应内置身份。仅返回脱敏的 `UsageReportView`，60 秒缓存，配置或实际凭据指纹变化即失效；禁用后立即从列表移除。没有凭据、接口不支持或读取失败只影响额度卡片，不改变模型路由。它不读取 DSH、Codex CLI、OpenDesign 桌面端或其他应用的凭据文件。
 
 ## 4. 任务路由
 

@@ -1,7 +1,9 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { AgentSettingsView, ModelOption, ProviderApi, ProviderConfigView, ProviderModelInput, ProviderTestResult, TaskKind, TaskRoute, ThinkingLevel, BuiltinProviderPreset, OAuthStatusView, UsageReportView, ProviderCompat } from "@nova-novel/shared";
 import { TASK_KINDS } from "@nova-novel/shared";
-import { Check, CircleAlert, CloudDownload, KeyRound, LoaderCircle, Pencil, Plus, Save, ShieldCheck, Trash2, X, Zap } from "lucide-react";
+import { Check, CircleAlert, CloudDownload, KeyRound, LoaderCircle, Pencil, Plus, Save, ShieldCheck, Trash2, Type, X, Zap } from "lucide-react";
+import { AppearanceView } from "./AppearanceView";
+import { writingRecommendation } from "../lib/writing-models";
 import { api } from "../lib/api";
 import { Badge } from "./UI";
 import { IconBeacon, IconCore, IconFacet, IconLens, IconQuill, IconSpark, type IconProps } from "./icons";
@@ -66,11 +68,16 @@ export function SettingsView({ onChanged, onToast }: { onChanged: () => void; on
   const [oauthCode, setOauthCode] = useState("");
   const [usage, setUsage] = useState<UsageReportView[]>([]);
   const [usageLoading, setUsageLoading] = useState(false);
+  const usageSeq = useRef(0);
+  const onChangedRef = useRef(onChanged);
+  onChangedRef.current = onChanged;
+  const [section, setSection] = useState<"models" | "appearance">("models");
 
   const apply = useCallback((next: AgentSettingsView) => {
     setSettings(next);
     setRoutes(next.routes);
     setRoutesDirty(false);
+    setUsage(current => current.filter(report => next.providers.some(provider => provider.providerId === report.providerId && !provider.disabled)));
   }, []);
 
   const load = useCallback(async () => {
@@ -84,10 +91,11 @@ export function SettingsView({ onChanged, onToast }: { onChanged: () => void; on
 
   useEffect(() => { void load(); }, [load]);
   const loadUsage = useCallback(async (refresh = false) => {
+    const seq = ++usageSeq.current;
     setUsageLoading(true);
-    try { setUsage((await api.usageReports(refresh)).reports); }
-    catch (cause) { onToast(cause instanceof Error ? cause.message : "额度读取失败"); }
-    finally { setUsageLoading(false); }
+    try { const result = await api.usageReports(refresh); if (seq === usageSeq.current) setUsage(result.reports); }
+    catch (cause) { if (seq === usageSeq.current) onToast(cause instanceof Error ? cause.message : "额度读取失败"); }
+    finally { if (seq === usageSeq.current) setUsageLoading(false); }
   }, [onToast]);
   useEffect(() => { void loadUsage(); }, [loadUsage]);
   useEffect(() => {
@@ -121,11 +129,27 @@ export function SettingsView({ onChanged, onToast }: { onChanged: () => void; on
     setOauth(null);
   };
   const choosePreset = (preset: BuiltinProviderPreset) => {
-    setEditing({ mode: "create", draft: { ...emptyDraft(), providerId: `my-${preset.providerId}`, name: preset.name, api: preset.api, baseUrl: preset.baseUrl, ...(preset.compat ? { compat: preset.compat } : {}), models: preset.models.length ? preset.models : [{ id: "" }] }, ...(preset.oauth ? { oauthProviderId: preset.providerId } : {}) });
+    setEditing({ mode: "create", draft: { ...emptyDraft(), providerId: `my-${preset.providerId}`, name: preset.name, api: preset.api, baseUrl: preset.baseUrl, apiKeyEnv: preset.apiKeyEnv ?? preset.envRefs[0] ?? "", ...(preset.compat ? { compat: preset.compat } : {}), models: preset.models.length ? preset.models : [{ id: "" }] }, ...(preset.oauth ? { oauthProviderId: preset.providerId } : {}) });
   };
 
   const availableModels = useMemo(() => (settings?.models ?? []).filter((model) => model.available), [settings]);
-  useEffect(() => { if (oauth?.status === "success") onChanged(); }, [oauth?.status]);
+  useEffect(() => { if (oauth?.status === "success") { void load(); void loadUsage(true); onChangedRef.current(); } }, [oauth?.status, load, loadUsage]);
+
+  const toggleProvider = async (provider: ProviderConfigView) => {
+    try {
+      apply(await api.updateProvider(provider.providerId, { disabled: !provider.disabled }));
+      onChanged(); void loadUsage(true);
+      onToast(provider.disabled ? `已启用 ${provider.name}` : `已禁用 ${provider.name}，用量与路由不再使用它`);
+    } catch (cause) { onToast(cause instanceof Error ? cause.message : "状态更新失败"); }
+  };
+
+  const enableDetected = async (candidate: AgentSettingsView["detectedProviders"][number]) => {
+    const preset = candidate.preset;
+    try {
+      apply(await api.createProvider(`my-${preset.providerId}`, { name: preset.name, api: preset.api, baseUrl: preset.baseUrl, keySource: "environment", apiKeyEnv: candidate.apiKeyEnv, models: preset.models }));
+      onChanged(); void loadUsage(true); onToast(`已启用 ${preset.name}`);
+    } catch (cause) { onToast(cause instanceof Error ? cause.message : "启用失败"); }
+  };
 
   const testProvider = async (providerId: string) => {
     setTests((value) => ({ ...value, [providerId]: "running" }));
@@ -141,7 +165,7 @@ export function SettingsView({ onChanged, onToast }: { onChanged: () => void; on
     if (!window.confirm(`删除“${provider.name}”？使用它的任务会改回默认模型。作品内容不受影响。`)) return;
     try {
       apply(await api.deleteProvider(provider.providerId));
-      onChanged();
+      onChanged(); void loadUsage(true);
       onToast(`已删除 ${provider.name}`);
     } catch (cause) {
       onToast(cause instanceof Error ? cause.message : "删除未完成");
@@ -178,8 +202,11 @@ export function SettingsView({ onChanged, onToast }: { onChanged: () => void; on
     );
   }
 
+  const sectionTabs = <nav className="settings-section-tabs" aria-label="设置分类"><button className={section === "models" ? "active" : ""} onClick={() => setSection("models")}><IconCore size={16} />模型与服务</button><button className={section === "appearance" ? "active" : ""} onClick={() => setSection("appearance")}><Type size={16} />界面与字体</button></nav>;
+  if (section === "appearance") return <>{sectionTabs}<AppearanceView /></>;
+
   return (
-    <div className="settings-page page-scroll">
+    <>{sectionTabs}<div className="settings-page page-scroll">
       <header className="page-toolbar">
         <div><p className="eyebrow">MODELS & SERVICES</p><h1>模型与服务</h1><p>接入你自己的模型服务，再为每类写作任务挑选合适的模型。作品始终保存在本机。</p></div>
         <div className="engine-chip"><IconCore size={20} /><div><strong>内置 Agent 引擎</strong><small>{settings.engine.name} {settings.engine.version} · 进程内运行，无需另装命令行</small></div></div>
@@ -192,7 +219,6 @@ export function SettingsView({ onChanged, onToast }: { onChanged: () => void; on
               <div><h2>Provider</h2><p>可以添加任意 OpenAI、Anthropic 或 Gemini 兼容的服务，包括本机运行的模型。</p></div>
               <button className="button primary" onClick={() => setEditing({ mode: "create", draft: emptyDraft() })}><Plus size={15} />添加 provider</button>
             </div>
-            <div className="provider-catalog-bar"><label className="filter-select">Pi 与插件服务<select id="builtin-provider-select" defaultValue="" onChange={(event) => { const preset = settings.builtinProviders.find(item => item.providerId === event.target.value); if (preset) choosePreset(preset); event.target.value = ""; }}><option value="">选择内置或插件服务…</option>{settings.builtinProviders.map(preset => <option key={preset.providerId} value={preset.providerId}>{preset.name}{preset.source === "plugin" ? " · 插件" : ""}{preset.oauth ? " · OAuth" : ""}</option>)}</select></label></div>
             {settings.providers.length === 0 && !editing && (
               <div className="provider-empty">
                 <IconBeacon size={30} />
@@ -200,6 +226,8 @@ export function SettingsView({ onChanged, onToast }: { onChanged: () => void; on
                 <p>从上方选择 Pi 或插件服务，也可以手动填写地址。没有模型时，写作、保存和版本功能照常可用。</p>
               </div>
             )}
+
+            {settings.detectedProviders.length > 0 && <section className="detected-providers"><div className="detected-providers-heading"><h3>检测到本机环境变量</h3><p>仅显示变量名，不读取或展示变量值。启用后才会用于模型和订阅用量。</p></div>{settings.detectedProviders.map(candidate => <article key={`${candidate.preset.providerId}:${candidate.apiKeyEnv}`} className="detected-provider-card"><div><strong>{candidate.preset.name}</strong><code>{candidate.apiKeyEnv}</code><p>{candidate.preset.models.length} 个可用模型 · 环境变量已检测到</p></div><button className="button secondary small" onClick={() => void enableDetected(candidate)}><Plus size={13} />启用</button></article>)}</section>}
 
             {oauth && (
               <div className="oauth-panel">
@@ -217,6 +245,8 @@ export function SettingsView({ onChanged, onToast }: { onChanged: () => void; on
                 mode={editing.mode}
                 initial={editing.draft}
                 existingIds={settings.providers.map((provider) => provider.providerId)}
+                builtinProviders={settings.builtinProviders}
+                onPreset={choosePreset}
                 {...(editing.oauthProviderId ? { oauthProviderId: editing.oauthProviderId } : {})}
                 onOAuth={(providerId) => { setEditing(null); void startOAuth(providerId); }}
                 onCancel={() => setEditing(null)}
@@ -224,22 +254,24 @@ export function SettingsView({ onChanged, onToast }: { onChanged: () => void; on
               />
             )}
 
+            <p className="writing-guide-note">写作建议用于初筛：4.6、Gemini、DeepSeek 等优先试写；5.5 暂不优先。最终以你的短场景效果为准。</p>
             <div className="provider-list">
               {settings.providers.map((provider) => {
                 const test = tests[provider.providerId];
                 const apiLabel = API_OPTIONS.find((option) => option.value === provider.api)?.label ?? provider.api;
                 return (
-                  <article key={provider.providerId} className="provider-card">
+                  <article key={provider.providerId} className={`provider-card ${provider.disabled ? "disabled" : ""}`}>
                     <div className="provider-card-main">
                       <span className="provider-glyph"><IconBeacon size={18} /></span>
                       <div>
-                        <div className="provider-title"><strong>{provider.name}</strong><code>{provider.providerId}</code>{provider.keySource === "environment" ? <Badge tone="green"><KeyRound size={10} />环境变量</Badge> : provider.hasApiKey ? <Badge tone="green"><KeyRound size={10} />已存密钥</Badge> : <Badge tone="amber">未设密钥</Badge>}</div>
+                        <div className="provider-title"><strong>{provider.name}</strong><code>{provider.providerId}</code>{provider.disabled ? <Badge tone="amber">已禁用</Badge> : provider.keySource === "environment" ? <Badge tone="green"><KeyRound size={10} />环境变量</Badge> : provider.hasApiKey ? <Badge tone="green"><KeyRound size={10} />已存密钥</Badge> : <Badge tone="amber">未设密钥</Badge>}</div>
                         <p>{apiLabel} · {provider.baseUrl}</p>
-                        <div className="model-chips">{provider.models.map((model) => <span key={model.id}>{model.name || model.id}{model.reasoning && <i title="支持思考">✦</i>}</span>)}</div>
+                        <div className="model-chips">{provider.models.map(model => { const recommendation = writingRecommendation(model.id); return <span key={model.id} title={recommendation.reason}>{model.name || model.id}{model.reasoning && <i title="支持思考">✦</i>}<em className={`writing-rec ${recommendation.tone}`}>{recommendation.label}</em></span>; })}</div>
                       </div>
                     </div>
                     <div className="provider-actions">
-                      <button className="button ghost small" disabled={test === "running"} onClick={() => void testProvider(provider.providerId)}>{test === "running" ? <LoaderCircle size={13} className="spin" /> : <Zap size={13} />}测试连接</button>
+                      <button className="button ghost small" onClick={() => void toggleProvider(provider)}>{provider.disabled ? "启用" : "禁用"}</button>
+                      <button className="button ghost small" disabled={test === "running" || provider.disabled} onClick={() => void testProvider(provider.providerId)}>{test === "running" ? <LoaderCircle size={13} className="spin" /> : <Zap size={13} />}测试连接</button>
                       <button className="icon-button" aria-label="编辑" title="编辑" onClick={() => setEditing({ mode: "edit", draft: draftFrom(provider) })}><Pencil size={15} /></button>
                       <button className="icon-button danger" aria-label="删除" title="删除" onClick={() => void removeProvider(provider)}><Trash2 size={15} /></button>
                     </div>
@@ -253,7 +285,7 @@ export function SettingsView({ onChanged, onToast }: { onChanged: () => void; on
           </section>
 
           <section className="settings-section">
-            <div className="settings-section-head"><div><h2>订阅用量</h2><p>只读显示已接入服务的额度窗口和余额；查询失败不会影响模型路由。</p></div><button className="button ghost" disabled={usageLoading} onClick={() => void loadUsage(true)}><CloudDownload size={15} />{usageLoading ? "读取中…" : "刷新用量"}</button></div>
+            <div className="settings-section-head"><div><h2>订阅用量</h2><p>只读显示已启用 provider 的额度窗口和余额；查询失败不会影响模型路由。</p></div><button className="button ghost" disabled={usageLoading} onClick={() => void loadUsage(true)}><CloudDownload size={15} />{usageLoading ? "读取中…" : "刷新用量"}</button></div>
             {usage.length === 0 ? <p className="quiet-empty">保存 provider 后，这里会显示支持查询的额度。</p> : <div className="usage-grid">{usage.map(report => <article className="usage-card" key={report.providerId}><div className="usage-card-head"><strong>{report.label}</strong><code>{report.providerId}</code></div>{report.state === "ok" ? <>{report.windows.map((item, index) => <div className="usage-window" key={`${item.kind}:${index}`}><div><span>{item.kind}</span><strong>剩余 {Math.max(0, 100 - item.percentUsed).toFixed(0)}%</strong></div><progress max={100} value={Math.max(0, 100 - item.percentUsed)} /></div>)}{report.balance && <p className="usage-balance">余额 <strong>{report.balance.value.toFixed(2)} {report.balance.currency}</strong></p>}{!report.windows.length && !report.balance && <p className="quiet-empty">当前没有可用额度窗口</p>}</> : <p className="usage-error">{report.state === "no-key" ? "未配置可用凭据" : report.state === "disabled" ? "该服务暂不支持额度读取" : report.error}</p>}</article>)}</div>}
           </section>
 
@@ -312,7 +344,7 @@ export function SettingsView({ onChanged, onToast }: { onChanged: () => void; on
           </div>
         </aside>
       </div>
-    </div>
+    </div></>
   );
 }
 
@@ -332,7 +364,7 @@ function withContext(model: ProviderModelInput, value: string): ProviderModelInp
   return value ? { ...rest, contextWindow: Number(value) } : rest;
 }
 
-function ProviderEditor({ mode, initial, existingIds, oauthProviderId, onOAuth, onCancel, onSaved }: { mode: "create" | "edit"; initial: Draft; existingIds: string[]; oauthProviderId?: string; onOAuth: (providerId: string) => void; onCancel: () => void; onSaved: (settings: AgentSettingsView, name: string) => void }) {
+function ProviderEditor({ mode, initial, existingIds, builtinProviders, onPreset, oauthProviderId, onOAuth, onCancel, onSaved }: { mode: "create" | "edit"; initial: Draft; existingIds: string[]; builtinProviders: BuiltinProviderPreset[]; onPreset: (preset: BuiltinProviderPreset) => void; oauthProviderId?: string; onOAuth: (providerId: string) => void; onCancel: () => void; onSaved: (settings: AgentSettingsView, name: string) => void }) {
   const [draft, setDraft] = useState<Draft>(initial);
   const [saving, setSaving] = useState(false);
   const [discovering, setDiscovering] = useState(false);
@@ -393,6 +425,7 @@ function ProviderEditor({ mode, initial, existingIds, oauthProviderId, onOAuth, 
   return (
     <section className="provider-editor">
       <header><h3>{mode === "create" ? "添加 provider" : `编辑 ${initial.name}`}</h3><div className="editor-header-actions">{oauthProviderId && <button className="button ghost small" onClick={() => onOAuth(oauthProviderId)}>使用 OAuth 登录</button>}<button className="icon-button" onClick={onCancel} aria-label="关闭"><X size={16} /></button></div></header>
+      {mode === "create" && <label className="provider-preset-select">从内置目录开始<select defaultValue="" onChange={event => { const preset = builtinProviders.find(item => item.providerId === event.target.value); if (preset) onPreset(preset); event.target.value = ""; }}><option value="">选择服务模板（可选）</option>{builtinProviders.map(preset => <option key={preset.providerId} value={preset.providerId}>{preset.name}{preset.source === "plugin" ? " · 插件" : ""}{preset.oauth ? " · OAuth" : ""}</option>)}</select><small>选择模板只会填入配置，不会读取或显示真实密钥。</small></label>}
       <div className="editor-grid">
         <label className="field-label">显示名称<input value={draft.name} onChange={(event) => set({ name: event.target.value, ...(mode === "create" && (!draft.providerId || draft.providerId === slug(draft.name)) ? { providerId: slug(event.target.value) } : {}) })} placeholder="例如：我的 DeepSeek" /></label>
         <label className="field-label">标识（ID）<input value={draft.providerId} disabled={mode === "edit"} onChange={(event) => set({ providerId: event.target.value.toLowerCase() })} placeholder="my-provider" />{draft.providerId && !idValid && <small className="field-error">只能用小写字母、数字和短横线，2–41 个字符</small>}{idTaken && <small className="field-error">这个标识已被使用</small>}</label>

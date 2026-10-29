@@ -27,6 +27,7 @@ import type {
   CharacterArcProfile,
   AuthoringEvent,
 } from "@nova-novel/shared";
+import type { AppearanceSettings } from "./appearance";
 
 export class ApiError extends Error {
   constructor(
@@ -78,6 +79,8 @@ export const api = {
     anchor.href = url; anchor.download = filename; anchor.click();
     URL.revokeObjectURL(url);
   },
+  appearance: () => request<AppearanceSettings>("/api/appearance"),
+  saveAppearance: (input: AppearanceSettings) => request<AppearanceSettings>("/api/appearance", { method: "PUT", body: JSON.stringify(input) }),
   bootstrap: (projectId?: string) => request<WorkspaceSnapshot>(`/api/bootstrap${projectId ? `?projectId=${encodeURIComponent(projectId)}` : ""}`),
   listNotes: (projectId: string) => request<{ notes: AuthorNote[] }>(`/api/notes?projectId=${encodeURIComponent(projectId)}`),
   createNote: (input: { projectId: string; title: string; body?: string; sceneId?: string; elementId?: string; tags?: string[] }) =>

@@ -1,4 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { resolve } from "node:path";
+import { readAppearanceSettings, writeAppearanceSettings } from "./appearance.js";
 import { timingSafeEqual } from "node:crypto";
 import type {
   ContextQuery, GenerationRequest, IdeaCardFields, SelectionAction, WorkspaceSnapshot, ProviderUpsert, TaskRoute, WorkflowDefinition, SceneAnnotation, AuthoringEvent,
@@ -82,6 +84,7 @@ function piIdeas(text: string): IdeaCardFields[] {
 }
 
 export function createApp({ store, knowledge, workflow, pi, guide, workflowGuide }: AppServices) {
+  const appearanceDir = pi.settings?.view().dataDir ?? process.env.NOVA_NOVEL_DATA_DIR ?? resolve(process.cwd(), "data");
   function snapshot(projectId?: string): WorkspaceSnapshot {
     const project = store.getProject(projectId);
     const branch = store.getBranch(project.activeBranchId);
@@ -142,6 +145,7 @@ export function createApp({ store, knowledge, workflow, pi, guide, workflowGuide
     const url = new URL(request.url ?? "/", `http://${request.headers.host}`);
     const path = url.pathname;
     const method = request.method ?? "GET";
+    if (method === "GET" && path === "/api/appearance") { json(response, 200, readAppearanceSettings(appearanceDir)); return; }
     if (method === "GET" && path === "/api/health") { json(response, 200, { ok: true, storage: "sqlite", connection: pi.getConnection() }); return; }
     if (method === "GET" && path === "/api/bootstrap") { json(response, 200, snapshot(url.searchParams.get("projectId") ?? undefined)); return; }
     if (method === "GET" && path === "/api/export/markdown") { const projectId = requiredString(url.searchParams.get("projectId"), "projectId"); response.writeHead(200, { "Content-Type": "text/markdown; charset=utf-8", "Content-Disposition": `attachment; filename="nova-novel-${projectId}.md"`, "Cache-Control": "no-store" }); response.end(exportMarkdown(snapshot(projectId))); return; }
@@ -204,6 +208,7 @@ export function createApp({ store, knowledge, workflow, pi, guide, workflowGuide
     if (!["POST", "PATCH", "DELETE", "PUT"].includes(method)) throw new DomainError(404, "NOT_FOUND", "接口不存在");
     if (path === "/api/import/backup" && method === "POST") { const backupInput = await body(request, 20 * 1024 * 1024); const restored = store.restoreBackup(parseBackup(backupInput.backup)); indexRevision(restored.project.projectId, restored.revision.revisionId); json(response, 201, { ...restored, snapshot: snapshot(restored.project.projectId) }); return; }
     const input = await body(request);
+    if (path === "/api/appearance" && method === "PUT") { json(response, 200, writeAppearanceSettings(appearanceDir, input)); return; }
     if (path === "/api/events" && method === "POST") { const seq = store.recordInteraction({ projectId: requiredString(input.projectId, "projectId"), kind: requiredString(input.kind, "kind", 100), ...(typeof input.sceneId === "string" ? { sceneId: input.sceneId } : {}), ...(input.actor === "system" || input.actor === "author" ? { actor: input.actor } : {}), ...(input.meta && typeof input.meta === "object" && !Array.isArray(input.meta) ? { meta: input.meta as AuthoringEvent["meta"] } : {}) }); json(response, 201, { seq }); return; }
     if (path === "/api/import" && method === "POST") { const parsed = parseManuscript(requiredString(input.text, "text", 1_000_000)); const imported = store.importProject({ ...(typeof input.title === "string" ? { title: input.title } : {}), ...(typeof input.premise === "string" ? { premise: input.premise } : {}), chapterTitle: parsed.chapterTitle, scenes: parsed.scenes }); indexRevision(imported.project.projectId, imported.revision.revisionId); json(response, 201, { ...imported, snapshot: snapshot(imported.project.projectId) }); return; }
     const arcRoute = path.match(/^\/api\/character-arcs\/([^/]+)$/);

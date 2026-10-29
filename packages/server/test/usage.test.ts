@@ -19,7 +19,7 @@ test("usage reports normalize provider windows and balances without exposing cre
     await settings.upsert("my-kimi", { name: "Kimi", api: "openai-completions", baseUrl: "https://api.kimi.com/coding/v1", keySource: "manual", apiKey: secret, models: [{ id: "kimi-k3" }] });
     await settings.upsert("opendesign-plan", { name: "OpenDesign", api: "openai-completions", baseUrl: "https://amr-api.open-design.ai/api/v1", keySource: "manual", apiKey: secret, models: [{ id: "gpt-6-luna" }] });
     settings.runtime.getAvailableSnapshot = (() => [{ provider: "openai-codex", modelId: "gpt-6-astra", api: "openai-codex-responses", baseUrl: "https://chatgpt.com/backend-api" }]) as typeof settings.runtime.getAvailableSnapshot;
-    settings.runtime.getAuth = (async () => ({ auth: { apiKey: secret } })) as typeof settings.runtime.getAuth;
+    settings.runtime.getAuth = (async () => { throw new Error("usage must not read ambient provider credentials"); }) as typeof settings.runtime.getAuth;
     let calls = 0;
     const usage = new AgentUsageService(settings, async (input) => {
       calls++;
@@ -36,13 +36,13 @@ test("usage reports normalize provider windows and balances without exposing cre
       throw new Error(`unexpected ${url}`);
     });
     const reports = await usage.list();
-    assert.equal(reports.length, 6);
+    assert.equal(reports.length, 5);
     assert.ok(reports.every(report => report.state === "ok"));
     assert.equal(reports.find(report => report.providerId === "my-deepseek")?.balance?.value, 12.5);
     assert.equal(reports.find(report => report.providerId === "my-openrouter")?.windows[0]?.percentUsed, 75);
     assert.equal(reports.find(report => report.providerId === "my-zai")?.windows[0]?.percentUsed, 40);
     assert.equal(reports.find(report => report.providerId === "my-kimi")?.windows[0]?.percentUsed, 25);
-    assert.equal(reports.find(report => report.providerId === "openai-codex")?.windows[0]?.percentUsed, 30);
+    assert.equal(reports.find(report => report.providerId === "openai-codex"), undefined);
     assert.equal(reports.find(report => report.providerId === "opendesign-plan")?.balance?.value, 8.5);
     assert.ok(!JSON.stringify(reports).includes(secret));
     const before = calls;

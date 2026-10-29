@@ -72,6 +72,8 @@ Agent 的配置、密钥、生成的 `models.json` 和会话 JSONL 都放在 `<�
 - 故事画布支持章节新建/重命名、场景新建/重命名、跨章移动与叙述顺序调整；结构操作通过 `structureChanges` 进入同一不可变清单，按目标位置插入并重排，旧修订 CAS 拒绝覆盖。
 - 创作便签保存想法、疑问、对白和资料，支持标签、搜索、场景/元素关联、归档与恢复；便签编辑不创建修订，也不进入事实或 RAG。`POST /api/notes/:id/promote` 先保存编辑，再经 ChangeSet/CAS 创建计划场景，稳定 `note_<id>` 幂等。
 - 写作页按当前正文、计划、候选和最近操作显示下一步行动条；行动条不调用模型。交互式大纲支持逐场编辑、选择加入或暂不加入、显示新增数量，至少选择一场后采用。人工审阅支持接受、退回修改和拒绝，退回说明随决定保存并可输入后续生成节点；不接受或退回不会提交正文。
+- Provider 预设提供区分的默认环境变量名，检测本机变量后生成可启用的候选项；启用/禁用仅影响显式配置，模型路由与用量只跟随已启用 provider，不隐式启用环境里的其他服务。OAuth 登录创建 `my-*` 配置并以 `authProviderId` 复用内置身份，模型、路由和用量均可用。内置目录在添加 provider 编辑器中选择，模型旁显示写作初筛建议。
+- 设置包含“界面与字体”：UI 默认内置 Inter + Noto Sans CJK，正文默认 Noto Serif CJK，可选 LXGW 文楷与正文字号；字体和 OFL 许可证随应用打包。外观设置持久化到应用数据目录的 `appearance.json`，跨随机端口重启可恢复；删除/启停用量卡片按当前配置过滤，旧慢响应不会回写。
 - 人物、场景和作品表单按对象 ID 重建，异步响应按作品归属与独立序号验收。历史版本预览读取所选修订的真实清单。桌面导出统一携带配对令牌；窄窗口的助手、画布检查器和节点详情使用可开合侧栏，弹窗支持初始焦点、Tab 圈定、Escape 关闭与焦点归还。
 - 同源与回环 Host/Origin 校验，1 MiB 请求体限制，统一的 JSON 错误格式，SSE 快照重连。
 
@@ -101,7 +103,7 @@ Agent 的配置、密钥、生成的 `models.json` 和会话 JSONL 都放在 `<�
 
 ### 自动化测试
 
-`pnpm --filter @nova-novel/server test`：**104/104 通过**。旧的 RPC 子进程协议测试已随 RPC 宿主一起移除。
+`pnpm --filter @nova-novel/server test`：**112/112 通过**。旧的 RPC 子进程协议测试已随 RPC 宿主一起移除。
 
 | 范围 | 覆盖摘要 |
 | --- | --- |
@@ -122,12 +124,17 @@ Agent 的配置、密钥、生成的 `models.json` 和会话 JSONL 都放在 `<�
 | 作品管理（2 项） | 重命名、归档/恢复、最后一个未归档作品保护、副本 ID/正文/修订独立，副本修改不污染原稿 |
 | 备份恢复（1 项） | 恢复为新作品、场景/章节/路线/元素/事实/事件/证据引用重映射、便签/批注/人物弧线、POV 与重索引后证据 ID 保持、重复恢复、原作品不变 |
 | POV HTTP（3 项） | 真实生成 HTTP 请求中，视角实体 ID、名称“阿禾”和别名“小禾”均解析为同一实体 ID；任务成功且 queryContext 作品/修订正确 |
+| Provider 环境与用量（5 项） | Zen/Go/CN 默认变量名、检测安全与排重、启停和路由持久化、用量仅随启用配置、凭据变化缓存失效与错误脱敏、预设 token 上限归一化 |
+| 写作建议（1 项） | 4.6/Gemini/DeepSeek 推荐、5.5 暂不优先、未知模型不绝对排名 |
+| OAuth 配置（1 项） | 登录创建 `my-openai-codex` 与 `authProviderId`、内置模型可路由、身份用量、配置文件不含令牌 |
+| 外观设置（1 项） | 默认字体、文楷与 110% 跨服务重启持久化、非法字号 400 且原设置不变 |
 
 ### 实际应用与浏览器
 
 以临时数据目录、临时端口启动生产构建，配合本机假 OpenAI 兼容服务（`scripts/fake-openai.mjs`），用无头 Chrome 1440×1000 执行 `scripts/ui-smoke.mjs` 与补充脚本，结果如下：
 
 - 设置页：provider 卡片可见，页面不含密钥；测试连接成功；编辑中文名称后保存；新增 provider 时读取模型列表并勾选；任务分配保存后写入 `settings.json`。
+- 环境与外观：Zen/Go/MiniMax CN 默认变量名正确；Mistral 检测仅显示变量名，启用后用量只有 `my-mistral`，禁用消失、重新启用恢复；文楷与 110% 正文字号即时生效，控制台错误 0。用例在 `scripts/provider-appearance-smoke.mjs`，结果在 `artifacts/provider-appearance-run/report.json`，截图 `provider-settings.png` 与 `appearance-settings.png`。
 - Provider 目录与额度：内置选择器含 45 个 Pi/插件 provider（另加默认选项共 46 项），覆盖 OpenCode Go、Mistral、Azure、Bedrock、火山方舟双套餐等；火山方舟编辑器提供 OAuth 和独立 AK/SK 字段。选择 DeepSeek 后保留模型元数据，切换环境变量密钥并成功保存和分配模型，假模型连接测试通过；`models.json` 只含 `$FAKE_API_KEY`，脱敏额度响应显示“剩余 75% / 12.50 CNY”，控制台错误 0。用例在 `scripts/provider-catalog-smoke.mjs`，结果在 `artifacts/provider-catalog-run/report.json`。
 - 人机交互闭环：采用候选后行动条切换为“看看实际写出了什么”；交互大纲只加入两个场景，初始场景加采用场景共 3 个；工作流退回说明完整落库且修订数不变，审阅框问题优先、候选可折叠。用例在 `scripts/hci-workflow-smoke.mjs`，结果在 `artifacts/hci-workflow-run/report.json`，截图 `workflow-review-note.png`。
 - 创作便签：无模型时创建、搜索、关联场景、归档和恢复均可使用；另一条便签由作者明确转为场景，初始场景加新场景共 2 个，便签状态为 linked。用例在 `scripts/notes-smoke.mjs`，结果在 `artifacts/notes-run/report.json`，截图 `notes-workspace.png`。
@@ -160,8 +167,8 @@ Agent 的配置、密钥、生成的 `models.json` 和会话 JSONL 都放在 `<�
 ### Windows 桌面验证
 
 - `node scripts/test-packed-runtime.mjs`：真实进程分配随机回环端口，未配对 API 返回 403，配对后健康检查和 bootstrap 通过，静态页面可加载。
-- 根依赖、锁文件、部署 manifest 与原生模块重建统一为 Electron 44.7.2。使用本地缓存生成 unpacked 后，真实桌面启动与未配对 403、配对健康检查和页面加载通过；`scripts/test-electron-lifecycle.mjs` 使用独立空闲调试端口关闭窗口，验证 `before-quit`、Electron 退出和服务停止，失败时清理进程树。当前页面截图在 `artifacts/final-electron-unpacked.png`。
-- `pnpm dist:win` 已生成 `Nova Novel Setup 0.1.0.exe`（146,259,260 bytes，x64 NSIS，SHA-256 `86e1034a82f0b83ce84faebe3592829d204c493b217520d74705a8502899c94d`）。本机未配置代码签名证书，日志明确标记 signing is skipped；未声称安装包已签名或已运行安装向导。
+- 根依赖、锁文件、部署 manifest 与原生模块重建统一为 Electron 44.7.2。使用本地缓存生成 unpacked 后，真实桌面启动与未配对 403、配对健康检查和页面加载通过；`scripts/test-electron-lifecycle.mjs` 使用独立空闲调试端口关闭窗口，验证 `before-quit`、Electron 退出和服务停止，失败时清理进程树。当前页面截图在 `artifacts/final-provider-appearance-desktop.png`。
+- `pnpm dist:win` 已生成 `Nova Novel Setup 0.1.0.exe`（178,874,704 bytes，x64 NSIS，SHA-256 `d97fbb30e39dd4f013ec704292f908b17526710d61e0fb45bc109c31a7e6f9a0`）。本机未配置代码签名证书，日志明确标记 signing is skipped；未声称安装包已签名或已运行安装向导。
 
 ## 尚未完成或未实测
 

@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { ModelRuntime, VERSION } from "@earendil-works/pi-coding-agent";
 import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
-import { extraProviderPresets } from "./provider-metadata.js";
+import { extraProviderPresets, providerEnvironmentMetadata } from "./provider-metadata.js";
 import { VOLC_LABELS, VOLC_ROUTES, volcBaseUrl, volcCompat, volcSnapshotModels, type VolcPlan } from "./volcengine/models.js";
 import { TASK_KINDS, THINKING_LEVELS, type AgentSettingsView, type ModelOption, type ProviderUpsert, type ProviderConfigView, type TaskKind, type TaskRoute, type ThinkingLevel, type BuiltinProviderPreset, type OAuthStatusView, type OAuthEventView, type ProviderApi, type ProviderCompat } from "@nova-novel/shared";
 import { DomainError, requiredString } from "../domain.js";
@@ -21,7 +21,7 @@ export function builtinProviderPresets(): BuiltinProviderPreset[] {
     if (!baseUrl || models.length === 0) return [];
     const api = PREFERRED_APIS[provider.id] ?? apis.find(candidate => models.some(model => model.api === candidate));
     if (!api) return [];
-    return [{ providerId: provider.id, name: provider.name, baseUrl, api, oauth: Boolean(provider.auth.oauth), source: "pi" as const, models: models.map(model => ({ id: model.id, ...(model.name !== model.id ? { name: model.name } : {}), reasoning: model.reasoning, contextWindow: model.contextWindow, maxTokens: model.maxTokens, input: [...model.input], ...(model.thinkingLevelMap ? { thinkingLevelMap: { ...model.thinkingLevelMap } } : {}) })) }];
+    return [{ providerId: provider.id, name: provider.name, baseUrl, api, oauth: Boolean(provider.auth.oauth), ...providerEnvironmentMetadata(provider.id, Boolean(provider.auth.apiKey)), source: "pi" as const, models: models.map(model => ({ id: model.id, ...(model.name !== model.id ? { name: model.name } : {}), reasoning: model.reasoning, contextWindow: model.contextWindow, maxTokens: Math.min(model.maxTokens, model.contextWindow), input: [...model.input], ...(model.thinkingLevelMap ? { thinkingLevelMap: { ...model.thinkingLevelMap } } : {}) })) }];
   });
   for (const extra of extraProviderPresets()) {
     const existing = presets.find(preset => preset.providerId === extra.providerId);
@@ -32,11 +32,14 @@ export function builtinProviderPresets(): BuiltinProviderPreset[] {
       existing.source = "plugin";
       existing.name = extra.name;
       existing.oauth ||= extra.oauth;
+      existing.envRefs = extra.envRefs;
+      if (extra.apiKeyEnv) existing.apiKeyEnv = extra.apiKeyEnv;
+      else delete existing.apiKeyEnv;
     } else presets.push(extra);
   }
   for (const plan of ["agent-plan", "coding-plan"] as VolcPlan[]) {
     const providerId = VOLC_ROUTES[plan];
-    if (!presets.some(preset => preset.providerId === providerId)) presets.push({ providerId, name: VOLC_LABELS[plan], api: "anthropic-messages", baseUrl: volcBaseUrl(plan), compat: volcCompat(plan), oauth: true, source: "plugin", models: volcSnapshotModels(plan) });
+    if (!presets.some(preset => preset.providerId === providerId)) presets.push({ providerId, name: VOLC_LABELS[plan], api: "anthropic-messages", baseUrl: volcBaseUrl(plan), compat: volcCompat(plan), oauth: true, ...providerEnvironmentMetadata(providerId), source: "plugin", models: volcSnapshotModels(plan) });
   }
   return presets;
 }
@@ -101,7 +104,11 @@ export class AgentSettings {
     if (apiKey !== undefined && (typeof apiKey !== "string" || apiKey.length > 16000 || /^[!$]/.test(apiKey) || /[\r\n]/.test(apiKey))) invalid("API Key 格式无效");
     const keySource = input.keySource ?? "manual";
     if (!["manual", "environment"].includes(keySource)) invalid("密钥来源无效");
-    const apiKeyEnv = input.apiKeyEnv;
+    if (input.disabled !== undefined && typeof input.disabled !== "boolean") invalid("停用状态必须是布尔值");
+    const presets = builtinProviderPresets();
+    const preset = presets.find(preset => id === preset.providerId || id === `my-${preset.providerId}`)
+      ?? presets.find(preset => preset.api === input.api && preset.baseUrl.replace(/\/$/, "") === url.href.replace(/\/$/, ""));
+    const apiKeyEnv = input.apiKeyEnv ?? (preset ? preset.apiKeyEnv : providerEnvironmentMetadata(id).apiKeyEnv);
     if (keySource === "environment" && (typeof apiKeyEnv !== "string" || !/^[A-Z][A-Z0-9_]{1,80}$/.test(apiKeyEnv))) invalid("环境变量名必须是 2–81 位大写字母、数字或下划线，且以字母开头");
     if (keySource === "environment" && apiKey) invalid("使用环境变量时不能同时填写密钥");
     for (const [field, value] of [["quotaAccessKeyEnv", input.quotaAccessKeyEnv], ["quotaSecretKeyEnv", input.quotaSecretKeyEnv]] as const) if (value !== undefined && (typeof value !== "string" || !/^[A-Z][A-Z0-9_]{1,80}$/.test(value))) invalid(`${field} 环境变量名无效`);
@@ -122,17 +129,20 @@ export class AgentSettings {
       return { id: modelId, name: model.name === undefined ? modelId : requiredString(model.name, "模型名称", 200), reasoning: model.reasoning ?? false, contextWindow, maxTokens, input: model.input ?? ["text" as const], ...(model.thinkingLevelMap ? { thinkingLevelMap: { ...model.thinkingLevelMap } } : {}), ...(compat ? { compat } : {}) };
     });
     const compat = validateCompat(input.compat);
-    return { name: requiredString(input.name, "服务名称", 200), api: input.api, baseUrl: url.href.replace(/\/$/, ""), ...(compat ? { compat } : {}), keySource, ...(keySource === "environment" ? { apiKeyEnv: apiKeyEnv!, apiKey: "" } : apiKey !== undefined ? { apiKey } : {}), ...(input.quotaAccessKeyEnv !== undefined ? { quotaAccessKeyEnv: input.quotaAccessKeyEnv } : {}), ...(input.quotaSecretKeyEnv !== undefined ? { quotaSecretKeyEnv: input.quotaSecretKeyEnv } : {}), models };
+    return { name: requiredString(input.name, "服务名称", 200), api: input.api, baseUrl: url.href.replace(/\/$/, ""), ...(compat ? { compat } : {}), disabled: input.disabled ?? false, keySource, ...(keySource === "environment" ? { apiKeyEnv: apiKeyEnv!, apiKey: "" } : apiKey !== undefined ? { apiKey } : {}), ...(input.authProviderId ? { authProviderId: input.authProviderId } : {}), ...(input.quotaAccessKeyEnv !== undefined ? { quotaAccessKeyEnv: input.quotaAccessKeyEnv } : {}), ...(input.quotaSecretKeyEnv !== undefined ? { quotaSecretKeyEnv: input.quotaSecretKeyEnv } : {}), models };
   }
   private async reload(): Promise<void> {
     // 无密钥的服务（Ollama、LM Studio 等本机模型）写入占位值，Pi 才会把它视为可用；占位值不会回显给页面。
-    const providers = Object.fromEntries(this.data.providers.map(({ providerId, name, baseUrl, api, apiKey, keySource, apiKeyEnv, models, compat }) => [providerId, { name, baseUrl, api, ...(compat ? { compat } : {}), apiKey: keySource === "environment" ? `$${apiKeyEnv}` : apiKey ? apiKey.split("$").join("$$") : "no-key", models }]));
+    const enabledProviders = this.data.providers.filter(provider => !provider.disabled);
+    const modelProviders = enabledProviders.filter(provider => !provider.authProviderId);
+    const providers = Object.fromEntries(modelProviders.map(({ providerId, name, baseUrl, api, apiKey, keySource, apiKeyEnv, models, compat }) => [providerId, { name, baseUrl, api, ...(compat ? { compat } : {}), apiKey: keySource === "environment" ? `$${apiKeyEnv}` : apiKey ? apiKey.split("$").join("$$") : "no-key", models }]));
     atomic(this.modelsPath, { providers });
     const runtime = await ModelRuntime.create({ authPath: resolve(this.agentDir, "auth.json"), modelsPath: this.modelsPath, allowModelNetwork: false, refreshOnCreate: false });
     if (runtime.getError()) throw new DomainError(400, "INVALID_AGENT_SETTINGS", "模型配置无法加载");
     const available = await runtime.getAvailable();
-    const custom = new Set(this.data.providers.map(provider => provider.providerId));
-    this.models = runtime.getModels().filter(model => custom.has(model.provider) || available.some(item => item.provider === model.provider && item.id === model.id)).map(model => ({ provider: model.provider, modelId: model.id, name: model.name, reasoning: model.reasoning, thinkingLevels: thinkingLevels(model), contextWindow: model.contextWindow, maxTokens: model.maxTokens, costInput: model.cost.input, costOutput: model.cost.output, available: available.some(item => item.provider === model.provider && item.id === model.id), source: custom.has(model.provider) ? "custom" : "builtin" }));
+    const custom = new Set(modelProviders.map(provider => provider.providerId));
+    const oauthProviders = new Set(enabledProviders.flatMap(provider => provider.authProviderId ? [provider.authProviderId] : []));
+    this.models = runtime.getModels().filter(model => custom.has(model.provider) || oauthProviders.has(model.provider)).map(model => ({ provider: model.provider, modelId: model.id, name: model.name, reasoning: model.reasoning, thinkingLevels: thinkingLevels(model), contextWindow: model.contextWindow, maxTokens: Math.min(model.maxTokens, model.contextWindow), costInput: model.cost.input, costOutput: model.cost.output, available: custom.has(model.provider) ? available.some(item => item.provider === model.provider && item.id === model.id) : available.some(item => item.provider === model.provider && item.id === model.id), source: custom.has(model.provider) ? "custom" : "builtin" }));
     this.runtime = runtime;
   }
   oauthStatus(id: string): OAuthStatusView {
@@ -165,6 +175,16 @@ export class AgentSettings {
             else events.push({ type: event.type, message: event.message });
           },
         });
+        const preset = builtinProviderPresets().find(item => item.providerId === id);
+        if (preset) {
+          const providerId = `my-${id}`;
+          const clean = this.validate(providerId, { name: preset.name, api: preset.api, baseUrl: preset.baseUrl, keySource: "manual", ...(preset.compat ? { compat: preset.compat } : {}), models: preset.models });
+          const current = this.data.providers.find(item => item.providerId === providerId);
+          const date = new Date().toISOString();
+          const configured: Provider = { providerId, ...clean, authProviderId: id, apiKey: "", hasApiKey: true, createdAt: current?.createdAt ?? date, updatedAt: date };
+          this.data.providers = [...this.data.providers.filter(item => item.providerId !== providerId), configured];
+          atomic(this.settingsPath, this.data);
+        }
         await this.reload();
         this.oauthRuns.delete(id);
         const result: OAuthStatusView = { providerId: id, status: "success", events };
@@ -195,7 +215,17 @@ export class AgentSettings {
     this.oauthResults.set(id, { providerId: id, status: "cancelled", events: run.events });
   }
   view(): AgentSettingsView {
-    return { providers: this.data.providers.map(({ apiKey, ...provider }) => ({ ...provider, hasApiKey: provider.keySource === "environment" ? Boolean(process.env[provider.apiKeyEnv!]) : Boolean(apiKey) })), models: structuredClone(this.models), routes: this.data.routes.map(route => { const model = this.resolveModel(route.kind); return { ...route, thinkingLevel: model ? clampThinking(route.thinkingLevel, model.thinkingLevels) : route.thinkingLevel }; }), builtinProviders: builtinProviderPresets(), engine: { name: "Pi", version: VERSION, mode: "embedded" }, dataDir: this.dataDir };
+    const presets = builtinProviderPresets();
+    const configuredEnvs = new Set(this.data.providers.flatMap(provider => provider.apiKeyEnv ? [provider.apiKeyEnv] : []));
+    const detectedProviders: AgentSettingsView["detectedProviders"] = [];
+    for (const preset of presets) {
+      if (!preset.apiKeyEnv || this.data.providers.some(provider => provider.providerId === preset.providerId || provider.providerId === `my-${preset.providerId}` || (provider.api === preset.api && provider.baseUrl.replace(/\/$/, "") === preset.baseUrl.replace(/\/$/, "")))) continue;
+      const apiKeyEnv = preset.envRefs.find(name => Boolean(process.env[name]) && !configuredEnvs.has(name));
+      if (!apiKeyEnv) continue;
+      detectedProviders.push({ preset, apiKeyEnv, hasApiKey: true });
+      configuredEnvs.add(apiKeyEnv);
+    }
+    return { providers: this.data.providers.map(({ apiKey, ...provider }) => ({ ...provider, hasApiKey: provider.authProviderId ? true : provider.keySource === "environment" ? Boolean(process.env[provider.apiKeyEnv!]) : Boolean(apiKey) })), models: structuredClone(this.models), routes: this.data.routes.map(route => { const model = this.resolveModel(route.kind); return { ...route, thinkingLevel: model ? clampThinking(route.thinkingLevel, model.thinkingLevels) : route.thinkingLevel }; }), builtinProviders: presets, detectedProviders, engine: { name: "Pi", version: VERSION, mode: "embedded" }, dataDir: this.dataDir };
   }
   resolveModel(kind: TaskKind): ModelOption | undefined {
     const route = this.data.routes.find(item => item.kind === kind);

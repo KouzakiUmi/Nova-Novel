@@ -8,8 +8,8 @@ Nova Novel 使用 Electron + electron-builder 产出 Windows x64 NSIS 安装包�
 
 - `electron/main.cjs` 通过 Electron 的 `ELECTRON_RUN_AS_NODE=1` 子进程模式启动 `packages/server/dist/index.js`，共用 Electron 自带的 Node 运行时。
 - `scripts/package-windows.mjs` 先执行项目构建和 `scripts/test-packed-runtime.mjs`，再用 `pnpm --filter @nova-novel/server --prod deploy .release/server` 生成独立部署目录，避免 pnpm workspace 链接指向开发仓库；根依赖、锁文件和部署 manifest 均固定 Electron 44.7.2，并通过 `@electron/rebuild` 按同一版本重建 `better-sqlite3`，避免 Node ABI 不匹配。
-- 部署目录包含服务端、共享包、前端静态文件、Electron 主进程、生产依赖和 `build/icon.ico`。`electron-builder.yml` 配置 Windows x64 NSIS 输出。
-- 每次启动使用随机回环端口和新的随机配对令牌。API 必须带 `X-Nova-Novel-Token`，前端从 URL hash 读取令牌；令牌不写入请求 URL、数据库或日志。未设置 `NOVA_NOVEL_PAIR_TOKEN` 的开发模式保持原有行为。
+- 部署目录包含服务端、共享包、前端静态文件、Electron 主进程、生产依赖、`build/icon.ico`，以及内置开源字体和 OFL 许可证；字体随 `packages/web/dist` 一起打包，不需要运行时下载。`electron-builder.yml` 配置 Windows x64 NSIS 输出。
+- 每次启动使用随机回环端口和新的随机配对令牌。API 必须带 `X-Nova-Novel-Token`，前端从 URL hash 读取令牌；令牌不写入请求 URL、数据库或日志。未设置 `NOVA_NOVEL_PAIR_TOKEN` 的开发模式保持原有行为。外观设置不依赖该端口，统一保存在应用数据目录的 `appearance.json`。
 - BrowserWindow 使用 `sandbox`、`contextIsolation`、禁用 Node 集成、禁止新窗口和站外导航。默认数据目录是 `%APPDATA%/Nova Novel`，服务日志位于其 `logs/server.log`。
 - 单实例锁、退出时终止服务子进程，不需要系统凭据库或外部服务。
 
