@@ -163,7 +163,7 @@ export function EditorView({ snapshot, scene, localDraft, focusMode, onSelectSce
   // 只表示尚未被任何一次保存请求捕获的修改，避免重复提交已在途的内容。
   const unsavedChangesRef = useRef(false);
   const aiReady = snapshot.connection.state === "connected";
-  const manuscriptSize = 17 * readAppearance().manuscriptScale / 100;
+  const manuscriptSize = 18 * readAppearance().manuscriptScale / 100;
   const activeSceneIntent = SCENE_INTENTS[sceneIntent];
   const nextAction = recommendNextAction({ hasBody: Boolean(body.trim()), hasPlan: Boolean((scene.goal ?? "").trim() || scene.summary.trim()), outcome: outcome ? outcome.type === "report" ? "report" : "candidate" : null, stale: outcome && outcome.type !== "report" ? outcome.stale : false, lastAction });
 

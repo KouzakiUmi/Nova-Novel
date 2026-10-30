@@ -68,7 +68,7 @@ const results = {};
 
 try {
   await cdp("Page.enable"); await cdp("Runtime.enable"); await cdp("Log.enable");
-  await viewport(1440);
+  await viewport(1426, 953);
   await cdp("Page.navigate", { url: appUrl });
   await until(`!!document.querySelector('.app-shell')`, "应用加载");
   assert.ok(await nav("写作"), "打开写作页");
@@ -121,7 +121,7 @@ try {
   await evaluate(`[...document.querySelectorAll('.toast button')].forEach(button => button.click())`);
   await shot("writing-model-picker");
 
-  await viewport(1440);
+  await viewport(1426, 953);
   assert.ok(await nav("故事"), "打开故事画布");
   await until(`!!document.querySelector('.canvas-inspector.inspector-open')`, "宽屏检查器默认打开");
   await clickText(".toolbar-actions button", "收起检查器");
@@ -129,6 +129,7 @@ try {
   results.storyInspectorToggle = true;
   await clickText(".toolbar-actions button", "场景检查器");
   await until(`getComputedStyle(document.querySelector('.canvas-inspector')).display !== 'none'`, "宽屏检查器重开");
+  await shot("story-typography");
 
   assert.ok(await nav("工作流"), "打开工作流");
   await until(`!!document.querySelector('.workflow-workspace')`, "工作流画布");
@@ -143,16 +144,31 @@ try {
   await evaluate(`document.querySelector(${JSON.stringify(searchInput)}).dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))`);
   await until(`!!document.querySelector('.elements-workspace')`, "回车打开元素");
   results.commandElementSearch = true;
+  await shot("elements-typography");
+  results.elementFormContained = await evaluate(`[...document.querySelectorAll('.elements-page input, .elements-page select')].filter(el => el.getClientRects().length).every(el => { const rect = el.getBoundingClientRect(); return rect.left >= 0 && rect.right <= innerWidth + 1; })`);
+  assert.equal(results.elementFormContained, true, "元素页输入框与下拉框不得被挤出视口");
+  await nav("便签");
+  await until(`!!document.querySelector('.notes-page')`, "便签页");
+  await shot("notes-typography");
+  results.controlFontUnified = await evaluate(`(() => { const first = window.getComputedStyle(document.querySelector('.note-composer > input')).fontFamily.split(',')[0].replace(/[\\"']/g, '').trim(); const ui = window.getComputedStyle(document.documentElement).getPropertyValue('--ui-font').split(',')[0].replace(/[\\"']/g, '').trim(); return first === ui; })()`);
+  assert.equal(results.controlFontUnified, true, "可编辑输入框应使用界面字体而不是阅读字体");
 
   assert.ok(await nav("模型与服务"), "打开外观设置");
   await until(`!!document.querySelector('.settings-section-tabs')`, "设置分类加载");
   assert.ok(await clickText(".settings-section-tabs button", "界面与字体"), "切换到外观设置");
   await until(`!!document.querySelector('.appearance-page')`, "外观页");
-  results.defaultReadingFont = await evaluate(`getComputedStyle(document.documentElement).getPropertyValue('--manuscript-font').includes('LXGW WenKai') && getComputedStyle(document.querySelector('.appearance-manuscript-preview p:not(.eyebrow)')).fontWeight === '500' && document.fonts.check('500 17px "LXGW WenKai"', '阿禾')`);
-  assert.equal(results.defaultReadingFont, true, "默认正文应实际使用可用的文楷 Medium");
+  results.defaultReadingFont = await evaluate(`getComputedStyle(document.documentElement).getPropertyValue('--manuscript-font').includes('LXGW WenKai') && getComputedStyle(document.querySelector('.appearance-manuscript-preview p:not(.eyebrow)')).fontWeight === '500' && [...document.fonts].some(face => face.family.replace(/[\\"']/g, '') === 'LXGW WenKai' && face.weight === '500' && face.status === 'loaded')`);
+  assert.equal(results.defaultReadingFont, true, "默认正文应实际加载文楷 Medium 字重");
   results.noSongFallback = await evaluate(`!getComputedStyle(document.documentElement).getPropertyValue('--manuscript-font').replace(/sans-serif/gi, '').match(/Song|Serif|STSong|Georgia|SimSun/i)`);
   assert.equal(results.noSongFallback, true, "正文回退栈不得包含宋体或衬线字体");
   await shot("appearance-default-font");
+  const manuscriptBeforeUiChange = await evaluate(`getComputedStyle(document.documentElement).getPropertyValue('--manuscript-font')`);
+  await evaluate(`(() => { const select = document.querySelector('select[aria-label="界面字体"]'); select.value = 'sarasa'; select.dispatchEvent(new Event('change', { bubbles: true })); return true; })()`);
+  await until(`getComputedStyle(document.documentElement).getPropertyValue('--ui-font').includes('Sarasa UI SC')`, "界面字体生效");
+  results.uiFontSelectable = await evaluate(`getComputedStyle(document.documentElement).getPropertyValue('--display-font') === getComputedStyle(document.documentElement).getPropertyValue('--ui-font') && getComputedStyle(document.documentElement).getPropertyValue('--manuscript-font') === ${JSON.stringify(manuscriptBeforeUiChange)} && document.fonts.check('400 14px "Sarasa UI SC"', '故事画布')`);
+  assert.equal(results.uiFontSelectable, true, "界面字体应独立可选且标题与控件统一");
+  results.readableTypeRamp = await evaluate(`parseFloat(getComputedStyle(document.querySelector('.nav-button')).fontSize) >= 15 && parseFloat(getComputedStyle(document.querySelector('.appearance-scale button')).fontSize) >= 14 && parseFloat(getComputedStyle(document.querySelector('.appearance-manuscript-preview p:not(.eyebrow)')).fontSize) >= 18 && getComputedStyle(document.querySelector('.settings-section-head h2')).fontWeight === '600'`);
+  assert.equal(results.readableTypeRamp, true, "默认字号和字重必须符合可读层级");
   const fontBefore = await evaluate(`parseFloat(getComputedStyle(document.querySelector('.appearance-scale button')).fontSize)`);
   const displayBefore = await evaluate(`getComputedStyle(document.documentElement).getPropertyValue('--display-font')`);
   await evaluate(`(() => { const row = [...document.querySelectorAll('.appearance-scale')].find(el => el.textContent.includes('界面字号')); const button = [...row.querySelectorAll('button')].find(el => el.textContent.includes('110%')); button.click(); return true; })()`);

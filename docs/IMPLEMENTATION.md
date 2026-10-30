@@ -82,7 +82,7 @@ Agent 的配置、密钥、生成的 `models.json` 和会话 JSONL 都放在 `<�
 - 创作便签保存想法、疑问、对白和资料，支持标签、搜索、场景/元素关联、归档与恢复；便签编辑不创建修订，也不进入事实或 RAG。`POST /api/notes/:id/promote` 先保存编辑，再经 ChangeSet/CAS 创建计划场景，稳定 `note_<id>` 幂等。
 - 写作页按当前正文、计划、候选和最近操作显示下一步行动条；行动条不调用模型。交互式大纲支持逐场编辑、选择加入或暂不加入、显示新增数量，至少选择一场后采用。人工审阅支持接受、退回修改和拒绝，退回说明随决定保存并可输入后续生成节点；不接受或退回不会提交正文。
 - Provider 预设提供区分的默认环境变量名，检测本机变量后生成可启用的候选项；启用/禁用仅影响显式配置，模型路由与用量只跟随已启用 provider，不隐式启用环境里的其他服务。OAuth 登录创建 `my-*` 配置并以 `authProviderId` 复用内置身份，模型、路由和用量均可用。内置目录在添加 provider 编辑器中选择，模型旁显示写作初筛建议。
-- 设置包含“界面与字体”：UI 默认内置 Inter + Noto Sans CJK，正文默认霞鹜文楷 Medium（500），可选文楷 Regular、本机霞鹜新晰黑、更纱黑体 UI SC 与等线/系统黑体；缺字体时回退到内置文楷或黑体，不使用宋体。UI 字号（90%–130%）与正文字号（90%–120%）独立设置，界面展示字体不随正文字体切换，候选、试写与证据使用正文字号倍率。内置字体与许可随应用打包，本机阅读字体只引用不复制。外观设置持久化到应用数据目录的 `appearance.json`，跨随机端口重启可恢复；删除/启停用量卡片按当前配置过滤，旧慢响应不会回写。
+- 设置包含“界面与字体”：UI 与正文分别提供完整字体选择。UI 默认 Noto Sans CJK（可变字重，Inter 只在缺拉丁字形时兜底），正文默认随包霞鹜文楷 Medium（500，另可选 Regular），均可选文楷、本机霞鹜新晰黑、更纱黑体 UI SC 与等线/系统黑体；缺字体时回退到内置文楷或黑体，不使用宋体。导航、按钮、设置项、面板标题与可编辑输入框使用 UI 字体，正文、候选与证据引文等渲染内容以及创作内容标题使用阅读字体；字重收敛为 400/500/600，默认辅助字 13px、控件 14px、导航 15px；正文默认 18px，候选、试写与证据使用正文字号倍率。UI 字号（90%–130%）与正文字号（90%–120%）独立设置，内置字体与许可随应用打包，本机阅读字体只引用不复制。外观设置持久化到应用数据目录的 `appearance.json`，跨随机端口重启可恢复；写入只保留四个已知字段，旧文件中的未知字体值回退为内置；删除/启停用量卡片按当前配置过滤，旧慢响应不会回写。
 - 人物、场景和作品表单按对象 ID 重建，异步响应按作品归属与独立序号验收。历史版本预览读取所选修订的真实清单。桌面导出统一携带配对令牌；作品管理提供未归档作品列表，窄窗口也能切换作品；故事结构、助手、画布检查器和节点详情使用可开合侧栏，宽屏检查器与节点详情同样可收起，任务分配网格在窄窗口换行而不裁剪模型选择。弹窗支持初始焦点、Tab 圈定、Escape 关闭与焦点归还。
 - 同源与回环 Host/Origin 校验，1 MiB 请求体限制，统一的 JSON 错误格式，SSE 快照重连。
 
@@ -159,8 +159,8 @@ Agent 的配置、密钥、生成的 `models.json` 和会话 JSONL 都放在 `<�
 - 对象与版本状态：阿禾/父亲切换时弧线表单互不串写，历史版本显示命名时正文而非现稿，故事页切作品后可新建场景，控制台错误 0。用例在 `scripts/object-state-smoke.mjs`，结果在 `artifacts/object-state-run/report.json`，截图 `object-state.png`。
 - 保存屏障：正文输入后立即切作品仍完整落库，保存新计划后立即离页不回退，复制包含最近正文和计划，控制台错误 0。用例在 `scripts/save-barrier-smoke.mjs`，结果在 `artifacts/save-barrier-run/report.json`，截图 `save-barrier.png`。
 - 保存可靠性：注入 PATCH 失败后正文保留为本地草稿且提示可操作，网络错误恰好重试 3 次不无界循环；制造版本冲突后仅在 1 次请求内停止自动重试；草稿经「读取最新版本→确认保存」后真正写入服务端；切换作品后界面不被旧响应改回；中文输入法组合输入期间按 Enter 不检索、真实 Enter 只检索 1 次；外观保存失败显示「尚未保存」并可重试成功；便签保存失败时不调用转为场景；结构保存失败保留输入并显示可重试错误，重试后标题真正写入且正文未被覆盖。用例在 `scripts/reliability-smoke.mjs`，结果在 `artifacts/reliability-run/report.json`。
-- 桌面与 UX：配对模式下 Markdown、JSON 备份和回放导出成功；1000px 窗口可打开助手和画布检查器；弹窗初始焦点、Escape 关闭与焦点归还通过，控制台错误 0。用例在 `scripts/desktop-ux-smoke.mjs`，本轮复测结果在 `artifacts/desktop-ux-regression-2/report.json`。
-- 基础功能回归：`scripts/foundation-smoke.mjs` 在 1440px、1000px 与 760px 视口验证 16 项：写作页模型分配落库、未保存正文在生成前写入、错误 Toast、场景卡完整恢复、脑暴失败提示、宽屏两类检查器开关、元素搜索与回车打开、默认文楷 Medium 实际可用且无宋体回退、本机新晰黑与更纱黑体可用、UI 缩放与字体解耦、窄窗作品切换和故事结构入口、任务分配不裁剪。结果在 `artifacts/foundation-smoke/report.json`，截图包括 `appearance-default-font.png`、`appearance-ui-scale.png`、`appearance-sarasa.png` 与 `writing-model-picker.png`，浏览器未处理异常 0。
+- 桌面与 UX：配对模式下 Markdown、JSON 备份和回放导出成功；1000px 窗口可打开助手和画布检查器；弹窗初始焦点、Escape 关闭与焦点归还通过，控制台错误 0。用例在 `scripts/desktop-ux-smoke.mjs`，本轮复测结果在 `artifacts/desktop-ux-typography/report.json`。
+- 基础功能回归：`scripts/foundation-smoke.mjs` 在 1426×953、1000px 与 760px 视口验证 21 项：写作页模型分配落库、未保存正文在生成前写入、错误 Toast、场景卡完整恢复、脑暴失败提示、宽屏两类检查器开关、元素搜索与回车打开、元素表单不溢出、默认文楷 Medium 实际可用且无宋体回退、UI 字体独立可选与统一、默认字号字重层级、本机新晰黑与更纱黑体可用、UI 缩放与字体解耦、可编辑输入框与界面字体一致、窄窗作品切换和故事结构入口、任务分配不裁剪。结果在 `artifacts/foundation-smoke/report.json`，截图包括 `writing-typography.png`、`story-typography.png`、`elements-typography.png`、`notes-typography.png`、`appearance-default-font.png`、`appearance-sarasa.png` 与 `appearance-ui-scale.png`，浏览器未处理异常 0。
 - 写作：续写候选接到正文末尾并自动保存；选中第三段推敲后只替换该段，段落数和开头不变；检查报告分级显示且没有采用按钮。
 - 自动保存后立即“恢复为新版本”：成功，没有 409。
 - 工作流：运行到人工节点，审阅框显示草稿正文与检查发现；“不接受”后运行结束且不提交，“接受并提交”后运行完成。

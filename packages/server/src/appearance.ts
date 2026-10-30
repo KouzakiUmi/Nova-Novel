@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 import { DomainError } from "./domain.js";
 
 export interface AppearanceSettings {
-  uiFont: "builtin" | "system";
+  uiFont: "builtin" | "wenkai" | "neo" | "sarasa" | "system";
   manuscriptFont: "builtin" | "wenkai" | "neo" | "sarasa" | "system";
   uiScale: number;
   manuscriptScale: number;
@@ -17,7 +17,7 @@ export function readAppearanceSettings(dataDir: string): AppearanceSettings {
   try {
     const value = JSON.parse(readFileSync(path, "utf8")) as Partial<AppearanceSettings>;
     return {
-      uiFont: value.uiFont === "system" ? "system" : "builtin",
+      uiFont: value.uiFont === "system" || value.uiFont === "wenkai" || value.uiFont === "neo" || value.uiFont === "sarasa" ? value.uiFont : "builtin",
       manuscriptFont: value.manuscriptFont === "system" || value.manuscriptFont === "wenkai" || value.manuscriptFont === "neo" || value.manuscriptFont === "sarasa" ? value.manuscriptFont : "builtin",
       uiScale: typeof value.uiScale === "number" && [90, 100, 110, 120, 130].includes(value.uiScale) ? value.uiScale : 100,
       manuscriptScale: typeof value.manuscriptScale === "number" && [90, 100, 110, 120].includes(value.manuscriptScale) ? value.manuscriptScale : 100,
@@ -26,11 +26,17 @@ export function readAppearanceSettings(dataDir: string): AppearanceSettings {
 }
 
 export function writeAppearanceSettings(dataDir: string, input: Partial<AppearanceSettings>): AppearanceSettings {
-  if (input.uiFont !== undefined && !["builtin", "system"].includes(input.uiFont)) throw new DomainError(400, "INVALID_INPUT", "界面字体无效");
+  if (input.uiFont !== undefined && !["builtin", "wenkai", "neo", "sarasa", "system"].includes(input.uiFont)) throw new DomainError(400, "INVALID_INPUT", "界面字体无效");
   if (input.manuscriptFont !== undefined && !["builtin", "wenkai", "neo", "sarasa", "system"].includes(input.manuscriptFont)) throw new DomainError(400, "INVALID_INPUT", "正文字体无效");
   if (input.uiScale !== undefined && (typeof input.uiScale !== "number" || ![90, 100, 110, 120, 130].includes(input.uiScale))) throw new DomainError(400, "INVALID_INPUT", "界面字号无效");
   if (input.manuscriptScale !== undefined && (typeof input.manuscriptScale !== "number" || ![90, 100, 110, 120].includes(input.manuscriptScale))) throw new DomainError(400, "INVALID_INPUT", "正文字号无效");
-  const next = { ...readAppearanceSettings(dataDir), ...input };
+  const current = readAppearanceSettings(dataDir);
+  const next: AppearanceSettings = {
+    uiFont: input.uiFont ?? current.uiFont,
+    manuscriptFont: input.manuscriptFont ?? current.manuscriptFont,
+    uiScale: input.uiScale ?? current.uiScale,
+    manuscriptScale: input.manuscriptScale ?? current.manuscriptScale,
+  };
   mkdirSync(dataDir, { recursive: true });
   const path = resolve(dataDir, "appearance.json");
   const temporary = `${path}.tmp`;

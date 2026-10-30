@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { once } from "node:events";
@@ -20,7 +20,7 @@ async function start(server: Server): Promise<string> {
   return `http://127.0.0.1:${address.port}`;
 }
 
-test("appearance HTTP settings survive app restart and reject invalid UI and manuscript scales", async () => {
+test("appearance HTTP settings survive app restart and reject invalid UI fonts, manuscript fonts and scales", async () => {
   const directory = mkdtempSync(join(tmpdir(), "nova-appearance-http-"));
   const resources: Array<{ server: Server; db: Database.Database }> = [];
   async function open() {
@@ -47,7 +47,7 @@ test("appearance HTTP settings survive app restart and reject invalid UI and man
     const defaults = await fetch(`${first.base}/api/appearance`);
     assert.equal(defaults.status, 200, "GET must be reachable before the non-write route guard");
     assert.deepEqual(await defaults.json(), { uiFont: "builtin", manuscriptFont: "builtin", uiScale: 100, manuscriptScale: 100 });
-    const expected = { uiFont: "builtin", manuscriptFont: "neo", uiScale: 120, manuscriptScale: 110 };
+    const expected = { uiFont: "sarasa", manuscriptFont: "neo", uiScale: 120, manuscriptScale: 110 };
     const saved = await fetch(`${first.base}/api/appearance`, { method: "PUT", headers: { "Content-Type": "application/json", Origin: first.base }, body: JSON.stringify(expected) });
     assert.equal(saved.status, 200);
     assert.deepEqual(await saved.json(), expected);
@@ -67,7 +67,19 @@ test("appearance HTTP settings survive app restart and reject invalid UI and man
       assert.equal(invalid.status, 400);
       assert.equal((await invalid.json() as { error: { code: string } }).error.code, "INVALID_INPUT");
     }
+    for (const uiFont of ["songti", "", 42]) {
+      const invalid = await fetch(`${reopened.base}/api/appearance`, { method: "PUT", headers: { "Content-Type": "application/json", Origin: reopened.base }, body: JSON.stringify({ uiFont }) });
+      assert.equal(invalid.status, 400, `uiFont ${JSON.stringify(uiFont)} must be rejected`);
+      assert.equal((await invalid.json() as { error: { code: string } }).error.code, "INVALID_INPUT");
+    }
     assert.deepEqual(await (await fetch(`${reopened.base}/api/appearance`)).json(), expected, "rejected updates must preserve the persisted appearance");
+    await close(reopened);
+    writeFileSync(join(directory, "appearance.json"), JSON.stringify({ uiFont: "songti", manuscriptFont: "wenkai", uiScale: 110, manuscriptScale: 90, extra: "ignored" }), "utf8");
+    const legacy = await open();
+    assert.deepEqual(await (await fetch(`${legacy.base}/api/appearance`)).json(), { uiFont: "builtin", manuscriptFont: "wenkai", uiScale: 110, manuscriptScale: 90 }, "unknown stored uiFont must fall back to builtin");
+    const rewritten = await fetch(`${legacy.base}/api/appearance`, { method: "PUT", headers: { "Content-Type": "application/json", Origin: legacy.base }, body: JSON.stringify({ uiScale: 100 }) });
+    assert.equal(rewritten.status, 200);
+    assert.deepEqual(Object.keys(JSON.parse(readFileSync(join(directory, "appearance.json"), "utf8"))).sort(), ["manuscriptFont", "manuscriptScale", "uiFont", "uiScale"], "unknown request and legacy keys must not be persisted");
   } finally {
     try { for (const resource of resources) await close(resource); }
     finally {

@@ -213,9 +213,9 @@
 
 ### 6.1 内置开源字体
 
-- Inter：官方仓库 <https://github.com/rsms/inter>；许可证为 SIL Open Font License 1.1，全文随包保存于 `packages/web/public/fonts/INTER-LICENSE.txt`。用于英文、数字和界面辅助文字。
-- Noto Sans CJK：官方仓库 <https://github.com/notofonts/noto-cjk>；许可证为 SIL Open Font License 1.1，保存于 `NOTO-SANS-LICENSE.txt`。本机可变字体用于 UI。Noto Serif CJK 的许可文本仍随包保留，但不再作为默认或回退正文。
-- LXGW 文楷：官方仓库 <https://github.com/lxgw/LxgwWenKai>；许可证为 SIL Open Font License 1.1，保存于 `LXGW-LICENSE.txt`。默认正文优先使用本机 Medium（500），无 Medium 时回退到随包 Regular；不引用运行时 CDN，保留 Reserved Font Name 条款与许可文本。
+- Inter：官方仓库 <https://github.com/rsms/inter>；许可证为 SIL Open Font License 1.1，全文随包保存于 `packages/web/public/fonts/INTER-LICENSE.txt`。随包只有 Regular（400）静态字重，因此在 UI 字体栈中排在 Noto Sans CJK 之后，仅在缺失拉丁字形时兜底，不承担 500/600 字重。
+- Noto Sans CJK：官方仓库 <https://github.com/notofonts/noto-cjk>；许可证为 SIL Open Font License 1.1，保存于 `NOTO-SANS-LICENSE.txt`。本机可变字体（100–900）同时覆盖中文与拉丁，作为 UI 字体的首选，使 400/500/600 字重在两种文字上粗细一致。Noto Serif CJK 不随包分发。
+- LXGW 文楷：官方仓库 <https://github.com/lxgw/LxgwWenKai>；许可证为 SIL Open Font License 1.1，保存于 `LXGW-LICENSE.txt`。随包提供 Regular（400）与 Medium（500）两个字重文件（`lxgw-wenkai-regular.ttf`、`lxgw-wenkai-medium.ttf`），正文默认 Medium、可选 Regular；不引用运行时 CDN，保留 Reserved Font Name 条款与许可文本。
 
 ### 6.2 本机阅读字体（只引用，不再分发）
 
