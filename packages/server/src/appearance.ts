@@ -37,7 +37,7 @@ export function writeAppearanceSettings(dataDir: string, input: Partial<Appearan
     uiScale: input.uiScale ?? current.uiScale,
     manuscriptScale: input.manuscriptScale ?? current.manuscriptScale,
   };
-  mkdirSync(dataDir, { recursive: true });
+  mkdirSync(dataDir, { recursive: true, mode: 0o700 });
   const path = resolve(dataDir, "appearance.json");
   const temporary = `${path}.tmp`;
   writeFileSync(temporary, `${JSON.stringify(next, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });

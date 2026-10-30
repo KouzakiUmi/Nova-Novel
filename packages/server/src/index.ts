@@ -5,7 +5,7 @@ import { mkdir, readFile, stat } from "node:fs/promises";
 import { dirname, extname, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { GenerationRequest } from "@nova-novel/shared";
-import { createApp } from "./app.js";
+import { createApp, SECURITY_HEADERS } from "./app.js";
 import { VolcengineService } from "./agent/volcengine/service.js";
 import { DomainStore } from "./store.js";
 import { SqliteKnowledgeService, parseStoryOrderFromTime } from "./knowledge/index.js";
@@ -18,12 +18,12 @@ import { newId } from "./utils.js";
 const here = dirname(fileURLToPath(import.meta.url));
 const projectRoot = resolve(here, "../../..");
 const dataDir = resolve(process.env.NOVA_NOVEL_DATA_DIR ?? resolve(projectRoot, "data"));
-await mkdir(dataDir, { recursive: true });
+await mkdir(dataDir, { recursive: true, mode: 0o700 });
 
 const defaultDatabase = resolve(dataDir, "nova-novel.sqlite");
 const legacyDatabase = resolve(dataDir, "storyweave.sqlite");
 const databasePath = resolve(process.env.NOVA_NOVEL_DB_PATH ?? (!existsSync(defaultDatabase) && existsSync(legacyDatabase) ? legacyDatabase : defaultDatabase));
-await mkdir(dirname(databasePath), { recursive: true });
+await mkdir(dirname(databasePath), { recursive: true, mode: 0o700 });
 const db = new Database(databasePath);
 const store = new DomainStore(db);
 const knowledge = new SqliteKnowledgeService(db);
@@ -159,7 +159,7 @@ async function serveWeb(request: IncomingMessage, response: ServerResponse): Pro
   }
   try {
     const content = await readFile(file);
-    response.writeHead(200, { "Content-Type": mime[extname(file)] ?? "application/octet-stream", "X-Content-Type-Options": "nosniff", "Cache-Control": extname(file) === ".html" ? "no-cache" : "public, max-age=31536000, immutable" });
+    response.writeHead(200, { "Content-Type": mime[extname(file)] ?? "application/octet-stream", "X-Content-Type-Options": "nosniff", "Cache-Control": extname(file) === ".html" ? "no-cache" : "public, max-age=31536000, immutable", ...SECURITY_HEADERS });
     response.end(request.method === "HEAD" ? undefined : content);
   } catch {
     response.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
@@ -174,6 +174,11 @@ const server = createServer((request, response) => {
 
 server.requestTimeout = 660_000;
 server.headersTimeout = 30_000;
+// 安全生产基线：在 Electron 内（打包或 dev spawn 都会注入令牌）若令牌缺失，说明启动链路异常，
+// 此时所有请求会免认证，必须直接失败退出（fail-closed）。纯 Node dev 模式（无 Electron）仍允许裸跑调试。
+if (process.versions.electron && !process.env.NOVA_NOVEL_PAIR_TOKEN) {
+  throw new Error("NOVA_NOVEL_PAIR_TOKEN 缺失：打包环境必须注入配对令牌，服务拒绝以无认证状态启动");
+}
 const host = process.env.NOVA_NOVEL_HOST ?? "127.0.0.1";
 if (!["127.0.0.1", "localhost", "::1"].includes(host)) throw new Error("Nova Novel 仅允许监听本机回环地址");
 const port = Number(process.env.NOVA_NOVEL_PORT ?? 43110);

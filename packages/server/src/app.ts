@@ -19,8 +19,18 @@ export interface AppServices { store: DomainStore; knowledge: KnowledgeService; 
 const MAX_BODY_BYTES = 1_048_576;
 type Body = Record<string, unknown>;
 
+// 纵深防御：即便未来渲染层出现 XSS 疏漏，也挡住脚本执行、 framing 与跨源读取。
+// 前端模板无内联脚本（仅 type=module），故 script-src 可收紧为 'self'；
+// style-src-attr 放行 React 内联 style 属性，style-src 仍只限 'self'。
+export const SECURITY_HEADERS = {
+  "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'",
+  "X-Frame-Options": "DENY",
+  "Cross-Origin-Opener-Policy": "same-origin",
+  "Cross-Origin-Resource-Policy": "same-origin",
+} as const;
+
 function json(response: ServerResponse, status: number, value: unknown): void {
-  response.writeHead(status, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer" });
+  response.writeHead(status, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer", ...SECURITY_HEADERS });
   response.end(JSON.stringify(value));
 }
 function protectLoopback(request: IncomingMessage): void {

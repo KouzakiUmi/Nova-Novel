@@ -77,6 +77,34 @@ export function parseBackup(value: unknown): NovaBackup {
   for (const key of arrays) if (!Array.isArray(backup[key]) || (backup[key] as unknown[]).length > 20_000) throw new DomainError(400, "INVALID_BACKUP", `备份的 ${key} 无效或过大`);
   if (backup.workflows !== undefined && !Array.isArray(backup.workflows)) throw new DomainError(400, "INVALID_BACKUP", "备份的 workflows 无效");
   const scenes = backup.scenes as Array<Record<string, unknown>>;
-  if (scenes.length < 1 || scenes.length > 500 || scenes.some(scene => typeof scene.sceneId !== "string" || typeof scene.chapterId !== "string" || typeof scene.routeId !== "string" || typeof scene.title !== "string" || typeof scene.body !== "string")) throw new DomainError(400, "INVALID_BACKUP", "备份必须包含 1–500 个有效场景");
+  if (scenes.length < 1 || scenes.length > 500) throw new DomainError(400, "INVALID_BACKUP", "备份必须包含 1–500 个有效场景");
+  for (const [index, scene] of scenes.entries()) {
+    if (!scene || typeof scene !== "object") throw new DomainError(400, "INVALID_BACKUP", `场景 #${index + 1} 格式无效`);
+    const strKeys = ["sceneId", "chapterId", "routeId", "title", "body"];
+    for (const key of strKeys) if (typeof scene[key] !== "string") throw new DomainError(400, "INVALID_BACKUP", `场景 #${index + 1} 的 ${key} 无效`);
+    if (scene.pov !== undefined && typeof scene.pov !== "string") throw new DomainError(400, "INVALID_BACKUP", `场景 #${index + 1} 的 pov 无效`);
+    if (!Array.isArray(scene.entityIds)) throw new DomainError(400, "INVALID_BACKUP", `场景 #${index + 1} 的 entityIds 必须是数组`);
+    if (scene.entityIds.some(id => typeof id !== "string")) throw new DomainError(400, "INVALID_BACKUP", `场景 #${index + 1} 的 entityIds 含非法项`);
+  }
+  const elements = backup.elements as Array<Record<string, unknown>>;
+  for (const [index, entity] of elements.entries()) {
+    if (!entity || typeof entity !== "object") throw new DomainError(400, "INVALID_BACKUP", `元素 #${index + 1} 格式无效`);
+    if (typeof entity.entityId !== "string" || typeof entity.name !== "string") throw new DomainError(400, "INVALID_BACKUP", `元素 #${index + 1} 缺少 entityId 或 name`);
+    if (!Array.isArray(entity.aliases)) throw new DomainError(400, "INVALID_BACKUP", `元素 #${index + 1} 的 aliases 必须是数组`);
+    if (entity.aliases.some(alias => typeof alias !== "string")) throw new DomainError(400, "INVALID_BACKUP", `元素 #${index + 1} 的 aliases 含非法项`);
+  }
+  const facts = backup.facts as Array<Record<string, unknown>>;
+  for (const [index, fact] of facts.entries()) {
+    if (!fact || typeof fact !== "object") throw new DomainError(400, "INVALID_BACKUP", `事实 #${index + 1} 格式无效`);
+    if (typeof fact.subjectId !== "string") throw new DomainError(400, "INVALID_BACKUP", `事实 #${index + 1} 缺少 subjectId`);
+    if (!Array.isArray(fact.evidenceIds)) throw new DomainError(400, "INVALID_BACKUP", `事实 #${index + 1} 的 evidenceIds 必须是数组`);
+    if (fact.evidenceIds.some(id => typeof id !== "string")) throw new DomainError(400, "INVALID_BACKUP", `事实 #${index + 1} 的 evidenceIds 含非法项`);
+  }
+  const events = backup.events as Array<Record<string, unknown>>;
+  for (const [index, event] of events.entries()) {
+    if (!event || typeof event !== "object") throw new DomainError(400, "INVALID_BACKUP", `事件 #${index + 1} 格式无效`);
+    if (!Array.isArray(event.evidenceIds)) throw new DomainError(400, "INVALID_BACKUP", `事件 #${index + 1} 的 evidenceIds 必须是数组`);
+    if (event.evidenceIds.some(id => typeof id !== "string")) throw new DomainError(400, "INVALID_BACKUP", `事件 #${index + 1} 的 evidenceIds 含非法项`);
+  }
   return value as NovaBackup;
 }

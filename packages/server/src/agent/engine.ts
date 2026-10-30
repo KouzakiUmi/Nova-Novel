@@ -77,7 +77,7 @@ export class EmbeddedAgentHost implements PiHost {
       const prompt = checkPromptBudget(request, frozen, toolScope.isVisible, model, tools.map(tool => ({ name: tool.name, description: tool.description, parameters: tool.parameters })));
       const cwd = resolve(this.settings.agentDir, "workspace");
       const sessionDir = resolve(this.settings.agentDir, "sessions", request.projectId);
-      mkdirSync(sessionDir, { recursive: true });
+      mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
       const manager = SessionManager.create(cwd, sessionDir);
       sessionId = manager.getSessionId();
       const { session } = await createAgentSession({ cwd, agentDir: this.settings.agentDir, model, thinkingLevel: route.thinkingLevel, modelRuntime: runtime, resourceLoader: novelResourceLoader(), noTools: "builtin", tools: ["novel_*"], customTools: tools, sessionManager: manager, settingsManager: SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: true, maxRetries: 1 } }) });

@@ -47,9 +47,13 @@ Attackers the owner did **not** select (lower priority): malicious websites in t
 
 - Loopback-only listen (`index.ts` refuses non-loopback `NOVA_NOVEL_HOST`); pair token; Host/Origin/Sec-Fetch-Site checks.
 - Static serving path-traversal check (`serveWeb`, `startsWith(webRoot + sep)`), `nosniff`.
+- **Defense-in-depth response headers** (`app.ts` `SECURITY_HEADERS`, applied to API JSON and `serveWeb`): strict `Content-Security-Policy` (`default-src 'self'`, `script-src 'self'`, `object-src 'none'`, `frame-ancestors 'none'`, `base-uri 'self'`; `style-src-attr 'unsafe-inline'` only for React inline style), `X-Frame-Options: DENY`, `Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Resource-Policy: same-origin`. Front-end template has no inline scripts, so the policy is enforceable.
+- **Fail-closed pair token** (`index.ts`): inside the Electron runtime (`process.versions.electron`), if `NOVA_NOVEL_PAIR_TOKEN` is missing the server refuses to start rather than serving unauthenticated requests. Plain Node dev mode (no Electron) is still allowed to run without a token.
 - Agent: custom ResourceLoader (no extensions/skills/context files), no built-in coding tools, only 9 read-only `novel_*` tools bound to the frozen task scope.
 - Candidate text goes through ChangeSet + human review; decisions bound to task/artifact/text hash, idempotent `decisionId`.
 - Secrets files written with mode `0o600`; ArkCli raw output hidden on error; `execFile` without shell, absolute non-`.cmd/.bat` path required for `NOVA_NOVEL_ARKCLI_PATH`.
+- **Data directories created with mode `0o700`** (`index.ts`, `settings.ts`, `engine.ts`, `appearance.ts`): `%APPDATA%/Nova Novel` and its `agent/`, `agent/workspace/`, `agent/sessions/<projectId>/`, plus the SQLite parent dir, are not readable by other local users.
+- **Deep backup validation** (`transfer.ts` `parseBackup`): nested fields of scenes, elements, facts and events (e.g. `entity.aliases`, `fact.evidenceIds`, `scene.entityIds`) are type-asserted; a malformed backup returns a clear `INVALID_BACKUP` error instead of an uncaught exception / 500 that could leak internals.
 - Backups exclude provider settings, API keys, pair token and OAuth credentials; restore creates a new project with remapped IDs.
 - Electron renderer sandboxed, navigation and new windows blocked.
 
@@ -59,5 +63,5 @@ Attackers the owner did **not** select (lower priority): malicious websites in t
 
 ## Open questions
 
-- Is the app ever distributed to multi-user machines where `%APPDATA%` permissions matter? (Currently treated as low priority: other local users not selected as attackers.)
+- Is the app ever distributed to multi-user machines where `%APPDATA%` permissions matter? (Partially addressed: data directories are now created `0o700` and secret files `0o600`, reducing cross-user readability. Other local users remain out of scope as attackers; a shared machine still relies on OS account isolation.)
 - Auto-update / code-signing of the Windows installer is not covered by this model.

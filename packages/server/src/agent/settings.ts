@@ -78,7 +78,7 @@ export class AgentSettings {
   private oauthResults = new Map<string, OAuthStatusView>();
   private constructor(readonly dataDir: string) {
     this.agentDir = resolve(dataDir, "agent");
-    mkdirSync(resolve(this.agentDir, "workspace"), { recursive: true });
+    mkdirSync(resolve(this.agentDir, "workspace"), { recursive: true, mode: 0o700 });
     this.modelsPath = resolve(this.agentDir, "models.json");
     this.settingsPath = resolve(this.agentDir, "settings.json");
     try { this.data = existsSync(this.settingsPath) ? JSON.parse(readFileSync(this.settingsPath, "utf8")) as Settings : { providers: [], routes: TASK_KINDS.map(kind => ({ kind, thinkingLevel: defaults[kind] })) }; }
