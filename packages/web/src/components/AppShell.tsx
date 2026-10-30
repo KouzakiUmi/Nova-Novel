@@ -42,13 +42,14 @@ interface AppShellProps {
   onFocusMode: () => void;
   onOpenStart: () => void;
   onOpenScene: (sceneId: string) => void;
+  onOpenElement: (entityId: string) => void;
   onProjectChange: (projectId: string) => Promise<void>;
   onManageProjects: () => void;
   saveStatus: SaveStatus;
   children: ReactNode;
 }
 
-export function AppShell({ snapshot, view, onViewChange, focusMode, onFocusMode, onOpenStart, onOpenScene, onProjectChange, onManageProjects, saveStatus, children }: AppShellProps) {
+export function AppShell({ snapshot, view, onViewChange, focusMode, onFocusMode, onOpenStart, onOpenScene, onOpenElement, onProjectChange, onManageProjects, saveStatus, children }: AppShellProps) {
   const [commandOpen, setCommandOpen] = useState(false);
   const [commandQuery, setCommandQuery] = useState("");
   const commandRef = useRef<HTMLElement>(null);
@@ -137,7 +138,7 @@ export function AppShell({ snapshot, view, onViewChange, focusMode, onFocusMode,
       {commandOpen && (
         <div className="modal-backdrop" role="presentation" onMouseDown={() => setCommandOpen(false)}>
           <section ref={commandRef} className="command-palette" role="dialog" aria-modal="true" aria-label="搜索与跳转" onMouseDown={(event) => event.stopPropagation()}>
-            <div className="command-input"><Search size={18} /><input autoFocus value={commandQuery} onChange={(event) => setCommandQuery(event.target.value)} placeholder="搜索场景、元素，或输入要去的功能…" /><button className="icon-button" onClick={() => setCommandOpen(false)} aria-label="关闭"><X size={17} /></button></div>
+            <div className="command-input"><Search size={18} /><input autoFocus value={commandQuery} onChange={(event) => setCommandQuery(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.nativeEvent.isComposing && event.nativeEvent.keyCode !== 229) { event.preventDefault(); commandRef.current?.querySelector<HTMLButtonElement>(".command-result")?.click(); } }} placeholder="搜索场景、元素，或输入要去的功能…" /><button className="icon-button" onClick={() => setCommandOpen(false)} aria-label="关闭"><X size={17} /></button></div>
             <p className="command-label">快速前往</p>
             {navigation.filter((item) => `${item.label}${item.hint}`.includes(commandQuery)).map((item) => (
               <button key={item.id} className="command-result" onClick={() => { onViewChange(item.id); setCommandOpen(false); setCommandQuery(""); }}>
@@ -148,6 +149,12 @@ export function AppShell({ snapshot, view, onViewChange, focusMode, onFocusMode,
             {snapshot.scenes.filter((scene) => scene.title.includes(commandQuery)).slice(0, 4).map((scene) => (
               <button key={scene.sceneId} className="command-result" onClick={() => { onOpenScene(scene.sceneId); setCommandOpen(false); setCommandQuery(""); }}>
                 <PenLine size={17} /><span><strong>{scene.title}</strong><small>{scene.summary || "未写摘要"}</small></span><span>场景</span>
+              </button>
+            ))}
+            <p className="command-label">元素</p>
+            {snapshot.elements.filter((element) => `${element.name}${element.aliases.join("")}${element.summary}`.includes(commandQuery)).slice(0, 4).map((element) => (
+              <button key={element.entityId} className="command-result" onClick={() => { onOpenElement(element.entityId); setCommandOpen(false); setCommandQuery(""); }}>
+                <IconFacet size={17} /><span><strong>{element.name}</strong><small>{element.summary || "未写简介"}</small></span><span>元素</span>
               </button>
             ))}
           </section>

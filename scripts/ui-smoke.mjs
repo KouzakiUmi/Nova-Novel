@@ -87,7 +87,7 @@ await waitFor(`document.querySelector(".save-indicator")?.textContent.includes("
 // 4. 检查：报告单独展示，不提供“接受”。
 await clickText(".quick-actions button", "检查前后照应");
 await waitFor(`!!document.querySelector(".report-panel")`, "检查报告", 30000);
-results.reportHasAccept = await evaluate(`!!document.querySelector(".report-panel .button.primary")`);
+results.reportHasAccept = await evaluate(`[...document.querySelectorAll('.report-panel button')].some(button => /接受|采用|接到正文|替换选段/.test(button.textContent))`);
 results.reportIssues = await evaluate(`document.querySelectorAll(".report-panel .issue").length`);
 assert.equal(results.reportHasAccept, false, "报告不应有采用按钮");
 await shot("writing");

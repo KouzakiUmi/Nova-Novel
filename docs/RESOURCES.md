@@ -214,10 +214,15 @@
 ### 6.1 内置开源字体
 
 - Inter：官方仓库 <https://github.com/rsms/inter>；许可证为 SIL Open Font License 1.1，全文随包保存于 `packages/web/public/fonts/INTER-LICENSE.txt`。用于英文、数字和界面辅助文字。
-- Noto Sans CJK / Noto Serif CJK：官方仓库 <https://github.com/notofonts/noto-cjk>；许可证为 SIL Open Font License 1.1，分别保存于 `NOTO-SANS-LICENSE.txt` 与 `NOTO-SERIF-LICENSE.txt`。本机可变字体用于 UI 与正文。
-- LXGW 文楷：官方仓库 <https://github.com/lxgw/LxgwWenKai>；许可证为 SIL Open Font License 1.1，保存于 `LXGW-LICENSE.txt`。作为正文阅读字体选项。字体文件均随应用分发，不引用运行时 CDN，保留 Reserved Font Name 条款与许可文本。
+- Noto Sans CJK：官方仓库 <https://github.com/notofonts/noto-cjk>；许可证为 SIL Open Font License 1.1，保存于 `NOTO-SANS-LICENSE.txt`。本机可变字体用于 UI。Noto Serif CJK 的许可文本仍随包保留，但不再作为默认或回退正文。
+- LXGW 文楷：官方仓库 <https://github.com/lxgw/LxgwWenKai>；许可证为 SIL Open Font License 1.1，保存于 `LXGW-LICENSE.txt`。默认正文优先使用本机 Medium（500），无 Medium 时回退到随包 Regular；不引用运行时 CDN，保留 Reserved Font Name 条款与许可文本。
 
-### 6.2 模型写作初筛参考
+### 6.2 本机阅读字体（只引用，不再分发）
+
+- 本机已核实的内部 family 名称：`LXGW Neo XiHei Screen`（霞鹜新晰黑屏幕阅读版）与 `Sarasa UI SC`（更纱黑体 UI SC）。两者只在本机已安装时作为正文备选，缺省时回退到内置文楷或黑体，不复制字体文件到应用包。
+- 新晰黑字体内嵌许可指向 IPA Font License（<https://opensource.org/licenses/IPA/>）。更纱黑体仅按本机系统字体引用，不据此作再分发或许可断言。
+
+### 6.3 模型写作初筛参考
 
 - 2026-10-29 检索了 [Claude 写作模型比较](<https://www.inkfluenceai.com/blog/best-claude-model-for-writing-2026#1>)、[创意写作榜单汇总](<https://www.benchleader.com/benchmarks/lmarena_text_creative>)、[中文短篇科幻生成评估](<https://openurl.ebsco.com/EPDB%3Agcd%3A3%3A40695507/detailv2?sid=ebsco%3Aplink%3Aresult-item&id=ebsco%3Adoi%3A10.1093%2Fllc%2Ffqag078&bquery=AU%20Chen%2C%20Xing&page=1&link_origin=none&searchDescription=Chen%2C%20Xing&crl=f)和[中文剧本实测](<https://m.thepaper.cn/newsDetail_forward_34318871>)。
 - 采用方式：模型旁只显示“写作推荐 / 暂不优先”的初筛建议，并明确最终由作者的短场景试写决定。4.6、Gemini、DeepSeek 等作为优先试写方向；5.5 暂不优先，不把版本号当作质量排名。上述来源用于提供比较视角，不视为官方写作承诺，也不替代中文语料和兼容性测试。

@@ -57,7 +57,7 @@ function slug(text: string): string {
   return text.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40);
 }
 
-export function SettingsView({ onChanged, onToast }: { onChanged: () => void; onToast: (message: string) => void }) {
+export function SettingsView({ onChanged, onToast }: { onChanged: () => void; onToast: (message: string, tone?: "success" | "error") => void }) {
   const [settings, setSettings] = useState<AgentSettingsView | null>(null);
   const [error, setError] = useState("");
   const [editing, setEditing] = useState<{ mode: "create" | "edit"; draft: Draft; oauthProviderId?: string } | null>(null);
@@ -94,7 +94,7 @@ export function SettingsView({ onChanged, onToast }: { onChanged: () => void; on
     const seq = ++usageSeq.current;
     setUsageLoading(true);
     try { const result = await api.usageReports(refresh); if (seq === usageSeq.current) setUsage(result.reports); }
-    catch (cause) { if (seq === usageSeq.current) onToast(cause instanceof Error ? cause.message : "额度读取失败"); }
+    catch (cause) { if (seq === usageSeq.current) onToast(cause instanceof Error ? cause.message : "额度读取失败", "error"); }
     finally { if (seq === usageSeq.current) setUsageLoading(false); }
   }, [onToast]);
   useEffect(() => { void loadUsage(); }, [loadUsage]);
@@ -111,7 +111,7 @@ export function SettingsView({ onChanged, onToast }: { onChanged: () => void; on
       setOauthCode("");
       setOauth(await api.startOAuth(providerId));
     } catch (cause) {
-      onToast(cause instanceof Error ? cause.message : "OAuth 启动失败");
+      onToast(cause instanceof Error ? cause.message : "OAuth 启动失败", "error");
     }
   };
   const submitCode = async () => {
@@ -120,7 +120,7 @@ export function SettingsView({ onChanged, onToast }: { onChanged: () => void; on
       await api.submitOAuthCode(oauth.providerId, oauthCode.trim());
       setOauthCode("");
     } catch (cause) {
-      onToast(cause instanceof Error ? cause.message : "授权码提交失败");
+      onToast(cause instanceof Error ? cause.message : "授权码提交失败", "error");
     }
   };
   const cancelOAuth = async () => {
@@ -140,7 +140,7 @@ export function SettingsView({ onChanged, onToast }: { onChanged: () => void; on
       apply(await api.updateProvider(provider.providerId, { disabled: !provider.disabled }));
       onChanged(); void loadUsage(true);
       onToast(provider.disabled ? `已启用 ${provider.name}` : `已禁用 ${provider.name}，用量与路由不再使用它`);
-    } catch (cause) { onToast(cause instanceof Error ? cause.message : "状态更新失败"); }
+    } catch (cause) { onToast(cause instanceof Error ? cause.message : "状态更新失败", "error"); }
   };
 
   const enableDetected = async (candidate: AgentSettingsView["detectedProviders"][number]) => {
@@ -148,7 +148,7 @@ export function SettingsView({ onChanged, onToast }: { onChanged: () => void; on
     try {
       apply(await api.createProvider(`my-${preset.providerId}`, { name: preset.name, api: preset.api, baseUrl: preset.baseUrl, keySource: "environment", apiKeyEnv: candidate.apiKeyEnv, models: preset.models }));
       onChanged(); void loadUsage(true); onToast(`已启用 ${preset.name}`);
-    } catch (cause) { onToast(cause instanceof Error ? cause.message : "启用失败"); }
+    } catch (cause) { onToast(cause instanceof Error ? cause.message : "启用失败", "error"); }
   };
 
   const testProvider = async (providerId: string) => {
@@ -168,7 +168,7 @@ export function SettingsView({ onChanged, onToast }: { onChanged: () => void; on
       onChanged(); void loadUsage(true);
       onToast(`已删除 ${provider.name}`);
     } catch (cause) {
-      onToast(cause instanceof Error ? cause.message : "删除未完成");
+      onToast(cause instanceof Error ? cause.message : "删除未完成", "error");
     }
   };
 
@@ -178,7 +178,7 @@ export function SettingsView({ onChanged, onToast }: { onChanged: () => void; on
       onChanged();
       onToast("任务分配已保存");
     } catch (cause) {
-      onToast(cause instanceof Error ? cause.message : "保存未完成");
+      onToast(cause instanceof Error ? cause.message : "保存未完成", "error");
     }
   };
 
@@ -203,10 +203,10 @@ export function SettingsView({ onChanged, onToast }: { onChanged: () => void; on
   }
 
   const sectionTabs = <nav className="settings-section-tabs" aria-label="设置分类"><button className={section === "models" ? "active" : ""} onClick={() => setSection("models")}><IconCore size={16} />模型与服务</button><button className={section === "appearance" ? "active" : ""} onClick={() => setSection("appearance")}><Type size={16} />界面与字体</button></nav>;
-  if (section === "appearance") return <>{sectionTabs}<AppearanceView /></>;
+  if (section === "appearance") return <div className="settings-view">{sectionTabs}<AppearanceView /></div>;
 
   return (
-    <>{sectionTabs}<div className="settings-page page-scroll">
+    <div className="settings-view">{sectionTabs}<div className="settings-page page-scroll">
       <header className="page-toolbar">
         <div><p className="eyebrow">MODELS & SERVICES</p><h1>模型与服务</h1><p>接入你自己的模型服务，再为每类写作任务挑选合适的模型。作品始终保存在本机。</p></div>
         <div className="engine-chip"><IconCore size={20} /><div><strong>内置 Agent 引擎</strong><small>{settings.engine.name} {settings.engine.version} · 进程内运行，无需另装命令行</small></div></div>
@@ -311,7 +311,7 @@ export function SettingsView({ onChanged, onToast }: { onChanged: () => void; on
                         const level = picked && !picked.thinkingLevels.includes(route.thinkingLevel) ? picked.thinkingLevels.at(-1) ?? "off" : route.thinkingLevel;
                         updateRoute(kind, event.target.value && provider && modelId ? { provider, modelId, thinkingLevel: level } : { clearModel: true });
                       }}>
-                        <option value="">默认（第一个可用模型）</option>
+                        <option value="">默认（{availableModels[0] ? `${availableModels[0].provider} / ${availableModels[0].name}` : "第一个可用模型"}）</option>
                         {groupModels(availableModels).map(([group, models]) => <optgroup key={group} label={group}>{models.map((item) => <option key={`${item.provider}:${item.modelId}`} value={`${item.provider}\u0000${item.modelId}`}>{item.name}{costLabel(item)}</option>)}</optgroup>)}
                       </select>
                       <select aria-label={`${meta.label}的思考强度`} value={levels.includes(route.thinkingLevel) ? route.thinkingLevel : levels[0]} disabled={levels.length <= 1} onChange={(event) => updateRoute(kind, { thinkingLevel: event.target.value as ThinkingLevel })}>
@@ -344,7 +344,7 @@ export function SettingsView({ onChanged, onToast }: { onChanged: () => void; on
           </div>
         </aside>
       </div>
-    </div></>
+    </div></div>
   );
 }
 

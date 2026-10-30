@@ -20,7 +20,7 @@ async function start(server: Server): Promise<string> {
   return `http://127.0.0.1:${address.port}`;
 }
 
-test("appearance HTTP settings survive app restart and reject invalid manuscript scale", async () => {
+test("appearance HTTP settings survive app restart and reject invalid UI and manuscript scales", async () => {
   const directory = mkdtempSync(join(tmpdir(), "nova-appearance-http-"));
   const resources: Array<{ server: Server; db: Database.Database }> = [];
   async function open() {
@@ -46,8 +46,8 @@ test("appearance HTTP settings survive app restart and reject invalid manuscript
     const first = await open();
     const defaults = await fetch(`${first.base}/api/appearance`);
     assert.equal(defaults.status, 200, "GET must be reachable before the non-write route guard");
-    assert.deepEqual(await defaults.json(), { uiFont: "builtin", manuscriptFont: "builtin", manuscriptScale: 100 });
-    const expected = { uiFont: "builtin", manuscriptFont: "wenkai", manuscriptScale: 110 };
+    assert.deepEqual(await defaults.json(), { uiFont: "builtin", manuscriptFont: "builtin", uiScale: 100, manuscriptScale: 100 });
+    const expected = { uiFont: "builtin", manuscriptFont: "neo", uiScale: 120, manuscriptScale: 110 };
     const saved = await fetch(`${first.base}/api/appearance`, { method: "PUT", headers: { "Content-Type": "application/json", Origin: first.base }, body: JSON.stringify(expected) });
     assert.equal(saved.status, 200);
     assert.deepEqual(await saved.json(), expected);
@@ -59,6 +59,11 @@ test("appearance HTTP settings survive app restart and reject invalid manuscript
     assert.deepEqual(await restored.json(), expected);
     for (const manuscriptScale of [105, 0, "110"]) {
       const invalid = await fetch(`${reopened.base}/api/appearance`, { method: "PUT", headers: { "Content-Type": "application/json", Origin: reopened.base }, body: JSON.stringify({ manuscriptScale }) });
+      assert.equal(invalid.status, 400);
+      assert.equal((await invalid.json() as { error: { code: string } }).error.code, "INVALID_INPUT");
+    }
+    for (const uiScale of [105, 0, "120"]) {
+      const invalid = await fetch(`${reopened.base}/api/appearance`, { method: "PUT", headers: { "Content-Type": "application/json", Origin: reopened.base }, body: JSON.stringify({ uiScale }) });
       assert.equal(invalid.status, 400);
       assert.equal((await invalid.json() as { error: { code: string } }).error.code, "INVALID_INPUT");
     }

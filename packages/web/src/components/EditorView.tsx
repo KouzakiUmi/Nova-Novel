@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { EditorContent, getTextBetween, getTextSerializersFromSchema, useEditor, useEditorState, type Editor } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
-import type { ConsistencyReport, ExtractedLedgerBundle, GenerationProgress, GenerationReceipt, GenerationRequest, Scene, SceneFieldOption, SceneProposalCard, WorkspaceSnapshot } from "@nova-novel/shared";
+import type { AgentSettingsView, ConsistencyReport, ExtractedLedgerBundle, GenerationProgress, GenerationReceipt, GenerationRequest, Scene, SceneFieldOption, SceneProposalCard, WorkspaceSnapshot } from "@nova-novel/shared";
 import { countWords, recommendNextAction, type NextActionKind } from "@nova-novel/shared";
 import {
   AlignLeft,
@@ -40,6 +40,8 @@ import { IconCore } from "./icons";
 import { AnnotationPanel, type AnnotationDraftRange } from "./AnnotationPanel";
 import { RevisionPanel } from "./RevisionPanel";
 import { api } from "../lib/api";
+import { WritingModelPicker } from "./WritingModelPicker";
+import { readAppearance } from "../lib/appearance";
 
 interface GenerationHandle {
   receipt: Promise<GenerationReceipt>;
@@ -62,6 +64,8 @@ interface EditorViewProps {
   onOpenSettings: () => void;
   onChanged: () => Promise<unknown>;
   onRegisterFlush: (flush: (() => Promise<void>) | null) => void;
+  agentSettings: AgentSettingsView | null;
+  onSelectTaskModel: (kind: TaskKind, provider?: string, modelId?: string) => Promise<unknown>;
 }
 
 type TaskKind = GenerationRequest["kind"];
@@ -130,7 +134,7 @@ type SceneWritingIntent = keyof typeof SCENE_INTENTS;
 
 const SCENE_REVIEW_INTENT = "复盘当前场景，不改正文：开头人物追求什么或面对什么问题；结尾正文实际发生了什么结果或状态变化；若继续写下一场，人物可以作出什么决定。只依据正文明确支持的内容，不为迎合结构公式强造灾难、反转或变化。把正文未交代的因果与变化标为 unknown，把可选的表达建议标为 aesthetic，并在 summary 里用普通语言概括“结果与可能的下一步”。";
 
-export function EditorView({ snapshot, scene, localDraft, focusMode, onSelectScene, onDirty, onSave, onGenerate, onProgress, onCancel, onOpenElement, onOpenReview, onOpenSettings, onChanged, onRegisterFlush }: EditorViewProps) {
+export function EditorView({ snapshot, scene, localDraft, focusMode, onSelectScene, onDirty, onSave, onGenerate, onProgress, onCancel, onOpenElement, onOpenReview, onOpenSettings, onChanged, onRegisterFlush, agentSettings, onSelectTaskModel }: EditorViewProps) {
   const [body, setBody] = useState(localDraft ?? scene.body);
   const [saveState, setSaveState] = useState<"saved" | "dirty" | "saving" | "error">(localDraft === undefined ? "saved" : "error");
   const [assistantTab, setAssistantTab] = useState<"assistant" | "context" | "scene" | "annotations" | "revision">("assistant");
@@ -159,6 +163,7 @@ export function EditorView({ snapshot, scene, localDraft, focusMode, onSelectSce
   // 只表示尚未被任何一次保存请求捕获的修改，避免重复提交已在途的内容。
   const unsavedChangesRef = useRef(false);
   const aiReady = snapshot.connection.state === "connected";
+  const manuscriptSize = 17 * readAppearance().manuscriptScale / 100;
   const activeSceneIntent = SCENE_INTENTS[sceneIntent];
   const nextAction = recommendNextAction({ hasBody: Boolean(body.trim()), hasPlan: Boolean((scene.goal ?? "").trim() || scene.summary.trim()), outcome: outcome ? outcome.type === "report" ? "report" : "candidate" : null, stale: outcome && outcome.type !== "report" ? outcome.stale : false, lastAction });
 
@@ -618,7 +623,7 @@ export function EditorView({ snapshot, scene, localDraft, focusMode, onSelectSce
           <div className="selection-toolbar"><Highlighter size={14} /><span>已选 {countWords(editorState.selectedText)} 字</span><button onClick={() => polishSelection("tighten")}>推敲表达</button><button onClick={() => polishSelection("expand")}>扩写</button><button onClick={checkSelection}>检查</button><button onClick={() => void createAnnotationDraft()}>批注</button></div>
         )}
 
-        <div className="editor-bottom-bar"><span>{wordCount.toLocaleString("zh-CN")} 字</span><span>正文 18px · 行距 1.9</span><span className="editor-bottom-spacer" /><button onClick={onOpenReview}><CircleAlert size={13} />{snapshot.facts.some((fact) => fact.reviewState === "candidate") ? "有待确认变化" : "暂无待确认变化"}</button></div>
+        <div className="editor-bottom-bar"><span>{wordCount.toLocaleString("zh-CN")} 字</span><span>正文 {Number(manuscriptSize.toFixed(1))}px · 行距 2</span><span className="editor-bottom-spacer" /><button onClick={onOpenReview}><CircleAlert size={13} />{snapshot.facts.some((fact) => fact.reviewState === "candidate") ? "有待确认变化" : "暂无待确认变化"}</button></div>
       </main>
 
       {rightOpen && !focusMode && (
@@ -630,6 +635,7 @@ export function EditorView({ snapshot, scene, localDraft, focusMode, onSelectSce
               {!aiReady && (
                 <button className="setup-callout" onClick={onOpenSettings}><IconCore size={18} /><span><strong>接入一个模型</strong><small>添加 provider 后即可续写、推敲和检查</small></span><ArrowRight size={14} /></button>
               )}
+              {aiReady && <WritingModelPicker settings={agentSettings} onSelect={onSelectTaskModel} onOpenSettings={onOpenSettings} />}
               <section className="next-action-bar" aria-label="建议的下一步"><div><span>下一步</span><strong>{nextAction.title}</strong><p>{nextAction.reason}</p></div><button className="button secondary small" disabled={Boolean(running) && nextAction.kind !== "review-candidate" && nextAction.kind !== "compare"} onClick={() => performNextAction(nextAction.kind)}>{nextAction.buttonLabel}<ArrowRight size={13} /></button></section>
               <div className="writing-intent-picker" role="group" aria-label="选择本场写作意图">{(Object.keys(SCENE_INTENTS) as SceneWritingIntent[]).map((intent) => <button key={intent} className={sceneIntent === intent ? "active" : ""} onClick={() => setSceneIntent(intent)}>{SCENE_INTENTS[intent].label}</button>)}</div>
               <p className="writing-intent-hint">{activeSceneIntent.hint} · 只影响本次生成，不给场景贴永久标签</p>
@@ -771,11 +777,13 @@ export function ScenePanel({ scene, onSave }: { scene: Scene; onSave: (scene: Sc
   const [brainstormBusy, setBrainstormBusy] = useState<"goal" | "conflict" | "summary" | null>(null);
   const [brainstormTarget, setBrainstormTarget] = useState<"goal" | "conflict" | "summary">("conflict");
   const [brainstormOptions, setBrainstormOptions] = useState<SceneFieldOption[]>([]);
+  const [brainstormError, setBrainstormError] = useState("");
   const update = (setter: (value: string) => void, value: string) => { setter(value); setSaved(false); };
   const runBrainstorm = (target: "goal" | "conflict" | "summary") => {
     if (brainstormBusy) return;
     setBrainstormBusy(target);
     setBrainstormTarget(target);
+    setBrainstormError("");
     void api
       .plotIdeate({
         projectId: scene.projectId,
@@ -784,7 +792,7 @@ export function ScenePanel({ scene, onSave }: { scene: Scene; onSave: (scene: Sc
         fieldTarget: target,
       })
       .then((res) => setBrainstormOptions(res.fieldOptions ?? []))
-      .catch(() => setBrainstormOptions([]))
+      .catch((cause) => { setBrainstormOptions([]); setBrainstormError(cause instanceof Error ? cause.message : "AI 场景建议未完成，请重试"); })
       .finally(() => setBrainstormBusy(null));
   };
   const applyBrainstorm = (val: string) => {
@@ -801,6 +809,7 @@ export function ScenePanel({ scene, onSave }: { scene: Scene; onSave: (scene: Sc
         <div><p><b>目标</b>{goal.trim() || "尚未决定"}</p><i>→</i><p><b>阻碍</b>{conflict.trim() || "尚未决定"}</p><i>→</i><p><b>结果 / 变化</b>{change.trim() || "尚未决定"}</p></div>
         <small>用来检查计划的因果连接，不给正文评分。</small>
       </div>
+      {brainstormError && <p className="inline-note error" role="alert">{brainstormError}</p>}
       {brainstormOptions.length > 0 && (
         <div className="note-composer" style={{ marginBottom: 10 }} aria-label="场景字段AI急救候选">
           <div className="note-composer-heading">

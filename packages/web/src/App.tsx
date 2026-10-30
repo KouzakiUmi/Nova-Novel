@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
+  AgentSettingsView,
   AuthoringSelection,
   GenerationProgress,
   GenerationReceipt,
   GenerationRequest,
   Scene,
   SelectionAction,
+  TaskKind,
   WorkspaceSnapshot,
 } from "@nova-novel/shared";
 import { api, ApiError } from "./lib/api";
@@ -39,6 +41,10 @@ export function App() {
   const [selectedElementId, setSelectedElementId] = useState<string>("");
   const [error, setError] = useState("");
   const [toast, setToast] = useState("");
+  const [toastTone, setToastTone] = useState<"success" | "error">("success");
+  const [agentSettings, setAgentSettings] = useState<AgentSettingsView | null>(null);
+  const agentSettingsRef = useRef<AgentSettingsView | null>(null);
+  const routeSave = useRef<Promise<unknown>>(Promise.resolve());
   const [busy, setBusy] = useState(false);
   const [focusMode, setFocusMode] = useState(false);
   const [guideOpen, setGuideOpen] = useState(false);
@@ -48,6 +54,10 @@ export function App() {
   const draftsRef = useRef(new Map<string, { scene: Scene; state: SaveStatus; message: string }>());
   const [drafts, setDrafts] = useState([...draftsRef.current.entries()]);
   const [retryPreview, setRetryPreview] = useState<{ key: string; draft: Scene; latest: Scene; head: string } | null>(null);
+  const notify = useCallback((message: string, tone: "success" | "error" = "success") => {
+    setToastTone(tone);
+    setToast(message);
+  }, []);
   const draftKey = (scene: Scene) => `${scene.projectId}:${scene.sceneId}`;
   const publishDrafts = useCallback(() => {
     const entries = [...draftsRef.current.entries()];
@@ -108,6 +118,17 @@ export function App() {
     void refresh();
   }, [refresh]);
 
+  const refreshAgentSettings = useCallback(async () => {
+    await routeSave.current.catch(() => undefined);
+    const next = await api.agentSettings();
+    agentSettingsRef.current = next;
+    setAgentSettings(next);
+    routeSave.current = Promise.resolve();
+    return next;
+  }, []);
+
+  useEffect(() => { void refreshAgentSettings().catch(() => undefined); }, [refreshAgentSettings]);
+
   useEffect(() => {
     if (!toast) return;
     const timer = window.setTimeout(() => setToast(""), 3600);
@@ -123,15 +144,15 @@ export function App() {
     setBusy(true);
     try {
       await action();
-      if (success) setToast(success);
+      if (success) notify(success);
       setError("");
     } catch (cause) {
-      setToast(cause instanceof Error ? cause.message : "操作未完成，请稍后重试");
+      notify(cause instanceof Error ? cause.message : "操作未完成，请稍后重试", "error");
       if (propagate) throw cause;
     } finally {
       setBusy(false);
     }
-  }, []);
+  }, [notify]);
 
   const flushPending = useCallback(async () => {
     if (flushEditorRef.current) await flushEditorRef.current();
@@ -156,7 +177,7 @@ export function App() {
   const activateProject = useCallback(async (projectId: string) => {
     const seq = ++projectSeq.current;
     refreshSeq.current += 1;
-    try { await flushPending(); } catch (cause) { setToast(cause instanceof Error ? `本地草稿已保留：${cause.message}` : "未保存的正文已保留为本地草稿"); }
+    try { await flushPending(); } catch (cause) { notify(cause instanceof Error ? `本地草稿已保留：${cause.message}` : "未保存的正文已保留为本地草稿", "error"); }
     if (seq !== projectSeq.current) return;
     projectIdRef.current = projectId;
     const token = beginSnapshot(projectId);
@@ -172,7 +193,7 @@ export function App() {
     setSelectedElementId(next.elements[0]?.entityId ?? "");
     setGuideOpen(false);
     setWorkflowGuideOpen(false);
-  }, [beginSnapshot, commitSnapshot, flushPending]);
+  }, [beginSnapshot, commitSnapshot, flushPending, notify]);
 
   const createProject = useCallback(async (input: NewProjectInput) => {
     await flushPending();
@@ -239,9 +260,9 @@ export function App() {
     const seq = saveSeq.current;
     if (activation === projectSeq.current && projectIdRef.current === scene.projectId) {
       const token = beginSnapshot(scene.projectId);
-      void api.bootstrap(scene.projectId).then((next) => { if (seq === saveSeq.current) commitSnapshot(next, token); }).catch(cause => setToast(cause instanceof Error ? `正文已保存，作品信息暂未刷新：${cause.message}` : "正文已保存，作品信息暂未刷新"));
+      void api.bootstrap(scene.projectId).then((next) => { if (seq === saveSeq.current) commitSnapshot(next, token); }).catch(cause => notify(cause instanceof Error ? `正文已保存，作品信息暂未刷新：${cause.message}` : "正文已保存，作品信息暂未刷新", "error"));
     }
-  }, [beginSnapshot, commitSnapshot, publishDrafts]);
+  }, [beginSnapshot, commitSnapshot, publishDrafts, notify]);
 
   const retryDraft = async (key: string) => {
     const draft = draftsRef.current.get(key);
@@ -261,12 +282,29 @@ export function App() {
     if (draft?.scene !== retryPreview.draft || draft.state === "saving") throw new Error("草稿已变化，请重新读取最新版本。");
     headsRef.current.set(draft.scene.projectId, retryPreview.head);
     setRetryPreview(null);
-    await handleSaveScene({ ...retryPreview.latest, body: draft.scene.body }, true);
+    await handleSaveScene({ ...draft.scene, baseRevisionId: retryPreview.head }, true);
   };
 
   const handleGenerate = useCallback((request: GenerationRequest): GenerationHandle => {
     const idempotencyKey = request.idempotencyKey;
-    return { idempotencyKey, receipt: api.generate(request) };
+    return { idempotencyKey, receipt: (async () => { await flushPending(); await routeSave.current; return api.generate(request); })() };
+  }, [flushPending]);
+
+  const selectTaskModel = useCallback((kind: TaskKind, provider?: string, modelId?: string) => {
+    const current = agentSettingsRef.current;
+    if (!current) return Promise.reject(new Error("模型设置尚未读取完成，请稍后重试。"));
+    const routes = current.routes.map(route => {
+      if (route.kind !== kind) return route;
+      const { provider: _provider, modelId: _modelId, ...rest } = route;
+      return provider && modelId ? { ...rest, provider, modelId } : rest;
+    });
+    const task = routeSave.current.then(() => api.saveRoutes(routes), () => api.saveRoutes(routes));
+    routeSave.current = task;
+    return task.then(next => {
+      agentSettingsRef.current = next;
+      setAgentSettings(next);
+      return next;
+    });
   }, []);
 
   const pollProgress = useCallback((idempotencyKey: string): Promise<GenerationProgress> => api.progress(idempotencyKey), []);
@@ -333,6 +371,7 @@ export function App() {
       onFocusMode={() => setFocusMode((value) => !value)}
       onOpenStart={() => setView("start")}
       onOpenScene={openScene}
+      onOpenElement={(entityId) => { setSelectedElementId(entityId); setView("elements"); }}
       onProjectChange={(projectId) => run(() => activateProject(projectId), "已打开作品")}
       onManageProjects={() => setProjectManagerOpen(true)}
       saveStatus={saveStatus}
@@ -348,7 +387,7 @@ export function App() {
               <details><summary>查看本地草稿</summary><textarea readOnly aria-label={`${draft.scene.title}的本地草稿`} value={draft.scene.body} /></details>
               {retryPreview?.key === key && retryPreview.draft === draft.scene && (
                 <div>
-                  <p>将本地草稿保存到“{retryPreview.latest.title}”，替代这场的最新正文。最新正文仍可在历史版本中查看。</p>
+                  <p>将本地草稿保存到“{retryPreview.latest.title}”，替代这场的最新正文与场景卡字段。当前版本仍可在历史版本中查看。</p>
                   <details><summary>比较最新正文</summary><textarea readOnly aria-label="待比较的最新正文" value={retryPreview.latest.body} /></details>
                   <button className="button secondary small" disabled={busy} onClick={() => void run(confirmRetry)}>确认保存本地草稿</button>
                   <button className="button ghost small" onClick={() => setRetryPreview(null)}>取消</button>
@@ -405,7 +444,7 @@ export function App() {
             try {
               await handleSaveScene(scene);
             } catch (cause) {
-              setToast(cause instanceof Error ? `尚未保存：${cause.message}` : "尚未保存，请重试");
+              notify(cause instanceof Error ? `尚未保存：${cause.message}` : "尚未保存，请重试", "error");
               throw cause;
             }
           }}
@@ -420,6 +459,8 @@ export function App() {
           onOpenSettings={() => setView("settings")}
           onChanged={refresh}
           onRegisterFlush={registerEditorFlush}
+          agentSettings={agentSettings}
+          onSelectTaskModel={selectTaskModel}
         />
       )}
       {view === "story" && (
@@ -492,11 +533,11 @@ export function App() {
           onOpenScene={openScene}
         />
       )}
-      {view === "settings" && <SettingsView onChanged={() => void refresh()} onToast={setToast} />}
+      {view === "settings" && <SettingsView onChanged={() => { void refresh(); void refreshAgentSettings().catch(() => undefined); }} onToast={notify} />}
       {projectManagerOpen && <ProjectManagerDialog snapshot={snapshot} onClose={() => setProjectManagerOpen(false)} onActivate={activateProject} onBeforeWrite={flushPending} />}
       {guideOpen && <GuidedOutlineDialog projectId={snapshot.activeProject.projectId} {...(snapshot.guide ? { session: snapshot.guide } : {})} aiReady={snapshot.connection.state === "connected"} onChanged={async () => { await refresh(); }} onClose={() => setGuideOpen(false)} onOpenSettings={() => { setGuideOpen(false); setView("settings"); }} />}
       {workflowGuideOpen && <GuidedWorkflowDialog projectId={snapshot.activeProject.projectId} {...(snapshot.workflowGuide ? { session: snapshot.workflowGuide } : {})} aiReady={snapshot.connection.state === "connected"} onChanged={async () => { await refresh(); }} onClose={() => setWorkflowGuideOpen(false)} onOpenSettings={() => { setWorkflowGuideOpen(false); setView("settings"); }} />}
-      {toast && <Toast message={toast} onClose={() => setToast("")} />}
+      {toast && <Toast message={toast} tone={toastTone} onClose={() => setToast("")} />}
       {error && <button className="offline-banner" onClick={() => void refresh()}>{error} · 点击重连</button>}
     </AppShell>
   );

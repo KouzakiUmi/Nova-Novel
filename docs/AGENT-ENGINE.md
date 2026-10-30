@@ -83,7 +83,9 @@ Pi 目录给出 provider/model 元数据，Nova 另为每个可单 API Key 使�
 
 ## 4. 任务路由
 
-`TaskRoute` 由 `kind`、`provider/modelId`、`thinkingLevel` 组成。默认思考强度：ideas `low`、rehearsal `low`、scene `medium`、polish `low`、consistency `high`、guide `low`；实际取值不超过模型支持的档位（非推理模型为 `off`）。任务没有配置模型时，退回第一个可用模型。完全没有可用模型时，连接状态为 `unconfigured`，生成返回明确的“请先在设置中添加模型”错误；写作、保存和版本功能不受影响。
+`TaskRoute` 由 `kind`、`provider/modelId`、`thinkingLevel` 组成。默认思考强度：ideas `low`、rehearsal `low`、scene `medium`、polish `low`、consistency `high`、guide `low`；实际取值不超过模型支持的档位（非推理模型为 `off`）。任务没有配置模型时，退回第一个可用模型，设置页和写作助手都显示该默认模型的实际名称。完全没有可用模型时，连接状态为 `unconfigured`，生成返回明确的“请先在设置中添加模型”错误；写作、保存和版本功能不受影响。
+
+写作助手可为续写、推敲/扩写、检查/复盘直接切换模型；选择仍写入对应 `TaskRoute`，不是另一套临时路由。模型分配与正文共用生成前等待队列，路由保存未完成或失败时不会发起生成；在设置页重新成功保存后可继续。
 
 全流程 AI 协助子任务默认**复用现有 6 类路由槽位**，不增加用户的模型配置负担：`element_design`（角色/世界观/秘密快速共创）与 `note_incubate`（便签孵化）复用 `ideas`；`element_design`（问答引导模式）、`arc_assist`（人物弧线推演与诊断）与 `plot_ideate`（局部情节推演）复用 `guide`；`extract_ledger`（正文反向抽取元素与状态事件）复用 `consistency`。
 

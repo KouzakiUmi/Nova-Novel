@@ -27,7 +27,7 @@ export function WorkflowView({ snapshot, scene, onRun, onDecide, onCancelRun, on
   const [showAllRuns, setShowAllRuns] = useState(false);
   const [reviewRunId, setReviewRunId] = useState<string | null>(null);
   const [checked, setChecked] = useState<string | null>(null);
-  const [nodeInspectorOpen, setNodeInspectorOpen] = useState(false);
+  const [nodeInspectorOpen, setNodeInspectorOpen] = useState(() => window.matchMedia("(min-width: 1051px)").matches);
   const definition = snapshot.workflows.find((workflow) => workflow.workflowVersionId === selectedId) ?? snapshot.workflows[0];
   const runs = snapshot.workflowRuns.filter((run) => run.workflowVersionId === definition?.workflowVersionId);
   const selectedNode = definition?.nodes.find((node) => node.id === selectedNodeId) ?? definition?.nodes[0];
@@ -80,7 +80,7 @@ export function WorkflowView({ snapshot, scene, onRun, onDecide, onCancelRun, on
         <div className="segmented-control compact"><button className={mode === "canvas" ? "active" : ""} onClick={() => setMode("canvas")}>画布</button><button className={mode === "list" ? "active" : ""} onClick={() => setMode("list")}>列表模式</button></div>
       </div>
       {checked && <p className="workflow-check-note"><ShieldCheck size={13} />{checked}<button className="icon-button" onClick={() => setChecked(null)} aria-label="关闭"><X size={13} /></button></p>}
-      <div className="workflow-workspace">
+      <div className={`workflow-workspace ${nodeInspectorOpen ? "" : "node-inspector-closed"}`}>
         <aside className="node-library">
           <div className="pane-heading"><span>节点与产物</span><Badge>{definition.nodes.length}</Badge></div>
           <div className="element-search"><Search size={14} /><input placeholder="查找节点" value={nodeQuery} onChange={(event) => setNodeQuery(event.target.value)} aria-label="查找节点" /></div>

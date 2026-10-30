@@ -35,7 +35,8 @@ export function StoryCanvas({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [note, setNote] = useState("");
-  const [inspectorOpen, setInspectorOpen] = useState(false);
+  const [inspectorOpen, setInspectorOpen] = useState(() => window.matchMedia("(min-width: 1051px)").matches);
+  const [outlineOpen, setOutlineOpen] = useState(false);
 
   // AI 局部情节推演状态
   const [ideateOpen, setIdeateOpen] = useState(false);
@@ -273,6 +274,10 @@ export function StoryCanvas({
               时间轴
             </button>
           </div>
+          <button className="button ghost small outline-toggle" onClick={() => setOutlineOpen(open => !open)}>
+            <LayoutList size={14} />
+            {outlineOpen ? "收起故事结构" : "故事结构"}
+          </button>
           <button className="button ghost small" onClick={() => setInspectorOpen((open) => !open)}>
             <Scan size={14} />
             {inspectorOpen ? "收起检查器" : "场景检查器"}
@@ -496,8 +501,8 @@ export function StoryCanvas({
         </section>
       )}
 
-      <div className="canvas-workspace">
-        <aside className="canvas-outline">
+      <div className={`canvas-workspace ${inspectorOpen ? "" : "inspector-closed"}`}>
+        <aside className={`canvas-outline ${outlineOpen ? "outline-open" : ""}`}>
           <div className="pane-heading">
             <span>故事结构</span>
             <Badge>{snapshot.scenes.length}</Badge>
@@ -565,7 +570,7 @@ export function StoryCanvas({
                   <button
                     key={scene.sceneId}
                     className={scene.sceneId === activeSceneId ? "active" : ""}
-                    onClick={() => setActiveSceneId(scene.sceneId)}
+                    onClick={() => { setActiveSceneId(scene.sceneId); setOutlineOpen(false); }}
                   >
                     <span>{String(scene.narrationOrder).padStart(2, "0")}</span>
                     {scene.title}
@@ -669,7 +674,7 @@ export function StoryCanvas({
               <p className="eyebrow">SCENE {String(activeScene.narrationOrder).padStart(2, "0")}</p>
               <h2>{activeScene.title}</h2>
               <div className="inspector-tags">
-                <Badge tone="green">{activeScene.status === "review" ? "待审阅" : "写作中"}</Badge>
+                <Badge tone="green">{activeScene.status === "final" ? "已定稿" : activeScene.status === "review" ? "待审阅" : activeScene.status === "planned" ? "已有计划" : activeScene.status === "draft" ? "草稿" : "写作中"}</Badge>
                 <Badge>{activeScene.pov ?? "视角待定"}</Badge>
               </div>
               <p className="inspector-summary">

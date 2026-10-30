@@ -1,13 +1,13 @@
-import { CheckCircle2, X } from "lucide-react";
+import { CheckCircle2, CircleAlert, X } from "lucide-react";
 
 export function Badge({ children, tone = "neutral" }: { children: React.ReactNode; tone?: "neutral" | "violet" | "green" | "amber" | "red" }) {
   return <span className={`badge ${tone}`}>{children}</span>;
 }
 
-export function Toast({ message, onClose }: { message: string; onClose: () => void }) {
+export function Toast({ message, tone = "success", onClose }: { message: string; tone?: "success" | "error"; onClose: () => void }) {
   return (
-    <div className="toast" role="status">
-      <CheckCircle2 size={17} aria-hidden="true" />
+    <div className={`toast ${tone === "error" ? "error" : ""}`} role={tone === "error" ? "alert" : "status"}>
+      {tone === "error" ? <CircleAlert size={17} aria-hidden="true" /> : <CheckCircle2 size={17} aria-hidden="true" />}
       <span>{message}</span>
       <button onClick={onClose} aria-label="关闭提示"><X size={15} /></button>
     </div>
