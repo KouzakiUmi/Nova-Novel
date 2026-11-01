@@ -140,6 +140,8 @@ export const api = {
     request<ManuscriptPreview>("/api/import/analyze", { method: "POST", body: JSON.stringify(input) }),
   importProject: (input: { title: string; premise?: string; text?: string; chapters?: ImportedChapterDraft[] }) =>
     request<{ project: WorkspaceSnapshot["activeProject"]; revision: Revision; snapshot: WorkspaceSnapshot }>("/api/import", { method: "POST", body: JSON.stringify(input) }),
+  importAppend: (input: { projectId: string; baseRevisionId: string; chapters: ImportedChapterDraft[] }) =>
+    request<{ revision: Revision; snapshot: WorkspaceSnapshot }>("/api/import/append", { method: "POST", body: JSON.stringify(input) }),
   restoreBackup: (backup: unknown) =>
     request<{ project: WorkspaceSnapshot["activeProject"]; revision: Revision; warnings: string[]; snapshot: WorkspaceSnapshot }>("/api/import/backup", { method: "POST", body: JSON.stringify({ backup }) }),
   updateProject: (projectId: string, patch: { title?: string; archived?: boolean }) =>

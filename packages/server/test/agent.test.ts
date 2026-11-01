@@ -206,7 +206,10 @@ test("OAuth login exposes only interaction events and accepts a manual code", as
 
 test("thinking levels follow model reasoning and explicit unsupported levels", () => {
   assert.deepEqual(thinkingLevels({ reasoning: false }), ["off"]);
-  assert.deepEqual(thinkingLevels({ reasoning: true, thinkingLevelMap: { low: null, xhigh: "extra", max: null } }), ["off", "minimal", "medium", "high", "xhigh"]);
+  assert.deepEqual(thinkingLevels({ reasoning: true, thinkingLevelMap: { low: null, xhigh: "extra", max: null } }), ["medium", "high", "xhigh"]);
+  assert.deepEqual(thinkingLevels({ reasoning: true, thinkingLevelMap: { off: "off", minimal: "minimal" } }), ["off", "minimal", "low", "medium", "high"]);
+  assert.deepEqual(thinkingLevels({ reasoning: true }), ["low", "medium", "high"], "未声明映射的思考模型从 low 起，不允许关闭");
+  assert.equal(clampThinking("off", thinkingLevels({ reasoning: true })), "low");
   assert.equal(clampThinking("max", ["off", "low", "high"]), "high");
 });
 

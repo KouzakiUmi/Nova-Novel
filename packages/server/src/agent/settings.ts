@@ -55,7 +55,11 @@ function validateCompat(input: ProviderCompat | undefined): ProviderCompat | und
 }
 export function thinkingLevels(model: { reasoning: boolean; thinkingLevelMap?: Partial<Record<ThinkingLevel, unknown>> }): ThinkingLevel[] {
   if (!model.reasoning) return ["off"];
-  return THINKING_LEVELS.filter(level => model.thinkingLevelMap?.[level] !== null && (THINKING_LEVELS.indexOf(level) <= 4 || model.thinkingLevelMap?.[level] !== undefined));
+  return THINKING_LEVELS.filter(level => {
+    // off / minimal 只在模型元数据显式声明时可选；未声明的思考模型一律从 low 起，避免强制思考模型被分配“关闭”。
+    if (level === "off" || level === "minimal") return model.thinkingLevelMap?.[level] != null;
+    return model.thinkingLevelMap?.[level] !== null && (THINKING_LEVELS.indexOf(level) <= 4 || model.thinkingLevelMap?.[level] !== undefined);
+  });
 }
 export function clampThinking(level: ThinkingLevel, supported: ThinkingLevel[]): ThinkingLevel {
   return [...supported].reverse().find(item => THINKING_LEVELS.indexOf(item) <= THINKING_LEVELS.indexOf(level)) ?? supported[0] ?? "off";

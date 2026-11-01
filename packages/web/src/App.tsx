@@ -549,15 +549,24 @@ export function App() {
           busy={busy}
           onCancel={() => setImportOpen(false)}
           onImport={async (input) => {
-            let created = false;
+            let created: { projectId: string; title: string; headRevisionId: string } | null = null;
             await run(async () => {
               await flushPending();
               const result = await api.importProject({ title: input.title, premise: "导入已有小说", chapters: input.chapters });
               await activateProject(result.project.projectId);
               setView("write");
-              created = true;
+              created = { projectId: result.project.projectId, title: result.project.title, headRevisionId: result.revision.revisionId };
             }, `已按 ${input.chapters.length} 个章节导入新作品`);
             return created;
+          }}
+          onAppend={async (input) => {
+            let appended: { headRevisionId: string } | null = null;
+            await run(async () => {
+              const result = await api.importAppend(input);
+              await refresh(input.projectId);
+              appended = { headRevisionId: result.revision.revisionId };
+            }, `已追加 ${input.chapters.length} 个章节`);
+            return appended;
           }}
         />
       )}

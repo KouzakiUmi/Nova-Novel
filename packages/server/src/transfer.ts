@@ -7,13 +7,14 @@ const NUM = "0-9零一二三四五六七八九十百千万两";
 const CHAPTER_RE = new RegExp(`^第[${NUM}]+[章卷](?![节回])`);
 const SCENE_RE = new RegExp(`^第[${NUM}]+[节场](?![话])`);
 const EN_CHAPTER_RE = /^chapter\s+\d+\b/i;
+const ABBREV_CHAPTER_RE = /^ch(?:apter)?[.\-_\s]?\d+\b/i;
 const SPECIAL_CHAPTER_RE = /^(楔子|序章|序言|尾声|后记|番外)($|[ 　:：\-—])/;
 const MAX_TITLE_LINE = 60;
 
 function isChapterHeading(line: string): boolean {
   const text = line.trim();
   if (!text || text.length > MAX_TITLE_LINE || /[。！？；]$/.test(text)) return false;
-  return CHAPTER_RE.test(text) || EN_CHAPTER_RE.test(text) || SPECIAL_CHAPTER_RE.test(text);
+  return CHAPTER_RE.test(text) || EN_CHAPTER_RE.test(text) || ABBREV_CHAPTER_RE.test(text) || SPECIAL_CHAPTER_RE.test(text);
 }
 function isSceneHeading(line: string): boolean {
   const text = line.trim();
@@ -87,10 +88,13 @@ export function summarizeManuscript(chapters: ImportedChapterDraft[], aiUsed: bo
 }
 
 export interface HeadingCandidate { line: number; text: string; before: string; after: string }
-/** 宽松收集疑似标题行供模型判断；只有这些行允许被 AI 选为章节边界。 */
+/** 宽松收集疑似标题行供模型判断；只有这些行允许被 AI 选为章节边界。
+ *  高置信标题行（第X章/ch-XX/Chapter N 等）全量保留，避免长书后半部分被截出候选；
+ *  仅靠空行与长度推测的宽松候选限制数量，控制提示规模。 */
 export function headingCandidates(input: string): HeadingCandidate[] {
   const lines = input.replace(/\r\n?/g, "\n").split("\n");
-  const candidates: HeadingCandidate[] = [];
+  const strong: HeadingCandidate[] = [];
+  const loose: HeadingCandidate[] = [];
   const excerpt = (index: number, direction: -1 | 1): string => {
     const parts: string[] = [];
     for (let i = index + direction; i >= 0 && i < lines.length && parts.join("").length < 60; i += direction) {
@@ -103,13 +107,12 @@ export function headingCandidates(input: string): HeadingCandidate[] {
   for (let index = 0; index < lines.length; index += 1) {
     const text = lines[index]!.trim();
     if (!text || text.length > 40 || isSeparator(text)) continue;
-    const likely = isChapterHeading(text) || isSceneHeading(text) || text.startsWith("#");
+    const candidate = { line: index, text, before: excerpt(index, -1), after: excerpt(index, 1) };
+    if (isChapterHeading(text) || isSceneHeading(text) || text.startsWith("#")) { if (strong.length < 2000) strong.push(candidate); continue; }
     const blankAround = (index === 0 || !lines[index - 1]!.trim()) && (index === lines.length - 1 || !lines[index + 1]!.trim());
-    if (!likely && !(blankAround && text.length <= 24 && !/[。！？；，、]$/.test(text))) continue;
-    candidates.push({ line: index, text, before: excerpt(index, -1), after: excerpt(index, 1) });
-    if (candidates.length >= 400) break;
+    if (blankAround && text.length <= 24 && !/[。！？；，、]$/.test(text)) loose.push(candidate);
   }
-  return candidates;
+  return [...strong, ...loose.slice(0, 400)].sort((a, b) => a.line - b.line);
 }
 
 export interface HeadingDecision { line: number; level: "chapter" | "scene"; title?: string }

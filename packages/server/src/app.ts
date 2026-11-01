@@ -52,8 +52,18 @@ function protectLoopback(request: IncomingMessage): void {
   if (request.headers["sec-fetch-site"] === "cross-site") throw new DomainError(403, "INVALID_ORIGIN", "不允许跨站请求");
   if (request.headers["transfer-encoding"] && request.headers["content-length"]) throw new DomainError(400, "INVALID_BODY", "请求长度不明确");
 }
-async function body(request: IncomingMessage, maxBytes = MAX_BODY_BYTES): Promise<Body> {
-  const contentType = request.headers["content-type"]?.split(";")[0]?.trim().toLowerCase();
+function parseImportChapters(value: unknown): ImportedChapterDraft[] {
+  if (!Array.isArray(value)) throw new DomainError(400, "INVALID_INPUT", "chapters 必须是数组");
+  return value.map((chapter: ImportedChapterDraft) => ({
+    title: requiredString(chapter?.title, "章节标题", 200),
+    scenes: Array.isArray(chapter?.scenes) ? chapter.scenes.map(scene => ({
+      title: requiredString(scene?.title || "未命名场景", "场景标题", 200),
+      body: requiredString(scene?.body ?? "", "场景正文", 1_000_000),
+      ...(typeof scene?.summary === "string" ? { summary: scene.summary } : {}),
+    })) : [],
+  }));
+}
+async function body(request: IncomingMessage, maxBytes = MAX_BODY_BYTES): Promise<Body> {  const contentType = request.headers["content-type"]?.split(";")[0]?.trim().toLowerCase();
   if (contentType !== undefined && contentType !== "application/json") throw new DomainError(415, "JSON_REQUIRED", "请使用 application/json");
   const declared = request.headers["content-length"];
   if (declared && (!/^\d+$/.test(declared) || Number(declared) > maxBytes)) throw new DomainError(413, "BODY_TOO_LARGE", "请求正文超过允许大小");
@@ -266,12 +276,17 @@ export function createApp({ store, knowledge, workflow, pi, guide, workflowGuide
       json(response, 200, summarizeManuscript(fallback, aiUsed, warnings)); return;
     }
     if (path === "/api/import" && method === "POST") {
-      const chapters = Array.isArray(input.chapters)
-        ? (input.chapters as ImportedChapterDraft[]).map(chapter => ({ title: requiredString(chapter.title, "章节标题", 200), scenes: Array.isArray(chapter.scenes) ? chapter.scenes.map(scene => ({ title: requiredString(scene.title || "未命名场景", "场景标题", 200), body: requiredString(scene.body ?? "", "场景正文", 1_000_000), ...(typeof scene.summary === "string" ? { summary: scene.summary } : {}) })) : [] }))
-        : parseManuscript(requiredString(input.text, "text", 1_000_000)).chapters;
+      const chapters = Array.isArray(input.chapters) ? parseImportChapters(input.chapters) : parseManuscript(requiredString(input.text, "text", 1_000_000)).chapters;
       const imported = store.importProject({ ...(typeof input.title === "string" ? { title: input.title } : {}), ...(typeof input.premise === "string" ? { premise: input.premise } : {}), chapters });
       indexRevision(imported.project.projectId, imported.revision.revisionId);
       json(response, 201, { ...imported, snapshot: snapshot(imported.project.projectId) }); return;
+    }
+    if (path === "/api/import/append" && method === "POST") {
+      const projectId = requiredString(input.projectId, "projectId");
+      const baseRevisionId = requiredString(input.baseRevisionId, "baseRevisionId");
+      const result = store.appendImportedChapters({ projectId, baseRevisionId, chapters: parseImportChapters(input.chapters) });
+      indexRevision(projectId, result.revision.revisionId);
+      json(response, 201, { ...result, snapshot: snapshot(projectId) }); return;
     }
     const arcRoute = path.match(/^\/api\/character-arcs\/([^/]+)$/);
     if (arcRoute && method === "PUT") { json(response, 200, { arc: store.saveCharacterArc(arcRoute[1]!, { motivation: typeof input.motivation === "string" ? input.motivation : "", goal: typeof input.goal === "string" ? input.goal : "", conflict: typeof input.conflict === "string" ? input.conflict : "", epiphany: typeof input.epiphany === "string" ? input.epiphany : "", notes: typeof input.notes === "string" ? input.notes : "" }) }); return; }

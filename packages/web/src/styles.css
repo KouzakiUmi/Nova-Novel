@@ -827,6 +827,10 @@ kbd { font-family: inherit; font-size: calc(13px * var(--ui-scale)); color: var(
 .import-chapter-list > li > ul { margin: 8px 0 0; padding: 7px 0 0 8px; list-style: none; border-top: 1px dashed var(--line); display: flex; flex-direction: column; gap: 4px; }
 .import-chapter-list > li > ul > li { display: flex; align-items: center; justify-content: space-between; gap: 10px; color: var(--ink-soft); font-size: calc(13px * var(--ui-scale)); }
 .import-chapter-list small { color: var(--faint); }
+.import-chapter-list > li.abnormal { border-color: #d9b98a; background: #fbf6ec; }
+.import-continue-panel { padding: 16px; border: 1px solid var(--line); border-radius: 6px; background: #faf9f4; }
+.import-continue-panel p { margin: 8px 0 14px; color: var(--muted); font-size: calc(13px * var(--ui-scale)); line-height: 1.7; }
+.import-dialog .inline-note .text-button { margin-left: 10px; }
 .guided-outline-dialog { width: min(900px, calc(100vw - 60px)); max-height: 84vh; display: flex; flex-direction: column; border: 1px solid var(--line-strong); border-radius: 10px; background: var(--white); box-shadow: 0 24px 80px rgb(20 25 20 / 25%); overflow: hidden; }
 .guided-outline-dialog > header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; padding: 20px 22px 14px; border-bottom: 1px solid var(--line); }
 .guided-outline-dialog > header .eyebrow { margin-bottom: 5px; }

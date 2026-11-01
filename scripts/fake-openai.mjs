@@ -17,11 +17,15 @@ function guideInput(body) {
 
 function reply(body) {
   const system = (body.messages ?? []).map((message) => typeof message.content === "string" ? message.content : JSON.stringify(message.content)).join("\n");
-  // 导入协助：把提示里的候选标题行全部标为 chapter，验证 AI 分章链路。
+  // 导入协助：模拟模型只认出前几个标题，长书后半部分会堆积，用于验证分批落盘与继续分。
   const importPrompt = (body.messages ?? []).filter(message => message.role === "user").map(message => typeof message.content === "string" ? message.content : "").join("\n");
   if (importPrompt.includes("你在整理一部小说原稿的章节结构")) {
-    const decisions = [...importPrompt.matchAll(/^#(\d+) \| ([^|]+) \|/gm)].map(match => ({ line: Number(match[1]), level: "chapter", title: match[2].trim() }));
-    return JSON.stringify(decisions);
+    // 模拟模型只认出前几个真标题（正文短行不选），长书后半部分堆积，用于验证分批落盘与继续分。
+    const titleLike = /^(第[0-9零一二三四五六七八九十百千万两]+[章卷]|ch(?:apter)?[.\-_\s]?\d+|chapter\s+\d+|楔子|序章|尾声|番外)/i;
+    const decisions = [...importPrompt.matchAll(/^#(\d+) \| ([^|]+) \|/gm)]
+      .filter(match => titleLike.test(match[2].trim()))
+      .map(match => ({ line: Number(match[1]), level: "chapter", title: match[2].trim() }));
+    return JSON.stringify(importPrompt.includes("第1章 开始") ? decisions.slice(0, 3) : decisions);
   }
   const guide = guideInput(body);
   if (guide.schema === 'nova-novel.workflow-guide/1') {

@@ -64,6 +64,37 @@ test("chapter-like sentences inside prose are not treated as headings", () => {
   assert.ok(parsed.chapters[0]?.scenes[0]?.body.includes("第三章里那句没说完的话"));
 });
 
+test("abbreviated ch-XX headings split and strong candidates survive loose cap", () => {
+  const text = "第1章 开始\n\n正文一\n\nch-18 战后的休整\n\n正文二\n\nch.19 新的旅程\n\n正文三";
+  const parsed = parseManuscript(text);
+  assert.equal(parsed.chapters.length, 3);
+  assert.equal(parsed.chapters[1]?.title, "ch-18 战后的休整");
+  assert.equal(parsed.chapters[2]?.scenes[0]?.body, "正文三");
+  const longBook = Array.from({ length: 200 }, (_, i) => `ch-${i + 1}\n\n短句${i}\n\n${"正文。".repeat(20)}`).join("\n\n");
+  const candidates = headingCandidates(longBook);
+  const headings = candidates.filter(candidate => candidate.text.startsWith("ch-"));
+  assert.equal(headings.length, 200, "全部 ch-XX 标题都在候选中");
+  const sliced = sliceManuscript(longBook, headings.map(candidate => ({ line: candidate.line, level: "chapter" as const })));
+  assert.equal(sliced?.length, 200, "长书后半部分同样可分章");
+});
+
+test("append imported chapters extends the same project with CAS protection", () => {
+  const db = new Database(":memory:");
+  try {
+    const store = new DomainStore(db);
+    const imported = store.importProject({ title: "分批导入", chapters: parseManuscript("第1章 开始\n\n正文一").chapters });
+    const head = imported.revision.revisionId;
+    const appended = store.appendImportedChapters({ projectId: imported.project.projectId, baseRevisionId: head, chapters: parseManuscript("第2章 继续\n\n正文二").chapters });
+    assert.equal(store.listChapters(imported.project.projectId).length, 2);
+    assert.equal(store.listScenes(imported.project.projectId).length, 2);
+    assert.equal(store.listScenes(imported.project.projectId)[1]?.narrationOrder, 2);
+    assert.equal(store.listRevisions(imported.project.projectId).length, 2);
+    assert.throws(() => store.appendImportedChapters({ projectId: imported.project.projectId, baseRevisionId: head, chapters: parseManuscript("第3章 冲突\n\n正文三").chapters }), /已改变/);
+    assert.equal(store.listChapters(imported.project.projectId).length, 2, "过期批次不会写入");
+    assert.ok(appended.revision.revisionId);
+  } finally { db.close(); }
+});
+
 test("AI decisions slice original text and ignore hallucinated line numbers", async () => {
   const text = "雨夜\n\n阿禾收铺。\n\n旧收据\n\n柜台底下卡着一张收据。";
   const candidates = headingCandidates(text);

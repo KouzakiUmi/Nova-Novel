@@ -450,6 +450,33 @@ export class DomainStore {
       return { project, revision };
     })();
   }
+  /** 分批导入的后续批次：在同一作品当前分支头追加章节，CAS 防止与编辑冲突。 */
+  appendImportedChapters(input: { projectId: string; baseRevisionId: string; chapters: { title: string; scenes: ImportedScene[] }[] }): { revision: Revision } {
+    const totalScenes = Array.isArray(input.chapters) ? input.chapters.reduce((sum, chapter) => sum + chapter.scenes.length, 0) : 0;
+    if (!Array.isArray(input.chapters) || input.chapters.length < 1 || totalScenes < 1 || totalScenes > 500) throw new DomainError(400, "INVALID_INPUT", "追加导入必须包含 1–500 个场景");
+    return this.db.transaction(() => {
+      const branch = this.projectBranch(input.projectId);
+      if (branch.headRevisionId !== input.baseRevisionId) this.conflict(branch.branchId);
+      const source = this.getManifest(branch.headRevisionId);
+      const routeId = this.getProject(input.projectId).activeRouteId;
+      const chapters = [...source.chapters];
+      const scenes = [...source.scenes];
+      for (const item of input.chapters) {
+        const chapterId = newId("chapter");
+        chapters.push({ chapterId, projectId: input.projectId, title: requiredString(item.title || `第 ${chapters.length + 1} 章`, "章节标题", 200), order: Math.max(0, ...chapters.map(chapter => chapter.order)) + 1 });
+        for (const scene of item.scenes) {
+          scenes.push({ sceneId: newId("scene"), projectId: input.projectId, chapterId, title: requiredString(scene.title || `第 ${scenes.length + 1} 场`, "场景标题", 200), summary: scene.summary ?? "", body: scene.body, status: scene.body.trim() ? "writing" : "planned", narrationOrder: scenes.length + 1, routeId, entityIds: [], baseRevisionId: "", updatedAt: now() });
+        }
+      }
+      const added = scenes.slice(source.scenes.length);
+      const storyGraph = { ...source.storyGraph, nodes: [...source.storyGraph.nodes, ...added.map((scene, index) => ({ id: scene.sceneId, kind: "scene" as const, sceneId: scene.sceneId, title: scene.title, summary: scene.summary, position: { x: 80 + (source.scenes.length + index) * 220, y: 120 } }))] };
+      const revision: Revision = { revisionId: newId("revision"), projectId: input.projectId, branchId: branch.branchId, parentRevisionIds: [branch.headRevisionId], name: "追加导入章节", kind: "named", createdAt: now(), wordCount: scenes.reduce((sum, scene) => sum + countWords(scene.body), 0) };
+      this.writeRevision(revision, { ...source, chapters, scenes, storyGraph });
+      if (this.db.prepare("UPDATE branches SET head_revision_id=? WHERE branch_id=? AND project_id=? AND head_revision_id=?").run(revision.revisionId, branch.branchId, input.projectId, input.baseRevisionId).changes !== 1) this.conflict(branch.branchId);
+      this.emit("project.imported", { projectId: input.projectId, revisionId: revision.revisionId });
+      return { revision };
+    })();
+  }
   duplicateProject(projectId: string): { project: Project; revision: Revision } {
     const source = this.getProject(projectId);
     const sourceBranch = this.projectBranch(projectId);
