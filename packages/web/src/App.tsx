@@ -568,6 +568,8 @@ export function App() {
             }, `已追加 ${input.chapters.length} 个章节`);
             return appended;
           }}
+          onProjectCreated={async (projectId) => { await activateProject(projectId); setView("write"); }}
+          onRefresh={refresh}
         />
       )}
       {guideOpen && <GuidedOutlineDialog projectId={snapshot.activeProject.projectId} {...(snapshot.guide ? { session: snapshot.guide } : {})} aiReady={snapshot.connection.state === "connected"} onChanged={async () => { await refresh(); }} onClose={() => setGuideOpen(false)} onOpenSettings={() => { setGuideOpen(false); setView("settings"); }} />}

@@ -1,13 +1,14 @@
 import { mkdirSync } from "node:fs";
 import { resolve } from "node:path";
 import { createAgentSession, createExtensionRuntime, SessionManager, SettingsManager, VERSION, type AgentSession, type ResourceLoader } from "@earendil-works/pi-coding-agent";
-import type { GenerationProgress, ImportedChapterDraft, PiConnection, ProviderApi, ProviderTestResult } from "@nova-novel/shared";
+import type { GenerationProgress, ImportedChapterDraft, IngestPlan, PiConnection, ProviderApi, ProviderTestResult } from "@nova-novel/shared";
 import type { KnowledgeService, PiGenerationInput, PiGenerationResult, PiHost } from "../contracts.js";
 import type { DomainStore } from "../store.js";
 import { DomainError } from "../domain.js";
 import { AgentSettings, secretOf } from "./settings.js";
 import { AgentUsageService } from "./usage.js";
 import { assistManuscript } from "./import-assist.js";
+import { planManuscriptIngest } from "./ingest-planner.js";
 import type { VolcengineService } from "./volcengine/service.js";
 import { checkPromptBudget, NOVEL_SYSTEM_PROMPT, parseOutput } from "./prompts.js";
 import { novelTools, type WorkflowCatalog } from "./tools.js";
@@ -155,6 +156,26 @@ export class EmbeddedAgentHost implements PiHost {
         complete: async (prompt) => {
           const response = await this.settings.runtime.completeSimple(model, { messages: [{ role: "user", content: prompt, timestamp: Date.now() }] }, { signal: controller.signal, maxTokens: 4096 });
           if (["error", "aborted"].includes(response.stopReason)) throw new Error("import assist failed");
+          return response.content.filter(block => block.type === "text").map(block => block.text).join("");
+        },
+      });
+    } catch { return null; }
+    finally { clearTimeout(timer); }
+  }
+  /** 导入预处理总控：判定结构并给出处理方案与标题模式，复用 guide 路由。 */
+  async planIngest(text: string, chapters: ImportedChapterDraft[]): Promise<IngestPlan | null> {
+    if (this.closed) return null;
+    const route = this.settings.route("guide");
+    if (!route.model) return null;
+    const model = this.settings.runtime.getModel(route.model.provider, route.model.modelId);
+    if (!model) return null;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 90_000);
+    try {
+      return await planManuscriptIngest(text, chapters, {
+        complete: async (prompt) => {
+          const response = await this.settings.runtime.completeSimple(model, { messages: [{ role: "user", content: prompt, timestamp: Date.now() }] }, { signal: controller.signal, maxTokens: 4096 });
+          if (["error", "aborted"].includes(response.stopReason)) throw new Error("ingest plan failed");
           return response.content.filter(block => block.type === "text").map(block => block.text).join("");
         },
       });

@@ -27,6 +27,18 @@ function reply(body) {
       .map(match => ({ line: Number(match[1]), level: "chapter", title: match[2].trim() }));
     return JSON.stringify(importPrompt.includes("第1章 开始") ? decisions.slice(0, 3) : decisions);
   }
+  // 导入预处理：返回结构判定与两个处理方案。
+  const plannerPrompt = (body.messages ?? []).filter(message => message.role === "user").map(message => typeof message.content === "string" ? message.content : "").join("\n");
+  if (plannerPrompt.includes("你是小说创作应用的导入总控")) {
+    return JSON.stringify({
+      analysis: "这是一部带目录与番外的长篇小说，章节以 Markdown 三级标题标记。",
+      chapterPattern: "^第\\d+章",
+      options: [
+        { id: "fast", title: "仅分章入库", detail: "只整理章节正文，不额外调用模型。", steps: ["本地分章", "确认入库"], estimatedCalls: 0, extract: false },
+        { id: "standard", title: "分章 + 知识提取", detail: "逐场提取人物/设定、人物关系与状态事件，统一审阅后入库。", steps: ["分章", "逐场提取", "统一审阅"], estimatedCalls: 2, recommended: true, extract: true },
+      ],
+    });
+  }
   const guide = guideInput(body);
   if (guide.schema === 'nova-novel.workflow-guide/1') {
     const guideStep = guide.stepId;
@@ -318,7 +330,7 @@ function reply(body) {
   }
   if (guide.schema === 'nova-novel.extract-ledger/1') {
     const userMsg = (body.messages ?? []).findLast((m) => m.role === "user")?.content ?? "";
-    const textContent = typeof userMsg === "string" ? userMsg : JSON.stringify(userMsg);
+    const textContent = typeof userMsg === "string" ? userMsg : Array.isArray(userMsg) ? userMsg.filter(block => block?.type === "text").map(block => block.text).join("\n") : JSON.stringify(userMsg);
     const bodySection = textContent.split("【当前正文】\n")[1]?.split("\n\n【选区】")[0] ?? "";
     const firstParagraph = bodySection.split(/\n{2,}/).map((s) => s.trim()).filter(Boolean)[0] ?? "那张旧收据夹在铁盒最底下";
     return JSON.stringify({
@@ -329,6 +341,14 @@ function reply(body) {
           name: "铁盒",
           aliases: ["旧铁盒"],
           summary: "柜台底下存放旧收据的铁盒。",
+          quote: firstParagraph,
+        },
+        {
+          proposalId: "ne-2",
+          type: "item",
+          name: "旧收据",
+          aliases: [],
+          summary: "已付待取的修鞋收据。",
           quote: firstParagraph,
         },
       ],

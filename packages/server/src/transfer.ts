@@ -8,17 +8,22 @@ const CHAPTER_RE = new RegExp(`^第[${NUM}]+[章卷](?![节回])`);
 const SCENE_RE = new RegExp(`^第[${NUM}]+[节场](?![话])`);
 const EN_CHAPTER_RE = /^chapter\s+\d+\b/i;
 const ABBREV_CHAPTER_RE = /^ch(?:apter)?[.\-_\s]?\d+\b/i;
-const SPECIAL_CHAPTER_RE = /^(楔子|序章|序言|尾声|后记|番外)($|[ 　:：\-—])/;
+const SPECIAL_CHAPTER_RE = /^(?:(?:楔子|序章|序言|尾声|后记)(?:$|[ 　:：\-—·])|番外[0-9零一二三四五六七八九十]*(?:$|[ 　:：\-—·]))/;
 const MAX_TITLE_LINE = 60;
+const MD_HEADING_RE = /^#{1,6}\s+/;
 
+function cleanHeadingLine(line: string): string {
+  // 统一全角数字，去掉成对包裹：【第14章】、[ch-18] 与 第14章 / ch-18 同等处理。
+  return line.trim().replace(/[０-９]/g, digit => String(digit.charCodeAt(0) - 0xff10)).replace(/^[【\[]+|[】\]]+$/g, "").trim();
+}
 function isChapterHeading(line: string): boolean {
-  const text = line.trim();
-  if (!text || text.length > MAX_TITLE_LINE || /[。！？；]$/.test(text)) return false;
+  const text = cleanHeadingLine(line);
+  if (!text || text.length > MAX_TITLE_LINE) return false;
   return CHAPTER_RE.test(text) || EN_CHAPTER_RE.test(text) || ABBREV_CHAPTER_RE.test(text) || SPECIAL_CHAPTER_RE.test(text);
 }
 function isSceneHeading(line: string): boolean {
-  const text = line.trim();
-  if (!text || text.length > MAX_TITLE_LINE || /[。！？；]$/.test(text)) return false;
+  const text = cleanHeadingLine(line);
+  if (!text || text.length > MAX_TITLE_LINE) return false;
   return SCENE_RE.test(text);
 }
 function isSeparator(line: string): boolean {
@@ -26,7 +31,7 @@ function isSeparator(line: string): boolean {
   return text === "---" || text === "***" || text === "* * *";
 }
 
-/** 本地确定性分章：识别 Markdown 标记与常见中文/英文章节标题；正文保持原文。 */
+/** 本地确定性分章：Markdown 标题按内容判定层级，目录与元信息跳过，正文保持原文。 */
 export function parseManuscript(input: string): { chapters: ImportedChapterDraft[] } {
   if (typeof input !== "string" || input.length > 1_000_000) throw new DomainError(400, "INVALID_INPUT", "导入文本必须是文字且不超过 1 MiB");
   const lines = input.replace(/\r\n?/g, "\n").split("\n");
@@ -34,6 +39,8 @@ export function parseManuscript(input: string): { chapters: ImportedChapterDraft
   let chapter: ImportedChapterDraft = { title: "导入正文", scenes: [] };
   let sceneTitle = "第一场";
   let body: string[] = [];
+  let skippingToc = false;
+  let sawChapter = false;
   const pushScene = () => {
     const text = body.join("\n").trim();
     if (text) chapter.scenes.push({ title: sceneTitle, body: text });
@@ -45,28 +52,44 @@ export function parseManuscript(input: string): { chapters: ImportedChapterDraft
     chapter = { title: "", scenes: [] };
   };
   for (const line of lines) {
-    if (line.startsWith("# ") || isChapterHeading(line)) {
-      const title = line.startsWith("# ") ? line.slice(2).trim() : line.trim();
-      pushChapter();
-      chapter.title = title || `第 ${chapters.length + 1} 章`;
-      sceneTitle = "第一场";
+    const trimmed = line.trim();
+    if (MD_HEADING_RE.test(trimmed)) {
+      const title = cleanHeadingLine(trimmed.replace(MD_HEADING_RE, ""));
+      if (/^目录$/.test(title)) { pushScene(); skippingToc = true; continue; }
+      if (isChapterHeading(title)) {
+        skippingToc = false;
+        pushChapter();
+        chapter.title = title;
+        sceneTitle = "第一场";
+        sawChapter = true;
+        continue;
+      }
+      if (skippingToc) continue;
+      if (isSceneHeading(title)) { pushScene(); sceneTitle = title; continue; }
+      // 一级标题且尚未出现章节：兼容“# 书名 / # 第一章”的旧导出；其余分组标题不混入正文。
+      if (/^#\s+/.test(trimmed) && !sawChapter) { pushChapter(); chapter.title = title; sceneTitle = "第一场"; continue; }
       continue;
     }
-    if (line.startsWith("## ") || isSceneHeading(line)) {
-      pushScene();
-      sceneTitle = line.startsWith("## ") ? line.slice(3).trim() : line.trim();
-      sceneTitle ||= `第 ${chapter.scenes.length + 1} 场`;
-      continue;
-    }
+    if (skippingToc) continue;
+    if (isChapterHeading(line)) { pushChapter(); chapter.title = cleanHeadingLine(line); sceneTitle = "第一场"; sawChapter = true; continue; }
+    if (isSceneHeading(line)) { pushScene(); sceneTitle = cleanHeadingLine(line); continue; }
     if (isSeparator(line)) { pushScene(); sceneTitle = `第 ${chapter.scenes.length + 1} 场`; continue; }
-    if (line.startsWith("> ")) continue;
+    if (trimmed.startsWith("> ") || trimmed.startsWith("<a ")) continue;
+    // 导出工具的书目元信息（- 作者：…）只出现在正文开始前，不作为小说内容。
+    if (!sawChapter && !chapters.some(item => item.scenes.length > 0) && /^[-*]\s+[^：:]+\s*[：:]/.test(trimmed)) continue;
     body.push(line);
   }
   pushChapter();
-  // 开头没有章标题时保留“导入正文”章；标题下的空章不产生占位内容。
-  const filled = chapters.filter(item => item.scenes.length > 0);
+  let filled = chapters.filter(item => item.scenes.length > 0);
+  if (filled.length < 2) {
+    // 无编号、无 Markdown 的书：以“上下空行的独立短行”推断章节结构。
+    const loose = looseHeadingCandidates(input).filter((candidate, index, all) => index === 0 || candidate.line - all[index - 1]!.line >= 4);
+    if (loose.length >= 3) {
+      const sliced = sliceManuscript(input, loose.map(candidate => ({ line: candidate.line, level: "chapter" as const })));
+      if (sliced && sliced.length >= 2) filled = sliced;
+    }
+  }
   if (!filled.length) return { chapters: [{ title: chapters[0]?.title || "导入正文", scenes: [{ title: "第一场", body: "" }] }] };
-  // 若第一章是无标题的“导入正文”且只是空壳，并入后续章节标题语义不变。
   let total = 0;
   for (const item of filled) {
     item.title ||= `第 ${filled.indexOf(item) + 1} 章`;
@@ -88,10 +111,11 @@ export function summarizeManuscript(chapters: ImportedChapterDraft[], aiUsed: bo
 }
 
 export interface HeadingCandidate { line: number; text: string; before: string; after: string }
-/** 宽松收集疑似标题行供模型判断；只有这些行允许被 AI 选为章节边界。
- *  高置信标题行（第X章/ch-XX/Chapter N 等）全量保留，避免长书后半部分被截出候选；
- *  仅靠空行与长度推测的宽松候选限制数量，控制提示规模。 */
-export function headingCandidates(input: string): HeadingCandidate[] {
+/** 仅靠空行与长度推测的宽松标题候选（供结构推断与 AI 补充），限制数量控制规模。 */
+export function looseHeadingCandidates(input: string): HeadingCandidate[] {
+  return splitHeadingCandidates(input).loose;
+}
+function splitHeadingCandidates(input: string): { strong: HeadingCandidate[]; loose: HeadingCandidate[] } {
   const lines = input.replace(/\r\n?/g, "\n").split("\n");
   const strong: HeadingCandidate[] = [];
   const loose: HeadingCandidate[] = [];
@@ -112,7 +136,26 @@ export function headingCandidates(input: string): HeadingCandidate[] {
     const blankAround = (index === 0 || !lines[index - 1]!.trim()) && (index === lines.length - 1 || !lines[index + 1]!.trim());
     if (blankAround && text.length <= 24 && !/[。！？；，、]$/.test(text)) loose.push(candidate);
   }
-  return [...strong, ...loose.slice(0, 400)].sort((a, b) => a.line - b.line);
+  return { strong, loose: loose.slice(0, 400) };
+}
+export function headingCandidates(input: string): HeadingCandidate[] {
+  const { strong, loose } = splitHeadingCandidates(input);
+  return [...strong, ...loose].sort((a, b) => a.line - b.line);
+}
+
+/** Agent 判定的标题模式经本地校验后按行切章；正文同样逐字保留。 */
+export function sliceByChapterPattern(input: string, pattern: string): ImportedChapterDraft[] | null {
+  let regex: RegExp;
+  try { regex = new RegExp(pattern, "i"); } catch { return null; }
+  const lines = input.replace(/\r\n?/g, "\n").split("\n");
+  const marks: number[] = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const text = cleanHeadingLine(lines[index]!.replace(MD_HEADING_RE, ""));
+    if (text && text.length <= MAX_TITLE_LINE && regex.test(text)) marks.push(index);
+  }
+  if (marks.length < 2 || marks.length > 500) return null;
+  const decisions = marks.map(line => ({ line, level: "chapter" as const }));
+  return sliceManuscript(input, decisions);
 }
 
 export interface HeadingDecision { line: number; level: "chapter" | "scene"; title?: string }
@@ -122,7 +165,7 @@ export function sliceManuscript(input: string, decisions: HeadingDecision[]): Im
   const allowed = new Set(headingCandidates(input).map(candidate => candidate.line));
   const marks = decisions
     .filter(decision => Number.isInteger(decision.line) && allowed.has(decision.line) && lines[decision.line])
-    .map(decision => ({ ...decision, title: (decision.title ?? lines[decision.line]!.trim().replace(/^#{1,2}\s*/, "")).trim() || lines[decision.line]!.trim() }))
+    .map(decision => ({ ...decision, title: (decision.title ?? cleanHeadingLine(lines[decision.line]!.replace(MD_HEADING_RE, ""))).trim() || cleanHeadingLine(lines[decision.line]!) }))
     .sort((a, b) => a.line - b.line);
   const chapterCount = marks.filter(mark => mark.level === "chapter").length;
   if (!marks.length || (!chapterCount && marks.length < 2)) return null;

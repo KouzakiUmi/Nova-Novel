@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 import { readAppearanceSettings, writeAppearanceSettings } from "./appearance.js";
 import { timingSafeEqual } from "node:crypto";
 import type {
-  ContextQuery, Entity, FactAssertion, GenerationRequest, IdeaCardFields, SelectionAction, WorkspaceSnapshot, ProviderUpsert, TaskRoute, WorkflowDefinition, SceneAnnotation, AuthoringEvent, ElementDesignCard, PlotIdeateMode, SceneProposalCard, NoteIncubateTarget, ExtractedElementProposal, ExtractedFactProposal, ExtractedEventProposal, ImportedChapterDraft,
+  ContextQuery, Entity, FactAssertion, GenerationRequest, IdeaCardFields, SelectionAction, WorkspaceSnapshot, ProviderUpsert, TaskRoute, WorkflowDefinition, SceneAnnotation, AuthoringEvent, ElementDesignCard, PlotIdeateMode, SceneProposalCard, NoteIncubateTarget, ExtractedElementProposal, ExtractedFactProposal, ExtractedEventProposal, ImportedChapterDraft, IngestPlan,
 } from "@nova-novel/shared";
 import type { KnowledgeService, PiHost, WorkflowService } from "./contracts.js";
 import { DomainError, EXAMPLE_IDEAS, requiredString, versionNumber } from "./domain.js";
@@ -13,7 +13,8 @@ import { parseStoryOrderFromTime } from "./knowledge/index.js";
 import type { GuidedOutlineService } from "./guide.js";
 import type { GuidedWorkflowService } from "./workflow-guide.js";
 import { CreativeAssistService, ElementGuideService } from "./assist.js";
-import { exportBackup, exportMarkdown, parseBackup, parseManuscript, summarizeManuscript } from "./transfer.js";
+import { IngestRunner } from "./ingest.js";
+import { exportBackup, exportMarkdown, parseBackup, parseManuscript, sliceByChapterPattern, summarizeManuscript } from "./transfer.js";
 import { NotionCopilotError, NotionCopilotPlugin } from "./integrations/notion-copilot.js";
 
 export interface AppServices { store: DomainStore; knowledge: KnowledgeService; workflow: WorkflowService; pi: PiHost; guide?: GuidedOutlineService; workflowGuide?: GuidedWorkflowService; elementGuide?: ElementGuideService; assist?: CreativeAssistService; notion?: NotionCopilotPlugin }
@@ -109,6 +110,7 @@ export function createApp({ store, knowledge, workflow, pi, guide, workflowGuide
   const assist = providedAssist ?? new CreativeAssistService(store.db, store, knowledge, pi);
   const elementGuide = providedElementGuide ?? new ElementGuideService(store.db, store, knowledge, pi, assist);
   const appearanceDir = pi.settings?.view().dataDir ?? process.env.NOVA_NOVEL_DATA_DIR ?? resolve(process.cwd(), "data");
+  const ingest = new IngestRunner(store, assist, resolve(appearanceDir, "ingest", "runs"));
   const notion = providedNotion ?? new NotionCopilotPlugin(appearanceDir);
   function snapshot(projectId?: string): WorkspaceSnapshot {
     const project = store.getProject(projectId);
@@ -260,6 +262,8 @@ export function createApp({ store, knowledge, workflow, pi, guide, workflowGuide
     if (getTask && method === "GET") { json(response, 200, store.getGeneration(getTask[1]!)); return; }
     const revisionRoute = path.match(/^\/api\/revisions\/([^/]+)$/);
     if (revisionRoute && method === "GET") { const revision = store.getRevision(revisionRoute[1]!); const manifest = store.getManifest(revision.revisionId); json(response, 200, { revision, chapters: manifest.chapters, scenes: manifest.scenes, facts: manifest.facts }); return; }
+    const ingestStatus = path.match(/^\/api\/ingest\/([0-9a-f-]+)$/);
+    if (ingestStatus && method === "GET") { json(response, 200, ingest.get(ingestStatus[1]!)); return; }
     if (!["POST", "PATCH", "DELETE", "PUT"].includes(method)) throw new DomainError(404, "NOT_FOUND", "接口不存在");
     if (path === "/api/import/backup" && method === "POST") { const backupInput = await body(request, 20 * 1024 * 1024); const restored = store.restoreBackup(parseBackup(backupInput.backup)); indexRevision(restored.project.projectId, restored.revision.revisionId); json(response, 201, { ...restored, snapshot: snapshot(restored.project.projectId) }); return; }
     const input = await body(request, path.startsWith("/api/import") ? 20 * 1024 * 1024 : MAX_BODY_BYTES);
@@ -287,6 +291,41 @@ export function createApp({ store, knowledge, workflow, pi, guide, workflowGuide
       const result = store.appendImportedChapters({ projectId, baseRevisionId, chapters: parseImportChapters(input.chapters) });
       indexRevision(projectId, result.revision.revisionId);
       json(response, 201, { ...result, snapshot: snapshot(projectId) }); return;
+    }
+    if (path === "/api/ingest/plan" && method === "POST") {
+      const text = requiredString(input.text, "text", 1_000_000);
+      const local = parseManuscript(text).chapters;
+      let chapters = local;
+      let plan: IngestPlan | null = null;
+      if (input.useAi !== false && typeof pi.planIngest === "function") {
+        plan = await pi.planIngest(text, local);
+        if (plan?.chapterPattern) {
+          const sliced = sliceByChapterPattern(text, plan.chapterPattern);
+          if (sliced) chapters = sliced;
+        }
+      }
+      json(response, 200, { plan, preview: summarizeManuscript(chapters, false, plan ? [] : ["未接入模型或判定失败，已按本地规则给出处理方案。"]) }); return;
+    }
+    if (path === "/api/ingest/start" && method === "POST") {
+      const chapters = parseImportChapters(input.chapters);
+      const imported = store.importProject({ ...(typeof input.title === "string" ? { title: input.title } : {}), premise: "导入已有小说", chapters });
+      indexRevision(imported.project.projectId, imported.revision.revisionId);
+      const run = ingest.start(imported.project.projectId, imported.project.title);
+      json(response, 201, { runId: run.runId, project: imported.project, revision: imported.revision, snapshot: snapshot(imported.project.projectId) }); return;
+    }
+    const ingestRun = path.match(/^\/api\/ingest\/([0-9a-f-]+)(?:\/(cancel|resume|commit|discard))?$/);
+    if (ingestRun) {
+      const runId = ingestRun[1]!;
+      const action = ingestRun[2];
+      if (!action && method === "GET") { json(response, 200, ingest.get(runId)); return; }
+      if (action === "cancel" && method === "POST") { json(response, 200, ingest.cancel(runId)); return; }
+      if (action === "resume" && method === "POST") { json(response, 200, ingest.resume(runId)); return; }
+      if (action === "discard" && method === "POST") { json(response, 200, ingest.discard(runId)); return; }
+      if (action === "commit" && method === "POST") {
+        const projectId = ingest.get(runId).projectId;
+        const totals = await ingest.commit(runId, requiredString(input.acceptanceId, "acceptanceId", 200));
+        json(response, 200, { ...totals, snapshot: snapshot(projectId) }); return;
+      }
     }
     const arcRoute = path.match(/^\/api\/character-arcs\/([^/]+)$/);
     if (arcRoute && method === "PUT") { json(response, 200, { arc: store.saveCharacterArc(arcRoute[1]!, { motivation: typeof input.motivation === "string" ? input.motivation : "", goal: typeof input.goal === "string" ? input.goal : "", conflict: typeof input.conflict === "string" ? input.conflict : "", epiphany: typeof input.epiphany === "string" ? input.epiphany : "", notes: typeof input.notes === "string" ? input.notes : "" }) }); return; }

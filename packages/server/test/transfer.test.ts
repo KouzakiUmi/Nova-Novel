@@ -3,8 +3,9 @@ import { test } from "node:test";
 import Database from "better-sqlite3";
 import type { WorkspaceSnapshot } from "@nova-novel/shared";
 import { DomainStore } from "../src/store.js";
-import { exportBackup, exportMarkdown, parseManuscript, summarizeManuscript, sliceManuscript, headingCandidates } from "../src/transfer.js";
+import { exportBackup, exportMarkdown, parseManuscript, summarizeManuscript, sliceManuscript, sliceByChapterPattern, headingCandidates } from "../src/transfer.js";
 import { assistManuscript } from "../src/agent/import-assist.js";
+import { planManuscriptIngest } from "../src/agent/ingest-planner.js";
 
 test("markdown manuscript import creates chapters and scenes with one initial revision", () => {
   const db = new Database(":memory:");
@@ -95,6 +96,29 @@ test("append imported chapters extends the same project with CAS protection", ()
   } finally { db.close(); }
 });
 
+test("markdown front matter, toc and ### chapter headings are handled", () => {
+  const text = "# 书名\n\n- 作者：某人\n- 来源：https://example.com\n\n---\n\n## 目录\n\n### 分组\n\n1. [第1章](#ch-1)\n\n### 番外1 · 月圆\n\n正文甲\n\n### 第1章 标题。\n\n正文乙";
+  const parsed = parseManuscript(text);
+  assert.deepEqual(parsed.chapters.map(chapter => chapter.title), ["番外1 · 月圆", "第1章 标题。"]);
+  assert.equal(parsed.chapters[0]?.scenes[0]?.body, "正文甲");
+  assert.equal(parsed.chapters[1]?.scenes[0]?.body, "正文乙");
+});
+
+test("agent supplied chapter pattern slices deterministically", () => {
+  const text = "第1章 A\n\n正文一\n\n第2章 B\n\n正文二";
+  const chapters = sliceByChapterPattern(text, "^第\\d+章");
+  assert.equal(chapters?.length, 2);
+  assert.equal(chapters?.[1]?.scenes[0]?.body, "正文二");
+  assert.equal(sliceByChapterPattern(text, "(["), null);
+});
+
+test("unnumbered short-line chapters fall back to structure inference", () => {
+  const text = "雨夜\n\n他说了一句话。\n\n旧收据\n\n她又翻了一遍。\n\n晴天\n\n雨停了。";
+  const parsed = parseManuscript(text);
+  assert.equal(parsed.chapters.length, 3);
+  assert.deepEqual(parsed.chapters.map(chapter => chapter.title), ["雨夜", "旧收据", "晴天"]);
+});
+
 test("AI decisions slice original text and ignore hallucinated line numbers", async () => {
   const text = "雨夜\n\n阿禾收铺。\n\n旧收据\n\n柜台底下卡着一张收据。";
   const candidates = headingCandidates(text);
@@ -108,5 +132,15 @@ test("AI decisions slice original text and ignore hallucinated line numbers", as
   const assisted = await assistManuscript(text, { complete: async () => JSON.stringify([{ line: 0, level: "chapter", title: "第一章 雨夜" }, { line: 4, level: "chapter", title: "第二章 旧收据" }]) });
   assert.equal(assisted?.length, 2);
   const fallback = await assistManuscript(text, { complete: async () => "不是 JSON" });
+  assert.equal(fallback, null);
+});
+
+test("ingest planner returns analysis and validated options with local fallback", async () => {
+  const chapters = parseManuscript("第1章 A\n\n正文一").chapters;
+  const plan = await planManuscriptIngest("第1章 A\n\n正文一", chapters, { complete: async () => JSON.stringify({ analysis: "单章短篇", chapterPattern: "^第\d+章", options: [{ id: "standard", title: "分章 + 知识提取", detail: "逐场提取", steps: ["分章"], estimatedCalls: 1, recommended: true, extract: true }] }) });
+  assert.equal(plan?.analysis, "单章短篇");
+  assert.equal(plan?.chapterPattern, "^第\d+章");
+  assert.equal(plan?.options[0]?.extract, true);
+  const fallback = await planManuscriptIngest("第1章 A\n\n正文一", chapters, { complete: async () => "无法判定" });
   assert.equal(fallback, null);
 });

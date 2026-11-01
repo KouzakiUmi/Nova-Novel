@@ -44,7 +44,20 @@ import type {
   WorldEvent,
   ImportedChapterDraft,
   ManuscriptPreview,
+  IngestPlan,
 } from "@nova-novel/shared";
+
+export interface IngestRunView {
+  runId: string;
+  projectId: string;
+  title: string;
+  status: "running" | "paused" | "review" | "done" | "discarded";
+  queue: string[];
+  done: string[];
+  failed: { sceneId: string; error: string }[];
+  bundles: (ExtractedLedgerBundle & { sceneTitle?: string })[];
+  cancelRequested?: boolean;
+}
 import type { AppearanceSettings } from "./appearance";
 
 export class ApiError extends Error {
@@ -142,6 +155,15 @@ export const api = {
     request<{ project: WorkspaceSnapshot["activeProject"]; revision: Revision; snapshot: WorkspaceSnapshot }>("/api/import", { method: "POST", body: JSON.stringify(input) }),
   importAppend: (input: { projectId: string; baseRevisionId: string; chapters: ImportedChapterDraft[] }) =>
     request<{ revision: Revision; snapshot: WorkspaceSnapshot }>("/api/import/append", { method: "POST", body: JSON.stringify(input) }),
+  ingestPlan: (input: { text: string; useAi?: boolean }) =>
+    request<{ plan: IngestPlan | null; preview: ManuscriptPreview }>("/api/ingest/plan", { method: "POST", body: JSON.stringify(input) }),
+  ingestStart: (input: { title: string; chapters: ImportedChapterDraft[] }) =>
+    request<{ runId: string; project: WorkspaceSnapshot["activeProject"]; revision: Revision; snapshot: WorkspaceSnapshot }>("/api/ingest/start", { method: "POST", body: JSON.stringify(input) }),
+  ingestRun: (runId: string) => request<IngestRunView>(`/api/ingest/${runId}`),
+  ingestAction: (runId: string, action: "cancel" | "resume" | "discard") =>
+    request<IngestRunView>(`/api/ingest/${runId}/${action}`, { method: "POST", body: "{}" }),
+  ingestCommit: (runId: string, acceptanceId: string) =>
+    request<{ elements: number; facts: number; events: number; snapshot: WorkspaceSnapshot }>(`/api/ingest/${runId}/commit`, { method: "POST", body: JSON.stringify({ acceptanceId }) }),
   restoreBackup: (backup: unknown) =>
     request<{ project: WorkspaceSnapshot["activeProject"]; revision: Revision; warnings: string[]; snapshot: WorkspaceSnapshot }>("/api/import/backup", { method: "POST", body: JSON.stringify({ backup }) }),
   updateProject: (projectId: string, patch: { title?: string; archived?: boolean }) =>

@@ -368,6 +368,9 @@ export interface ManuscriptPreview {
   aiUsed: boolean;
   warnings: string[];
 }
+/** Agent 预处理判定与处理方案；执行与切片由程序完成，方案语义只区分是否进入提取运行器。 */
+export interface IngestPlanOption { id: string; title: string; detail: string; steps: string[]; estimatedCalls: number; recommended?: boolean; extract: boolean }
+export interface IngestPlan { analysis: string; options: IngestPlanOption[]; chapterPattern?: string }
 
 export interface GenerationReceipt {
   task: AgentTask;
