@@ -42,6 +42,8 @@ import type {
   ExtractedEventProposal,
   FactAssertion,
   WorldEvent,
+  ImportedChapterDraft,
+  ManuscriptPreview,
 } from "@nova-novel/shared";
 import type { AppearanceSettings } from "./appearance";
 
@@ -61,7 +63,7 @@ function pairingHeaders(): Record<string, string> {
   return pairToken ? { "X-Nova-Novel-Token": pairToken } : {};
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+export async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
     ...init,
     headers: {
@@ -134,7 +136,9 @@ export const api = {
       method: "POST",
       body: JSON.stringify(input),
     }),
-  importProject: (input: { title: string; premise?: string; text: string }) =>
+  analyzeImport: (input: { text: string; useAi?: boolean }) =>
+    request<ManuscriptPreview>("/api/import/analyze", { method: "POST", body: JSON.stringify(input) }),
+  importProject: (input: { title: string; premise?: string; text?: string; chapters?: ImportedChapterDraft[] }) =>
     request<{ project: WorkspaceSnapshot["activeProject"]; revision: Revision; snapshot: WorkspaceSnapshot }>("/api/import", { method: "POST", body: JSON.stringify(input) }),
   restoreBackup: (backup: unknown) =>
     request<{ project: WorkspaceSnapshot["activeProject"]; revision: Revision; warnings: string[]; snapshot: WorkspaceSnapshot }>("/api/import/backup", { method: "POST", body: JSON.stringify({ backup }) }),

@@ -31,9 +31,10 @@ interface RevisionsViewProps {
   onActivate: (projectId: string) => Promise<void>;
   onBeforeWrite: () => Promise<void>;
   onOpenScene: (sceneId: string) => void;
+  onOpenImport: () => void;
 }
 
-export function RevisionsView({ snapshot, onCreateVersion, onRestore, onActivate, onBeforeWrite, onOpenScene }: RevisionsViewProps) {
+export function RevisionsView({ snapshot, onCreateVersion, onRestore, onActivate, onBeforeWrite, onOpenScene, onOpenImport }: RevisionsViewProps) {
   const [selectedId, setSelectedId] = useState(snapshot.revisions[0]?.revisionId ?? "");
   const [versionName, setVersionName] = useState("第一章初稿");
   const [showNewVersion, setShowNewVersion] = useState(false);
@@ -45,7 +46,6 @@ export function RevisionsView({ snapshot, onCreateVersion, onRestore, onActivate
   const [importError, setImportError] = useState("");
   const [importNotice, setImportNotice] = useState("");
   const [preview, setPreview] = useState<{ revisionId: string; scenes: WorkspaceSnapshot["scenes"]; facts: WorkspaceSnapshot["facts"] } | null>(null);
-  const fileRef = useRef<HTMLInputElement>(null);
   const backupFileRef = useRef<HTMLInputElement>(null);
   const versionDialogRef = useRef<HTMLElement>(null);
   useDialogKeyboard(versionDialogRef, () => setShowNewVersion(false), showNewVersion);
@@ -73,17 +73,6 @@ export function RevisionsView({ snapshot, onCreateVersion, onRestore, onActivate
     try { await api.download(`/api/export/${kind}?projectId=${encodeURIComponent(snapshot.activeProject.projectId)}`, `${snapshot.activeProject.title}.${kind === "markdown" ? "md" : "json"}`); }
     catch (cause) { setImportError(cause instanceof Error ? cause.message : "导出失败"); }
   };
-  const importFile = async (file: File) => {
-    setImporting(true); setImportError(""); setImportNotice("");
-    try {
-      const text = await file.text();
-      await onBeforeWrite();
-      const result = await api.importProject({ title: file.name.replace(/\.(md|markdown|txt)$/i, "") || file.name, premise: "从本地 Markdown/TXT 导入", text });
-      await onActivate(result.project.projectId);
-      onOpenScene(result.snapshot.scenes[0]?.sceneId ?? "");
-    } catch (cause) { setImportError(cause instanceof Error ? cause.message : "导入失败"); }
-    finally { setImporting(false); if (fileRef.current) fileRef.current.value = ""; }
-  };
   const restoreFile = async (file: File) => {
     setImporting(true); setImportError(""); setImportNotice("");
     try {
@@ -104,7 +93,7 @@ export function RevisionsView({ snapshot, onCreateVersion, onRestore, onActivate
           <h1>修订与版本</h1>
           <p>正文、计划和重要元素变化一起审阅；恢复不会抹掉现在。</p>
         </div>
-        <div className="revision-transfer-actions"><button className="button ghost" onClick={() => void download("markdown")}><Download size={15} />Markdown</button><button className="button ghost" onClick={() => void download("backup")}><FileJson2 size={15} />JSON 备份</button><button className="button secondary" disabled={importing} onClick={() => fileRef.current?.click()}><Upload size={15} />{importing ? "导入中…" : "导入 Markdown/TXT"}</button><input ref={fileRef} type="file" accept=".md,.markdown,.txt" hidden onChange={event => { const file = event.target.files?.[0]; if (file) void importFile(file); }} /><button className="button secondary" disabled={importing} onClick={() => backupFileRef.current?.click()}><RotateCcw size={15} />恢复 JSON 备份</button><input ref={backupFileRef} type="file" accept=".json" hidden onChange={event => { const file = event.target.files?.[0]; if (file) void restoreFile(file); }} /><button className="button ghost" onClick={() => setMode(current => current === "replay" ? "versions" : "replay")}><History size={15} />{mode === "replay" ? "版本列表" : "过程回放"}</button><button className="button primary" onClick={() => setShowNewVersion(true)}><Plus size={15} />创建命名版本</button></div>
+        <div className="revision-transfer-actions"><button className="button ghost" onClick={() => void download("markdown")}><Download size={15} />Markdown</button><button className="button ghost" onClick={() => void download("backup")}><FileJson2 size={15} />JSON 备份</button><button className="button secondary" disabled={importing} onClick={onOpenImport}><Upload size={15} />{importing ? "导入中…" : "导入小说"}</button><button className="button secondary" disabled={importing} onClick={() => backupFileRef.current?.click()}><RotateCcw size={15} />恢复 JSON 备份</button><input ref={backupFileRef} type="file" accept=".json" hidden onChange={event => { const file = event.target.files?.[0]; if (file) void restoreFile(file); }} /><button className="button ghost" onClick={() => setMode(current => current === "replay" ? "versions" : "replay")}><History size={15} />{mode === "replay" ? "版本列表" : "过程回放"}</button><button className="button primary" onClick={() => setShowNewVersion(true)}><Plus size={15} />创建命名版本</button></div>
       </header>
       <p className="backup-scope-note">JSON 备份保存当前快照，不含历史修订、任务运行或工作流定义；恢复时会创建新作品，不覆盖原稿。</p>
 

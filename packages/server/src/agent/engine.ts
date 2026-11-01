@@ -1,12 +1,13 @@
 import { mkdirSync } from "node:fs";
 import { resolve } from "node:path";
 import { createAgentSession, createExtensionRuntime, SessionManager, SettingsManager, VERSION, type AgentSession, type ResourceLoader } from "@earendil-works/pi-coding-agent";
-import type { GenerationProgress, PiConnection, ProviderApi, ProviderTestResult } from "@nova-novel/shared";
+import type { GenerationProgress, ImportedChapterDraft, PiConnection, ProviderApi, ProviderTestResult } from "@nova-novel/shared";
 import type { KnowledgeService, PiGenerationInput, PiGenerationResult, PiHost } from "../contracts.js";
 import type { DomainStore } from "../store.js";
 import { DomainError } from "../domain.js";
 import { AgentSettings, secretOf } from "./settings.js";
 import { AgentUsageService } from "./usage.js";
+import { assistManuscript } from "./import-assist.js";
 import type { VolcengineService } from "./volcengine/service.js";
 import { checkPromptBudget, NOVEL_SYSTEM_PROMPT, parseOutput } from "./prompts.js";
 import { novelTools, type WorkflowCatalog } from "./tools.js";
@@ -139,6 +140,26 @@ export class EmbeddedAgentHost implements PiHost {
     run.cancelled = true;
     if (run.session) await run.session.abort();
     await run.done;
+  }
+  /** 导入协助：复用 guide 路由的模型做标题边界判断，不创建作品任务，正文不经过模型改写。 */
+  async assistImport(text: string): Promise<ImportedChapterDraft[] | null> {
+    if (this.closed) return null;
+    const route = this.settings.route("guide");
+    if (!route.model) return null;
+    const model = this.settings.runtime.getModel(route.model.provider, route.model.modelId);
+    if (!model) return null;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 120_000);
+    try {
+      return await assistManuscript(text, {
+        complete: async (prompt) => {
+          const response = await this.settings.runtime.completeSimple(model, { messages: [{ role: "user", content: prompt, timestamp: Date.now() }] }, { signal: controller.signal, maxTokens: 4096 });
+          if (["error", "aborted"].includes(response.stopReason)) throw new Error("import assist failed");
+          return response.content.filter(block => block.type === "text").map(block => block.text).join("");
+        },
+      });
+    } catch { return null; }
+    finally { clearTimeout(timer); }
   }
   async close(): Promise<void> { this.closed = true; this.volcengine?.close(); await Promise.all([...this.runs.keys()].map(taskId => this.cancel(taskId))); }
   async testProvider(id: string, modelId?: string): Promise<ProviderTestResult> {

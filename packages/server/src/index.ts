@@ -14,6 +14,7 @@ import { EmbeddedAgentHost } from "./agent/engine.js";
 import { GuidedOutlineService } from "./guide.js";
 import { GuidedWorkflowService } from "./workflow-guide.js";
 import { newId } from "./utils.js";
+import { NotionCopilotPlugin } from "./integrations/notion-copilot.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const projectRoot = resolve(here, "../../..");
@@ -120,7 +121,8 @@ workflow.resumeIncompleteRuns();
 pi.setWorkflowCatalog(workflow);
 const guide = new GuidedOutlineService(db, store, knowledge, pi);
 const workflowGuide = new GuidedWorkflowService(db, store, knowledge, pi, workflow);
-const apiServer = createApp({ store, knowledge, workflow, pi, guide, workflowGuide });
+const notion = new NotionCopilotPlugin(dataDir);
+const apiServer = createApp({ store, knowledge, workflow, pi, guide, workflowGuide, notion });
 const apiHandler = apiServer.listeners("request")[0] as (request: IncomingMessage, response: ServerResponse) => void;
 
 const webRoot = resolve(process.env.NOVA_NOVEL_WEB_ROOT ?? resolve(projectRoot, "packages/web/dist"));
@@ -195,6 +197,7 @@ async function close(): Promise<void> {
   if (closing) return;
   closing = true;
   server.close();
+  await notion.close();
   await pi.close();
   db.close();
 }

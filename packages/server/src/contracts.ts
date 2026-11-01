@@ -114,6 +114,7 @@ export interface PiHost {
   generate(input: PiGenerationInput): Promise<PiGenerationResult>;
   cancel(taskId: string): Promise<void>;
   progress?(key: string): GenerationProgress;
+  assistImport?(text: string): Promise<import("@nova-novel/shared").ImportedChapterDraft[] | null>;
   usage?: { list(force?: boolean): Promise<UsageReportView[]> };
   volcengine?: {
     loginStatus(): OAuthStatusView;

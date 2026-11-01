@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
   AgentSettingsView,
   AuthoringSelection,
@@ -27,6 +27,8 @@ import type { NewProjectInput } from "./components/NewProjectDialog";
 import { GuidedOutlineDialog } from "./components/GuidedOutlineDialog";
 import { GuidedWorkflowDialog } from "./components/GuidedWorkflowDialog";
 import { ProjectManagerDialog } from "./components/ProjectManagerDialog";
+import { ImportDialog } from "./components/ImportDialog";
+const NotionCopilotView = lazy(() => import("./components/NotionCopilotView"));
 
 export interface GenerationHandle {
   receipt: Promise<GenerationReceipt>;
@@ -50,6 +52,7 @@ export function App() {
   const [guideOpen, setGuideOpen] = useState(false);
   const [workflowGuideOpen, setWorkflowGuideOpen] = useState(false);
   const [projectManagerOpen, setProjectManagerOpen] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
   const [saveStatus, setSaveStatus] = useState<SaveStatus>("saved");
   const draftsRef = useRef(new Map<string, { scene: Scene; state: SaveStatus; message: string }>());
   const [drafts, setDrafts] = useState([...draftsRef.current.entries()]);
@@ -418,6 +421,9 @@ export function App() {
           onAdopt={() => run(handleAdopt, "选定计划已进入作品，正文仍由你决定")}
           onDirectWrite={() => setView("write")}
           onOpenGuide={() => setGuideOpen(true)}
+          onOpenScene={openScene}
+          onOpenStory={() => setView("story")}
+          onOpenImport={() => setImportOpen(true)}
           onOpenSettings={() => setView("settings")}
           onRehearse={async (request) => {
             const receipt = await handleGenerate(request).receipt;
@@ -531,10 +537,30 @@ export function App() {
           onActivate={activateProject}
           onBeforeWrite={flushPending}
           onOpenScene={openScene}
+          onOpenImport={() => setImportOpen(true)}
         />
       )}
       {view === "settings" && <SettingsView onChanged={() => { void refresh(); void refreshAgentSettings().catch(() => undefined); }} onToast={notify} />}
+      {view === "notion" && <Suspense fallback={<p role="status">正在打开 Notion 笔记助手…</p>}><NotionCopilotView /></Suspense>}
       {projectManagerOpen && <ProjectManagerDialog snapshot={snapshot} onClose={() => setProjectManagerOpen(false)} onActivate={activateProject} onBeforeWrite={flushPending} />}
+      {importOpen && (
+        <ImportDialog
+          aiReady={snapshot.connection.state === "connected"}
+          busy={busy}
+          onCancel={() => setImportOpen(false)}
+          onImport={async (input) => {
+            let created = false;
+            await run(async () => {
+              await flushPending();
+              const result = await api.importProject({ title: input.title, premise: "导入已有小说", chapters: input.chapters });
+              await activateProject(result.project.projectId);
+              setView("write");
+              created = true;
+            }, `已按 ${input.chapters.length} 个章节导入新作品`);
+            return created;
+          }}
+        />
+      )}
       {guideOpen && <GuidedOutlineDialog projectId={snapshot.activeProject.projectId} {...(snapshot.guide ? { session: snapshot.guide } : {})} aiReady={snapshot.connection.state === "connected"} onChanged={async () => { await refresh(); }} onClose={() => setGuideOpen(false)} onOpenSettings={() => { setGuideOpen(false); setView("settings"); }} />}
       {workflowGuideOpen && <GuidedWorkflowDialog projectId={snapshot.activeProject.projectId} {...(snapshot.workflowGuide ? { session: snapshot.workflowGuide } : {})} aiReady={snapshot.connection.state === "connected"} onChanged={async () => { await refresh(); }} onClose={() => setWorkflowGuideOpen(false)} onOpenSettings={() => { setWorkflowGuideOpen(false); setView("settings"); }} />}
       {toast && <Toast message={toast} tone={toastTone} onClose={() => setToast("")} />}

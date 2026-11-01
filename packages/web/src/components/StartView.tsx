@@ -1,11 +1,14 @@
 import { useMemo, useState } from "react";
 import type { GenerationRequest, IdeaCard, SelectionAction, WorkspaceSnapshot } from "@nova-novel/shared";
+import { countWords } from "@nova-novel/shared";
 import {
   ArrowLeft,
   ArrowRight,
   ArrowUpRight,
+  BookOpenText,
   Check,
   ChevronDown,
+  FileUp,
   GitCompareArrows,
   Lightbulb,
   Lock,
@@ -35,10 +38,13 @@ interface StartViewProps {
   onAdopt: () => Promise<void>;
   onDirectWrite: () => void;
   onOpenGuide: () => void;
+  onOpenScene: (sceneId: string) => void;
+  onOpenStory: () => void;
+  onOpenImport: () => void;
   onRehearse: (request: GenerationRequest) => Promise<string>;
 }
 
-export function StartView({ snapshot, busy, aiReady, onGenerate, onGenerateExamples, onCreateProject, onOpenSettings, onSelection, onAdopt, onDirectWrite, onOpenGuide, onRehearse }: StartViewProps) {
+export function StartView({ snapshot, busy, aiReady, onGenerate, onGenerateExamples, onCreateProject, onOpenSettings, onSelection, onAdopt, onDirectWrite, onOpenGuide, onOpenScene, onOpenStory, onOpenImport, onRehearse }: StartViewProps) {
   const [input, setInput] = useState(snapshot.activeProject.premise);
   const [creating, setCreating] = useState(false);
   const [editingCard, setEditingCard] = useState<string | null>(null);
@@ -50,6 +56,16 @@ export function StartView({ snapshot, busy, aiReady, onGenerate, onGenerateExamp
   const [rehearsalError, setRehearsalError] = useState<{ cardId: string; message: string } | null>(null);
   const draft = snapshot.authoringDraft;
   const selected = useMemo(() => new Set(draft.selectedCardRefs.map((ref) => ref.cardId)), [draft.selectedCardRefs]);
+  /** 回来看作品时，第一眼应该是“继续写”，而不是重新学一遍新手流程。 */
+  const recentScene = useMemo(() => {
+    const scenes = snapshot.scenes;
+    if (!scenes.length) return null;
+    const written = scenes.filter((scene) => scene.body.trim().length > 0);
+    const pool = written.length ? written : scenes;
+    return pool.reduce((latest, scene) => (scene.updatedAt > latest.updatedAt ? scene : latest), pool[0]!);
+  }, [snapshot.scenes]);
+  const totalWords = useMemo(() => snapshot.scenes.reduce((sum, scene) => sum + countWords(scene.body), 0), [snapshot.scenes]);
+  const hasManuscript = snapshot.scenes.some((scene) => scene.body.trim().length > 0);
 
   const rehearse = async (card: IdeaCard) => {
     if (!aiReady) {
@@ -86,13 +102,37 @@ export function StartView({ snapshot, busy, aiReady, onGenerate, onGenerateExamp
 
   return (
     <div className="start-view page-scroll">
-      <CreationFlow hasCards={draft.cards.length > 0} hasSelection={draft.selectedCardRefs.length > 0} hasRehearsal={hasRehearsed} />
+      {recentScene && (
+        <section className="continue-panel" aria-label="继续创作">
+          <div className="continue-info">
+            <p className="eyebrow">{hasManuscript ? "WELCOME BACK" : "YOUR STUDIO"}</p>
+            <h2>{hasManuscript ? "回到你的故事，接着往下写。" : "第一场已经备好，开始写吧。"}</h2>
+            <p className="continue-meta">《{snapshot.activeProject.title}》 · {snapshot.scenes.length} 个场景 · {totalWords.toLocaleString("zh-CN")} 字</p>
+          </div>
+          <div className="continue-actions">
+            <button className="button primary large" onClick={() => onOpenScene(recentScene.sceneId)}>
+              <PenLine size={17} />{hasManuscript ? `继续写 · ${recentScene.title}` : `开始写 · ${recentScene.title}`}<ArrowUpRight size={16} />
+            </button>
+            <button className="button ghost" onClick={onOpenStory}><BookOpenText size={15} />看故事画布</button>
+          </div>
+        </section>
+      )}
+      {!hasManuscript && <CreationFlow hasCards={draft.cards.length > 0} hasSelection={draft.selectedCardRefs.length > 0} hasRehearsal={hasRehearsed} />}
       <section className="start-hero">
         <div className="hero-index"><span>01</span><i /><span>一个点子的开始</span></div>
         <div className="start-projectbar"><span>当前作品 · {snapshot.activeProject.title}</span><button className="button secondary small" onClick={() => setCreating(true)}><Plus size={14} />新建自己的作品</button></div>
         <p className="eyebrow">A QUIET PLACE FOR LOUD IDEAS</p>
-        <h1>让第一句话，<br />长成<span>第一场戏。</span></h1>
-        <p className="start-lead">不用先想好整个世界。留下一个画面、一个人，<br className="desktop-only" />或者一句让你放不下的话，我们一起找到下一步。</p>
+        {hasManuscript ? (
+          <>
+            <h1>写到哪算哪，<br />也可以<span>换个方向看看。</span></h1>
+            <p className="start-lead">想续写就点上方“继续写”。想探索新情节，<br className="desktop-only" />在这里留下一个画面、一个人，或一句放不下的话。</p>
+          </>
+        ) : (
+          <>
+            <h1>让第一句话，<br />长成<span>第一场戏。</span></h1>
+            <p className="start-lead">不用先想好整个世界。留下一个画面、一个人，<br className="desktop-only" />或者一句让你放不下的话，我们一起找到下一步。</p>
+          </>
+        )}
         <div className="idea-composer">
           <label htmlFor="idea-input">第 1 步 · 留下一个起点</label>
           <textarea id="idea-input" value={input} onChange={(event) => setInput(event.target.value)} placeholder="一句话、一个人物，或者一个画面……" rows={3} />
@@ -105,6 +145,7 @@ export function StartView({ snapshot, busy, aiReady, onGenerate, onGenerateExamp
           <button className="button primary large" disabled={busy} onClick={() => void (aiReady && !input.trim() ? onGenerateExamples() : onGenerate(input))}><WandSparkles size={17} />{aiReady && input.trim() ? "围绕这个点子找方向" : "先看三个示例方向"}<ArrowUpRight size={16} /></button>
           {!aiReady && <button className="button secondary large" onClick={onOpenSettings}>接入模型，按我的点子生成<ArrowRight size={16} /></button>}
           <button className="text-button" onClick={onDirectWrite}><PenLine size={15} />在当前作品直接写</button>
+          <button className="text-button" onClick={onOpenImport}><FileUp size={15} />导入已有小说</button>
           <button className="text-button" onClick={onOpenGuide}><Sparkles size={15} />AI 逐步带我列大纲</button>
         </div>
       </section>
@@ -158,7 +199,7 @@ export function StartView({ snapshot, busy, aiReady, onGenerate, onGenerateExamp
           <button className="button primary" disabled={busy || draft.selectedCardRefs.length === 0} onClick={() => void onAdopt()}>第 4 步 · 用这个方向写第一场<ArrowUpRight size={16} /></button>
         </div>
       </section>
-      {creating && <NewProjectDialog busy={busy} onCancel={() => setCreating(false)} onCreate={onCreateProject} />}
+      {creating && <NewProjectDialog busy={busy} onCancel={() => setCreating(false)} onCreate={onCreateProject} onOpenImport={() => { setCreating(false); onOpenImport(); }} />}
     </div>
   );
 }

@@ -19,19 +19,24 @@ import { countWords } from "@nova-novel/shared";
 import { IconConstellation, IconCore, IconFacet, IconFolio, IconLens, IconNote, IconOrbit, IconQuill, IconSpark, NovaMark, type IconProps } from "./icons";
 import { useDialogKeyboard } from "./useDialogKeyboard";
 
-export type ViewId = "start" | "write" | "story" | "elements" | "context" | "notes" | "workflow" | "revisions" | "settings";
+export type ViewId = "start" | "write" | "story" | "elements" | "context" | "notes" | "workflow" | "revisions" | "settings" | "notion";
 export type SaveStatus = "saved" | "dirty" | "saving" | "error";
+
+/** 日常创作直接可达；进阶工具默认收起，避免新用户面对一整排陌生入口。 */
+const primaryViews: ViewId[] = ["start", "write", "story", "notes"];
+const toolViews: ViewId[] = ["elements", "context", "workflow", "revisions"];
 
 const navigation: Array<{ id: ViewId; label: string; hint: string; icon: (props: IconProps) => React.ReactElement }> = [
   { id: "start", label: "创作起步", hint: "从一句话开始", icon: IconSpark },
   { id: "write", label: "写作", hint: "正文与场景", icon: IconQuill },
   { id: "story", label: "故事", hint: "剧情与时间线", icon: IconConstellation },
+  { id: "notes", label: "便签", hint: "想法与笔记", icon: IconNote },
   { id: "elements", label: "元素", hint: "人物、物品与规则", icon: IconFacet },
   { id: "context", label: "资料", hint: "证据与检索", icon: IconLens },
-  { id: "notes", label: "便签", hint: "想法与笔记", icon: IconNote },
   { id: "workflow", label: "工作流", hint: "编排与运行", icon: IconOrbit },
   { id: "revisions", label: "修订", hint: "版本与恢复", icon: IconFolio },
   { id: "settings", label: "模型与服务", hint: "Provider、模型与任务分配", icon: IconCore },
+  { id: "notion", label: "Notion 笔记", hint: "外部笔记 Copilot", icon: IconNote },
 ];
 
 interface AppShellProps {
@@ -52,6 +57,7 @@ interface AppShellProps {
 export function AppShell({ snapshot, view, onViewChange, focusMode, onFocusMode, onOpenStart, onOpenScene, onOpenElement, onProjectChange, onManageProjects, saveStatus, children }: AppShellProps) {
   const [commandOpen, setCommandOpen] = useState(false);
   const [commandQuery, setCommandQuery] = useState("");
+  const [toolsOpen, setToolsOpen] = useState(false);
   const commandRef = useRef<HTMLElement>(null);
   useDialogKeyboard(commandRef, () => setCommandOpen(false), commandOpen);
 
@@ -90,17 +96,27 @@ export function AppShell({ snapshot, view, onViewChange, focusMode, onFocusMode,
         </label><button className="icon-button" aria-label="管理作品" title="管理作品" onClick={onManageProjects}><Settings2 size={14} /></button></div>
 
         <nav className="primary-nav" aria-label="作品功能">
-          <p className="nav-section-label">创作空间</p>
-          {navigation.slice(0, 6).map((item) => (
+          <p className="nav-section-label">创作</p>
+          {navigation.filter((item) => primaryViews.includes(item.id)).map((item) => (
             <NavButton key={item.id} item={item} active={view === item.id} onClick={() => onViewChange(item.id)} />
           ))}
-          <p className="nav-section-label nav-section-secondary">创作方法</p>
-          {navigation.slice(6, 8).map((item) => (
-            <NavButton key={item.id} item={item} active={view === item.id} onClick={() => onViewChange(item.id)} />
-          ))}
+          <button
+            className={`nav-section-toggle ${toolsOpen || toolViews.includes(view) ? "open" : ""}`}
+            aria-expanded={toolsOpen || toolViews.includes(view)}
+            onClick={() => setToolsOpen((open) => !open)}
+          >
+            <span className="nav-section-label">创作工具</span>
+            <ChevronDown size={13} aria-hidden="true" />
+          </button>
+          <div className={`nav-tools ${toolsOpen || toolViews.includes(view) ? "open" : ""}`}>
+            {navigation.filter((item) => toolViews.includes(item.id)).map((item) => (
+              <NavButton key={item.id} item={item} active={view === item.id} onClick={() => onViewChange(item.id)} />
+            ))}
+          </div>
         </nav>
 
         <div className="rail-bottom">
+          <NavButton item={navigation.find(item => item.id === "notion")!} active={view === "notion"} onClick={() => onViewChange("notion")} />
           <button className={`local-status ${view === "settings" ? "active" : ""}`} onClick={() => onViewChange("settings")} title="管理模型与服务">
             <span className={`status-dot ${snapshot.connection.state === "connected" ? "online" : ""}`} />
             <span><strong>{snapshot.connection.state === "connected" ? "AI 搭档已就绪" : "尚未接入模型"}</strong><small>{snapshot.connection.state === "connected" ? "模型与服务 · 已配置" : "写作与保存不受影响"}</small></span>
@@ -131,7 +147,6 @@ export function AppShell({ snapshot, view, onViewChange, focusMode, onFocusMode,
           <span>{words.toLocaleString("zh-CN")} 字</span>
           <span className="statusbar-spacer" />
           <span><Archive size={12} />{activeRevision?.name ?? "自动恢复点"}</span>
-          <span className="statusbar-revision">{activeRevision?.revisionId.slice(0, 12) ?? "本地草稿"}</span>
         </footer>
       </div>
 

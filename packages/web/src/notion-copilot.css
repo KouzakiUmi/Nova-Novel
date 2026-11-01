@@ -1,0 +1,46 @@
+.notion-copilot { height: 100%; display: flex; flex-direction: column; gap: 14px; padding: 24px; overflow-y: auto; }
+.notion-heading { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; }
+.notion-eyebrow { font-size: 13px; color: var(--amber); }
+.notion-heading h1 { display: flex; align-items: center; gap: 10px; margin: 8px 0; font-size: 24px; font-weight: 600; }
+.notion-heading p, .notion-settings p { color: var(--muted); font-size: 13px; line-height: 1.7; margin-bottom: 8px; }
+.notion-feedback { display: flex; gap: 8px; align-items: center; padding: 10px 14px; border-radius: 6px; background: var(--green-soft); font-size: 13px; margin: 0; overflow-wrap: anywhere; }
+.notion-feedback.error { color: var(--red); background: var(--red-soft); }
+.notion-settings { padding: 18px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; }
+.notion-settings-title, .notion-settings-actions { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+.notion-settings-title { justify-content: space-between; }
+.notion-settings-title h2 { font-size: 16px; font-weight: 600; margin: 0; }
+.notion-toggle { display: inline-flex; gap: 6px; align-items: center; font-size: 13px; }
+.notion-settings-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin: 14px 0; }
+.notion-settings-fields label { display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
+.notion-settings-fields input, .notion-settings-fields select { min-width: 0; width: 100%; height: 36px; padding: 6px 9px; border: 1px solid var(--line-strong); border-radius: 5px; background: var(--white); font-size: 14px; }
+.notion-settings-actions > span { color: var(--muted); font-size: 13px; }
+.notion-help { margin: 12px 0 0; }
+.notion-help a { display: inline-flex; align-items: center; gap: 3px; color: var(--green); margin-left: 8px; }
+.notion-disabled, .notion-chat-empty { display: flex; align-items: center; justify-content: center; flex-direction: column; text-align: center; gap: 12px; color: var(--muted); padding: 40px 24px; }
+.notion-disabled h2, .notion-chat-empty h2 { color: var(--ink); font-size: 20px; margin: 0; font-weight: 500; }
+.notion-disabled p, .notion-chat-empty p { max-width: 420px; font-size: 14px; line-height: 1.8; margin: 0; }
+.notion-workspace { flex: 1; min-height: 360px; display: grid; grid-template-columns: 190px minmax(0, 1fr); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: var(--panel); }
+.notion-history { padding: 12px; border-right: 1px solid var(--line); overflow-y: auto; display: flex; flex-direction: column; gap: 7px; }
+.notion-history > p { font-size: 13px; color: var(--muted); line-height: 1.7; padding: 12px 4px; }
+.notion-history-item { text-align: left; display: flex; flex-direction: column; gap: 6px; padding: 12px 9px; border-radius: 6px; }
+.notion-history-item:hover, .notion-history-item.active { background: var(--green-soft); }
+.notion-history-item strong { font-size: 14px; font-weight: 500; overflow-wrap: anywhere; }
+.notion-history-item small { font-size: 13px; color: var(--muted); }
+.notion-chat { min-width: 0; display: flex; flex-direction: column; min-height: 0; }
+.notion-chat-title { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 14px 18px; border-bottom: 1px solid var(--line); font-size: 14px; }
+.notion-chat-title strong { font-weight: 500; overflow-wrap: anywhere; }
+.notion-chat-title span { color: var(--muted); font-size: 13px; white-space: nowrap; }
+.notion-transcript { flex: 1; min-height: 140px; overflow-y: auto; padding: 18px; }
+.notion-message { margin-bottom: 16px; border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; }
+.notion-message.user { margin-left: 24px; background: var(--paper); }
+.notion-message header { display: flex; justify-content: space-between; align-items: center; gap: 12px; color: var(--muted); min-height: 26px; margin-bottom: 8px; font-size: 13px; }
+.notion-message header strong { font-weight: 500; }
+.notion-message-body { font-family: var(--manuscript-font); font-weight: var(--manuscript-weight); font-size: calc(17px * var(--manuscript-scale)); line-height: 1.9; white-space: pre-wrap; overflow-wrap: anywhere; }
+.notion-message.provisional { border-style: dashed; }
+.notion-waiting { display: flex; gap: 8px; align-items: center; font-size: 13px; color: var(--muted); }
+.notion-composer { border-top: 1px solid var(--line); padding: 14px 18px; }
+.notion-composer > label { display: block; margin-bottom: 6px; font-family: var(--ui-font); font-size: 14px; }
+.notion-composer textarea { width: 100%; min-height: 75px; max-height: 200px; padding: 10px 12px; border: 1px solid var(--line-strong); border-radius: 6px; background: var(--white); font-size: 14px; line-height: 1.7; }
+.notion-composer > div { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-top: 8px; }
+.notion-composer small { font-size: 13px; color: var(--muted); }
+@media (max-width: 1000px) { .notion-copilot { padding: 16px; } .notion-workspace { grid-template-columns: 145px minmax(0, 1fr); } .notion-settings-fields { grid-template-columns: minmax(0, 1fr); } .notion-composer > div { flex-wrap: wrap; } }

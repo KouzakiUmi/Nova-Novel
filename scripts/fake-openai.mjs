@@ -17,6 +17,12 @@ function guideInput(body) {
 
 function reply(body) {
   const system = (body.messages ?? []).map((message) => typeof message.content === "string" ? message.content : JSON.stringify(message.content)).join("\n");
+  // 导入协助：把提示里的候选标题行全部标为 chapter，验证 AI 分章链路。
+  const importPrompt = (body.messages ?? []).filter(message => message.role === "user").map(message => typeof message.content === "string" ? message.content : "").join("\n");
+  if (importPrompt.includes("你在整理一部小说原稿的章节结构")) {
+    const decisions = [...importPrompt.matchAll(/^#(\d+) \| ([^|]+) \|/gm)].map(match => ({ line: Number(match[1]), level: "chapter", title: match[2].trim() }));
+    return JSON.stringify(decisions);
+  }
   const guide = guideInput(body);
   if (guide.schema === 'nova-novel.workflow-guide/1') {
     const guideStep = guide.stepId;

@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 import { readAppearanceSettings, writeAppearanceSettings } from "./appearance.js";
 import { timingSafeEqual } from "node:crypto";
 import type {
-  ContextQuery, Entity, FactAssertion, GenerationRequest, IdeaCardFields, SelectionAction, WorkspaceSnapshot, ProviderUpsert, TaskRoute, WorkflowDefinition, SceneAnnotation, AuthoringEvent, ElementDesignCard, PlotIdeateMode, SceneProposalCard, NoteIncubateTarget, ExtractedElementProposal, ExtractedFactProposal, ExtractedEventProposal,
+  ContextQuery, Entity, FactAssertion, GenerationRequest, IdeaCardFields, SelectionAction, WorkspaceSnapshot, ProviderUpsert, TaskRoute, WorkflowDefinition, SceneAnnotation, AuthoringEvent, ElementDesignCard, PlotIdeateMode, SceneProposalCard, NoteIncubateTarget, ExtractedElementProposal, ExtractedFactProposal, ExtractedEventProposal, ImportedChapterDraft,
 } from "@nova-novel/shared";
 import type { KnowledgeService, PiHost, WorkflowService } from "./contracts.js";
 import { DomainError, EXAMPLE_IDEAS, requiredString, versionNumber } from "./domain.js";
@@ -13,9 +13,10 @@ import { parseStoryOrderFromTime } from "./knowledge/index.js";
 import type { GuidedOutlineService } from "./guide.js";
 import type { GuidedWorkflowService } from "./workflow-guide.js";
 import { CreativeAssistService, ElementGuideService } from "./assist.js";
-import { exportBackup, exportMarkdown, parseBackup, parseManuscript } from "./transfer.js";
+import { exportBackup, exportMarkdown, parseBackup, parseManuscript, summarizeManuscript } from "./transfer.js";
+import { NotionCopilotError, NotionCopilotPlugin } from "./integrations/notion-copilot.js";
 
-export interface AppServices { store: DomainStore; knowledge: KnowledgeService; workflow: WorkflowService; pi: PiHost; guide?: GuidedOutlineService; workflowGuide?: GuidedWorkflowService; elementGuide?: ElementGuideService; assist?: CreativeAssistService }
+export interface AppServices { store: DomainStore; knowledge: KnowledgeService; workflow: WorkflowService; pi: PiHost; guide?: GuidedOutlineService; workflowGuide?: GuidedWorkflowService; elementGuide?: ElementGuideService; assist?: CreativeAssistService; notion?: NotionCopilotPlugin }
 const MAX_BODY_BYTES = 1_048_576;
 type Body = Record<string, unknown>;
 
@@ -94,10 +95,11 @@ function piIdeas(text: string): IdeaCardFields[] {
   });
 }
 
-export function createApp({ store, knowledge, workflow, pi, guide, workflowGuide, elementGuide: providedElementGuide, assist: providedAssist }: AppServices) {
+export function createApp({ store, knowledge, workflow, pi, guide, workflowGuide, elementGuide: providedElementGuide, assist: providedAssist, notion: providedNotion }: AppServices) {
   const assist = providedAssist ?? new CreativeAssistService(store.db, store, knowledge, pi);
   const elementGuide = providedElementGuide ?? new ElementGuideService(store.db, store, knowledge, pi, assist);
   const appearanceDir = pi.settings?.view().dataDir ?? process.env.NOVA_NOVEL_DATA_DIR ?? resolve(process.cwd(), "data");
+  const notion = providedNotion ?? new NotionCopilotPlugin(appearanceDir);
   function snapshot(projectId?: string): WorkspaceSnapshot {
     const project = store.getProject(projectId);
     const branch = store.getBranch(project.activeBranchId);
@@ -164,6 +166,23 @@ export function createApp({ store, knowledge, workflow, pi, guide, workflowGuide
     const url = new URL(request.url ?? "/", `http://${request.headers.host}`);
     const path = url.pathname;
     const method = request.method ?? "GET";
+    if (path.startsWith("/api/plugins/notion-copilot/")) {
+      const pluginPath = path.slice("/api/plugins/notion-copilot".length);
+      const conversation = pluginPath.match(/^\/conversations\/([a-zA-Z0-9_-]+)(?:\/(messages|cancel))?$/);
+      if (method === "GET" && pluginPath === "/settings") { json(response, 200, notion.view()); return; }
+      if (method === "GET" && pluginPath === "/conversations") { json(response, 200, { conversations: notion.list() }); return; }
+      if (method === "GET" && conversation && !conversation[2]) { json(response, 200, { conversation: notion.get(conversation[1]!) }); return; }
+      if (!["POST", "PUT"].includes(method)) throw new NotionCopilotError(404, "NOTION_NOT_FOUND", "笔记助手接口不存在");
+      const pluginInput = await body(request, 65_536);
+      const allowed = pluginPath === "/settings" ? ["enabled", "apiKeyEnv", "agentId", "token"] : conversation?.[2] === "messages" ? ["message", "requestId"] : [];
+      if (Object.keys(pluginInput).some(key => !allowed.includes(key))) throw new NotionCopilotError(400, "NOTION_INVALID_INPUT", "笔记助手请求包含不支持的字段");
+      if (method === "PUT" && pluginPath === "/settings") { json(response, 200, await notion.configure(pluginInput)); return; }
+      if (method === "POST" && pluginPath === "/agents") { json(response, 200, { agents: await notion.agents() }); return; }
+      if (method === "POST" && pluginPath === "/conversations") { json(response, 201, { conversation: notion.create() }); return; }
+      if (method === "POST" && conversation?.[2] === "messages") { json(response, 202, { conversation: notion.send(conversation[1]!, pluginInput) }); return; }
+      if (method === "POST" && conversation?.[2] === "cancel") { json(response, 200, { conversation: await notion.cancel(conversation[1]!) }); return; }
+      throw new NotionCopilotError(404, "NOTION_NOT_FOUND", "笔记助手接口不存在");
+    }
     if (method === "GET" && path === "/api/appearance") { json(response, 200, readAppearanceSettings(appearanceDir)); return; }
     if (method === "GET" && path === "/api/health") { json(response, 200, { ok: true, storage: "sqlite", connection: pi.getConnection() }); return; }
     if (method === "GET" && path === "/api/bootstrap") { json(response, 200, snapshot(url.searchParams.get("projectId") ?? undefined)); return; }
@@ -233,10 +252,27 @@ export function createApp({ store, knowledge, workflow, pi, guide, workflowGuide
     if (revisionRoute && method === "GET") { const revision = store.getRevision(revisionRoute[1]!); const manifest = store.getManifest(revision.revisionId); json(response, 200, { revision, chapters: manifest.chapters, scenes: manifest.scenes, facts: manifest.facts }); return; }
     if (!["POST", "PATCH", "DELETE", "PUT"].includes(method)) throw new DomainError(404, "NOT_FOUND", "接口不存在");
     if (path === "/api/import/backup" && method === "POST") { const backupInput = await body(request, 20 * 1024 * 1024); const restored = store.restoreBackup(parseBackup(backupInput.backup)); indexRevision(restored.project.projectId, restored.revision.revisionId); json(response, 201, { ...restored, snapshot: snapshot(restored.project.projectId) }); return; }
-    const input = await body(request);
+    const input = await body(request, path.startsWith("/api/import") ? 20 * 1024 * 1024 : MAX_BODY_BYTES);
     if (path === "/api/appearance" && method === "PUT") { json(response, 200, writeAppearanceSettings(appearanceDir, input)); return; }
     if (path === "/api/events" && method === "POST") { const seq = store.recordInteraction({ projectId: requiredString(input.projectId, "projectId"), kind: requiredString(input.kind, "kind", 100), ...(typeof input.sceneId === "string" ? { sceneId: input.sceneId } : {}), ...(input.actor === "system" || input.actor === "author" ? { actor: input.actor } : {}), ...(input.meta && typeof input.meta === "object" && !Array.isArray(input.meta) ? { meta: input.meta as AuthoringEvent["meta"] } : {}) }); json(response, 201, { seq }); return; }
-    if (path === "/api/import" && method === "POST") { const parsed = parseManuscript(requiredString(input.text, "text", 1_000_000)); const imported = store.importProject({ ...(typeof input.title === "string" ? { title: input.title } : {}), ...(typeof input.premise === "string" ? { premise: input.premise } : {}), chapterTitle: parsed.chapterTitle, scenes: parsed.scenes }); indexRevision(imported.project.projectId, imported.revision.revisionId); json(response, 201, { ...imported, snapshot: snapshot(imported.project.projectId) }); return; }
+    if (path === "/api/import/analyze" && method === "POST") {
+      const text = requiredString(input.text, "text", 1_000_000);
+      const useAi = input.useAi !== false && typeof pi.assistImport === "function";
+      let chapters: ImportedChapterDraft[] | null = null;
+      if (useAi) chapters = await pi.assistImport!(text);
+      const aiUsed = Boolean(chapters);
+      const fallback = aiUsed ? chapters! : parseManuscript(text).chapters;
+      const warnings = useAi && !aiUsed ? ["AI 未能确定章节结构，已按本地标题规则切分；可在预览中核对。"] : [];
+      json(response, 200, summarizeManuscript(fallback, aiUsed, warnings)); return;
+    }
+    if (path === "/api/import" && method === "POST") {
+      const chapters = Array.isArray(input.chapters)
+        ? (input.chapters as ImportedChapterDraft[]).map(chapter => ({ title: requiredString(chapter.title, "章节标题", 200), scenes: Array.isArray(chapter.scenes) ? chapter.scenes.map(scene => ({ title: requiredString(scene.title || "未命名场景", "场景标题", 200), body: requiredString(scene.body ?? "", "场景正文", 1_000_000), ...(typeof scene.summary === "string" ? { summary: scene.summary } : {}) })) : [] }))
+        : parseManuscript(requiredString(input.text, "text", 1_000_000)).chapters;
+      const imported = store.importProject({ ...(typeof input.title === "string" ? { title: input.title } : {}), ...(typeof input.premise === "string" ? { premise: input.premise } : {}), chapters });
+      indexRevision(imported.project.projectId, imported.revision.revisionId);
+      json(response, 201, { ...imported, snapshot: snapshot(imported.project.projectId) }); return;
+    }
     const arcRoute = path.match(/^\/api\/character-arcs\/([^/]+)$/);
     if (arcRoute && method === "PUT") { json(response, 200, { arc: store.saveCharacterArc(arcRoute[1]!, { motivation: typeof input.motivation === "string" ? input.motivation : "", goal: typeof input.goal === "string" ? input.goal : "", conflict: typeof input.conflict === "string" ? input.conflict : "", epiphany: typeof input.epiphany === "string" ? input.epiphany : "", notes: typeof input.notes === "string" ? input.notes : "" }) }); return; }
     if (path === "/api/annotations" && method === "POST") { const created = store.createAnnotation({ projectId: requiredString(input.projectId, "projectId"), sceneId: requiredString(input.sceneId, "sceneId"), kind: input.kind as "comment" | "question" | "todo", body: requiredString(input.body, "body", 20_000), ...(input.range && typeof input.range === "object" ? { range: input.range as SceneAnnotation["range"] } : {}) }); json(response, 201, { annotation: created }); return; }
@@ -730,7 +766,9 @@ export function createApp({ store, knowledge, workflow, pi, guide, workflowGuide
   const server = createServer((request, response) => {
     void handle(request, response).catch((error: unknown) => {
       if (response.headersSent) { response.end(); return; }
-      if (error instanceof DomainError) {
+      if (error instanceof NotionCopilotError) {
+        json(response, error.status, { error: { code: error.code, message: error.message } });
+      } else if (error instanceof DomainError) {
         json(response, error.status, { error: { code: error.code, message: error.message, ...(error.currentRevisionId ? { currentRevisionId: error.currentRevisionId } : {}), ...(error.selectionVersion !== undefined ? { selectionVersion: error.selectionVersion } : {}) } });
       } else {
         json(response, 500, { error: { code: "INTERNAL_ERROR", message: "服务处理失败" } });

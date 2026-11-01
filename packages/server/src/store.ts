@@ -422,17 +422,25 @@ export class DomainStore {
       return project;
     })();
   }
-  importProject(input: { title?: string; premise?: string; chapterTitle: string; scenes: ImportedScene[] }): { project: Project; revision: Revision } {
-    if (!Array.isArray(input.scenes) || input.scenes.length < 1 || input.scenes.length > 500) throw new DomainError(400, "INVALID_INPUT", "导入必须包含 1–500 个场景");
+  importProject(input: { title?: string; premise?: string; chapters: { title: string; scenes: ImportedScene[] }[] }): { project: Project; revision: Revision } {
+    const totalScenes = Array.isArray(input.chapters) ? input.chapters.reduce((sum, chapter) => sum + chapter.scenes.length, 0) : 0;
+    if (!Array.isArray(input.chapters) || input.chapters.length < 1 || totalScenes < 1 || totalScenes > 500) throw new DomainError(400, "INVALID_INPUT", "导入必须包含 1–500 个场景");
     const title = input.title === undefined ? "导入的作品" : requiredString(input.title, "title", 200);
     return this.db.transaction(() => {
       const project: Project = { projectId: newId("project"), title, premise: input.premise ?? "", createdAt: now(), updatedAt: now(), activeBranchId: newId("branch"), activeRouteId: newId("route") };
       this.db.prepare("INSERT INTO projects(project_id,json) VALUES(?,?)").run(project.projectId, JSON.stringify(project));
       const route: StoryRoute = { routeId: project.activeRouteId, projectId: project.projectId, name: "主线" };
       this.db.prepare("INSERT INTO story_routes(route_id,project_id,json) VALUES(?,?,?)").run(route.routeId, project.projectId, JSON.stringify(route));
-      const chapterId = newId("chapter");
-      const scenes: Scene[] = input.scenes.map((item, index) => ({ sceneId: newId("scene"), projectId: project.projectId, chapterId, title: requiredString(item.title || `第 ${index + 1} 场`, "场景标题", 200), summary: item.summary ?? "", body: item.body, status: item.body.trim() ? "writing" : "planned", narrationOrder: index + 1, routeId: route.routeId, entityIds: [], baseRevisionId: "", updatedAt: now() }));
-      const manifest = { chapters: [{ chapterId, projectId: project.projectId, title: requiredString(input.chapterTitle, "章节标题", 200), order: 1 }], scenes, facts: [], writingIntent: {}, storyGraph: { projectId: project.projectId, revisionId: "", nodes: scenes.map((scene, index) => ({ id: scene.sceneId, kind: "scene" as const, sceneId: scene.sceneId, title: scene.title, summary: scene.summary, position: { x: 80 + index * 220, y: 120 } })), edges: [] } };
+      const chapters: Chapter[] = [];
+      const scenes: Scene[] = [];
+      input.chapters.forEach((item, chapterIndex) => {
+        const chapterId = newId("chapter");
+        chapters.push({ chapterId, projectId: project.projectId, title: requiredString(item.title || `第 ${chapterIndex + 1} 章`, "章节标题", 200), order: chapterIndex + 1 });
+        for (const scene of item.scenes) {
+          scenes.push({ sceneId: newId("scene"), projectId: project.projectId, chapterId, title: requiredString(scene.title || `第 ${scenes.length + 1} 场`, "场景标题", 200), summary: scene.summary ?? "", body: scene.body, status: scene.body.trim() ? "writing" : "planned", narrationOrder: scenes.length + 1, routeId: route.routeId, entityIds: [], baseRevisionId: "", updatedAt: now() });
+        }
+      });
+      const manifest = { chapters, scenes, facts: [], writingIntent: {}, storyGraph: { projectId: project.projectId, revisionId: "", nodes: scenes.map((scene, index) => ({ id: scene.sceneId, kind: "scene" as const, sceneId: scene.sceneId, title: scene.title, summary: scene.summary, position: { x: 80 + index * 220, y: 120 } })), edges: [] } };
       const revision: Revision = { revisionId: newId("revision"), projectId: project.projectId, branchId: project.activeBranchId, parentRevisionIds: [], name: "导入作品", kind: "named", createdAt: now(), wordCount: scenes.reduce((sum, scene) => sum + countWords(scene.body), 0) };
       this.writeRevision(revision, manifest);
       const branch: Branch = { branchId: project.activeBranchId, projectId: project.projectId, name: "主稿", headRevisionId: revision.revisionId };

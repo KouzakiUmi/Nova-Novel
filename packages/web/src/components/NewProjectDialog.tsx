@@ -1,6 +1,6 @@
 import { useRef, useState } from "react";
 import { useDialogKeyboard } from "./useDialogKeyboard";
-import { ArrowRight, ClipboardPaste, Lightbulb, LoaderCircle, PenLine, ShieldCheck, X } from "lucide-react";
+import { ArrowRight, ClipboardPaste, FileUp, Lightbulb, LoaderCircle, PenLine, ShieldCheck, X } from "lucide-react";
 
 export interface NewProjectInput {
   title: string;
@@ -13,6 +13,7 @@ interface NewProjectDialogProps {
   busy: boolean;
   onCancel: () => void;
   onCreate: (input: NewProjectInput) => Promise<boolean>;
+  onOpenImport: () => void;
 }
 
 type EntryMode = "idea" | "paste" | "blank";
@@ -23,7 +24,7 @@ const entries: Array<{ id: EntryMode; title: string; detail: string; icon: typeo
   { id: "blank", title: "我想从空白直接写", detail: "建立空白第一场，写作提示可选、可跳过", icon: PenLine },
 ];
 
-export function NewProjectDialog({ busy, onCancel, onCreate }: NewProjectDialogProps) {
+export function NewProjectDialog({ busy, onCancel, onCreate, onOpenImport }: NewProjectDialogProps) {
   const [mode, setMode] = useState<EntryMode>("idea");
   const [title, setTitle] = useState("");
   const [premise, setPremise] = useState("");
@@ -61,6 +62,7 @@ export function NewProjectDialog({ busy, onCancel, onCreate }: NewProjectDialogP
         <div className="new-project-body">
           <div className="entry-mode-grid" role="group" aria-label="选择创作起点">
             {entries.map((entry) => <button key={entry.id} className={mode === entry.id ? "active" : ""} disabled={pending} onClick={() => { setMode(entry.id); setError(""); }}><entry.icon size={18} /><span><strong>{entry.title}</strong><small>{entry.detail}</small></span></button>)}
+            <button disabled={pending} onClick={onOpenImport}><FileUp size={18} /><span><strong>导入已有小说</strong><small>整本 Markdown/TXT 按章节入库，可用 AI 协助分章</small></span></button>
           </div>
           <label className="field-label">作品名（可先使用默认名）<input autoFocus data-autofocus value={title} disabled={pending} onChange={(event) => setTitle(event.target.value)} placeholder="未命名作品" maxLength={200} /></label>
           {mode === "idea" && <label className="field-label">你的点子<textarea value={premise} disabled={pending} onChange={(event) => setPremise(event.target.value)} rows={4} placeholder="一句话、一个人物，或者一个画面……" /></label>}

@@ -1,5 +1,6 @@
 export * from "./next-action.js";
 export * from "./revision-insights.js";
+export * from "./notion-copilot.js";
 export type Id = string;
 export type ISODateTime = string;
 export type SourceKind = "candidate" | "selected_plan" | "manuscript" | "author_setting";
@@ -354,6 +355,18 @@ export interface GenerationRequest {
   idempotencyKey: Id;
   reuseOfArtifactId?: Id;
   range?: { from: number; to: number; baseText: string };
+}
+
+/** 导入草稿：AI 或本地规则给出的章节结构，正文始终取自原稿切片，未经模型改写。 */
+export interface ImportedSceneDraft { title: string; body: string; summary?: string }
+export interface ImportedChapterDraft { title: string; scenes: ImportedSceneDraft[] }
+export interface ManuscriptPreview {
+  chapters: ImportedChapterDraft[];
+  chapterCount: number;
+  sceneCount: number;
+  wordCount: number;
+  aiUsed: boolean;
+  warnings: string[];
 }
 
 export interface GenerationReceipt {
