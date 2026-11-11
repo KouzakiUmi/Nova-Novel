@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { EditorContent, getTextBetween, getTextSerializersFromSchema, useEditor, useEditorState, type Editor } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
-import type { AgentSettingsView, ConsistencyReport, ExtractedLedgerBundle, GenerationProgress, GenerationReceipt, GenerationRequest, Scene, SceneFieldOption, SceneProposalCard, WorkspaceSnapshot } from "@nova-novel/shared";
+import type { AgentSettingsView, ConsistencyReport, ExtractedLedgerBundle, ExtractedProposalEdit, GenerationProgress, GenerationReceipt, GenerationRequest, Scene, SceneFieldOption, SceneProposalCard, WorkspaceSnapshot } from "@nova-novel/shared";
 import { countWords, recommendNextAction, type NextActionKind } from "@nova-novel/shared";
 import {
   AlignLeft,
@@ -668,75 +668,16 @@ export function EditorView({ snapshot, scene, localDraft, focusMode, onSelectSce
                 </button>
               </div>
               {extractBundle && extractBundle.sceneId === scene.sceneId && (
-                <section className="note-composer" style={{ marginBottom: 12 }} aria-label="本场设定提取审阅">
-                  <div className="note-composer-heading">
-                    <LibraryBig size={16} />
-                    <div>
-                      <strong>正文反向提取审阅</strong>
-                      <p>
-                        新元素 {extractBundle.newElements.length} · 事实 {extractBundle.factProposals.length} · 事件{" "}
-                        {extractBundle.eventProposals.length}
-                      </p>
-                    </div>
-                    <button className="button ghost small" onClick={() => setExtractBundle(null)}>
-                      关闭
-                    </button>
-                  </div>
-                  {extractBundle.newElements.map((el) => (
-                    <div key={el.proposalId} className="fact-card">
-                      <strong>
-                        新元素：{el.name}（{el.type}）
-                      </strong>
-                      <small>{el.summary}</small>
-                      <small style={{ opacity: 0.75 }}>证据原句：「{el.quote.slice(0, 60)}」</small>
-                    </div>
-                  ))}
-                  {extractBundle.factProposals.map((fp) => (
-                    <div key={fp.proposalId} className="fact-card">
-                      <strong>
-                        事实：{fp.subjectName} · {fp.predicate} = {fp.value}
-                      </strong>
-                      <small style={{ opacity: 0.75 }}>证据原句：「{fp.quote.slice(0, 60)}」</small>
-                    </div>
-                  ))}
-                  {extractBundle.eventProposals.map((ep) => (
-                    <div key={ep.proposalId} className="fact-card">
-                      <strong>
-                        事件：{ep.subjectName} · {ep.kind} → {ep.toValue}
-                      </strong>
-                      <small style={{ opacity: 0.75 }}>证据原句：「{ep.quote.slice(0, 60)}」</small>
-                    </div>
-                  ))}
-                  <div className="note-composer-actions">
-                    <span>全部绑定确定性段落证据 ID</span>
-                    <button
-                      className="button primary small"
-                      disabled={extractBusy}
-                      onClick={() => {
-                        setExtractBusy(true);
-                        void api
-                          .applyExtractedLedger({
-                            projectId: snapshot.activeProject.projectId,
-                            sceneId: scene.sceneId,
-                            acceptanceId: `extract_${scene.sceneId}_${extractBundle.revisionId}`,
-                            newElements: extractBundle.newElements,
-                            factProposals: extractBundle.factProposals,
-                            eventProposals: extractBundle.eventProposals,
-                          })
-                          .then(async () => {
-                            setExtractBundle(null);
-                            await onChanged();
-                            setTaskNote("已将提取的元素、事实与状态事件写入元素账本。");
-                          })
-                          .catch((err) => setTaskNote(err instanceof Error ? err.message : "入库失败"))
-                          .finally(() => setExtractBusy(false));
-                      }}
-                    >
-                      <Check size={13} />
-                      全部确认入库
-                    </button>
-                  </div>
-                </section>
+                <ExtractionReview
+                  key={extractBundle.artifactId}
+                  bundle={extractBundle}
+                  projectId={snapshot.activeProject.projectId}
+                  busy={extractBusy}
+                  onBusy={setExtractBusy}
+                  onClose={() => setExtractBundle(null)}
+                  onChanged={onChanged}
+                  onTaskNote={setTaskNote}
+                />
               )}
               <div className="assistant-divider"><span>本场写作依据</span></div>
               <section className="context-group"><div className="context-group-title"><ChevronDown size={13} /><strong>必须遵守</strong><span>{entities.length + 1}</span></div><div className="constraint-card"><BookOpen size={15} /><div><strong>选定计划 · 拟发生</strong><p>{scene.goal || scene.summary || "由当前正文继续发展"}</p></div></div>{entities.slice(0, 2).map((entity) => <button className="entity-context-row" key={entity.entityId} onClick={() => onOpenElement(entity.entityId)}><span className={`entity-glyph ${entity.type}`}>{entity.name.slice(0, 1)}</span><span><strong>{entity.name}</strong><small>{entity.summary}</small></span><ChevronRight size={13} /></button>)}</section>
@@ -755,6 +696,107 @@ export function EditorView({ snapshot, scene, localDraft, focusMode, onSelectSce
         </aside>
       )}
     </div>
+  );
+}
+
+function ExtractionReview({
+  bundle,
+  projectId,
+  busy,
+  onBusy,
+  onClose,
+  onChanged,
+  onTaskNote,
+}: {
+  bundle: ExtractedLedgerBundle;
+  projectId: string;
+  busy: boolean;
+  onBusy: (value: boolean) => void;
+  onClose: () => void;
+  onChanged: () => Promise<unknown>;
+  onTaskNote: (message: string) => void;
+}) {
+  const allIds = [...bundle.newElements, ...bundle.factProposals, ...bundle.eventProposals].map(item => item.proposalId);
+  const [selected, setSelected] = useState<string[]>(allIds);
+  const [edits, setEdits] = useState<Record<string, ExtractedProposalEdit>>({});
+  const toggle = (proposalId: string) => setSelected(current => current.includes(proposalId) ? current.filter(id => id !== proposalId) : [...current, proposalId]);
+  const edit = (proposalId: string, patch: ExtractedProposalEdit) => setEdits(current => ({ ...current, [proposalId]: { ...current[proposalId], ...patch } }));
+  const value = <K extends keyof ExtractedProposalEdit>(proposalId: string, key: K, fallback: ExtractedProposalEdit[K]) => edits[proposalId]?.[key] ?? fallback;
+  const apply = async () => {
+    if (busy || !selected.length) return;
+    onBusy(true);
+    try {
+      const proposalEdits = Object.fromEntries(Object.entries(edits).filter(([id]) => selected.includes(id)));
+      const reviewHash = await sha256Text(JSON.stringify({ artifactId: bundle.artifactId, selected, proposalEdits }));
+      await api.applyExtractedLedger({
+        projectId,
+        sceneId: bundle.sceneId,
+        artifactId: bundle.artifactId,
+        selectedProposalIds: selected,
+        ...(Object.keys(proposalEdits).length ? { proposalEdits } : {}),
+        acceptanceId: `extract_${bundle.artifactId}_${reviewHash.slice(0, 20)}`,
+      });
+      await onChanged();
+      onClose();
+      onTaskNote(`已将选中的 ${selected.length} 项提取提案写入元素账本。`);
+    } catch (cause) {
+      onTaskNote(cause instanceof Error ? cause.message : "入库失败，选中项与修改仍保留");
+    } finally {
+      onBusy(false);
+    }
+  };
+  return (
+    <section className="note-composer extraction-review" style={{ marginBottom: 12 }} aria-label="本场设定提取审阅">
+      <div className="note-composer-heading">
+        <LibraryBig size={16} />
+        <div><strong>正文反向提取审阅</strong><p>逐项选择并修改；原句与证据不可改</p></div>
+        <button className="button ghost small" disabled={busy} onClick={onClose}>关闭</button>
+      </div>
+      {bundle.newElements.map(item => {
+        const checked = selected.includes(item.proposalId);
+        return <fieldset className="fact-card extraction-proposal" key={item.proposalId} disabled={busy}>
+          <label className="extraction-select"><input type="checkbox" checked={checked} disabled={busy} onChange={() => toggle(item.proposalId)} />采用新元素</label>
+          <div className="extraction-fields">
+            <input aria-label={`新元素名称 ${item.proposalId}`} value={String(value(item.proposalId, "name", item.name))} onChange={event => edit(item.proposalId, { name: event.target.value })} />
+            <input aria-label={`新元素别名 ${item.proposalId}`} placeholder="别名，用顿号分隔" value={String(value(item.proposalId, "aliases", item.aliases)?.toString())} onChange={event => edit(item.proposalId, { aliases: event.target.value.split(/[、，,]/).map(v => v.trim()).filter(Boolean) })} />
+            <textarea aria-label={`新元素简介 ${item.proposalId}`} rows={2} value={String(value(item.proposalId, "summary", item.summary))} onChange={event => edit(item.proposalId, { summary: event.target.value })} />
+          </div>
+          <small>类型：{item.type} · 证据：「{item.quote.slice(0, 80)}」</small>
+        </fieldset>;
+      })}
+      {bundle.factProposals.map(item => {
+        const checked = selected.includes(item.proposalId);
+        return <fieldset className="fact-card extraction-proposal" key={item.proposalId} disabled={busy}>
+          <label className="extraction-select"><input type="checkbox" checked={checked} disabled={busy} onChange={() => toggle(item.proposalId)} />采用事实</label>
+          <div className="extraction-fields three">
+            <input aria-label={`事实主体 ${item.proposalId}`} value={String(value(item.proposalId, "subjectName", item.subjectName))} onChange={event => edit(item.proposalId, { subjectName: event.target.value })} />
+            <input aria-label={`事实谓词 ${item.proposalId}`} value={String(value(item.proposalId, "predicate", item.predicate))} onChange={event => edit(item.proposalId, { predicate: event.target.value })} />
+            <input aria-label={`事实值 ${item.proposalId}`} value={String(value(item.proposalId, "value", item.value))} onChange={event => edit(item.proposalId, { value: event.target.value })} />
+          </div>
+          <select aria-label={`事实语义 ${item.proposalId}`} value={String(value(item.proposalId, "semanticType", item.semanticType))} onChange={event => edit(item.proposalId, { semanticType: event.target.value as NonNullable<ExtractedProposalEdit["semanticType"]> })}>
+            <option value="world_fact">世界事实</option><option value="belief">角色信念</option><option value="rumor">传闻</option><option value="deception">假象/欺瞒</option><option value="plan">计划</option><option value="hypothesis">推测</option>
+          </select>
+          <small>证据：「{item.quote.slice(0, 80)}」</small>
+        </fieldset>;
+      })}
+      {bundle.eventProposals.map(item => {
+        const checked = selected.includes(item.proposalId);
+        return <fieldset className="fact-card extraction-proposal" key={item.proposalId} disabled={busy}>
+          <label className="extraction-select"><input type="checkbox" checked={checked} disabled={busy} onChange={() => toggle(item.proposalId)} />采用事件</label>
+          <div className="extraction-fields">
+            <input aria-label={`事件主体 ${item.proposalId}`} value={String(value(item.proposalId, "subjectName", item.subjectName))} onChange={event => edit(item.proposalId, { subjectName: event.target.value })} />
+            <input aria-label={`事件类型 ${item.proposalId}`} value={String(value(item.proposalId, "kind", item.kind))} onChange={event => edit(item.proposalId, { kind: event.target.value })} />
+            <input aria-label={`事件结果 ${item.proposalId}`} value={String(value(item.proposalId, "toValue", item.toValue))} onChange={event => edit(item.proposalId, { toValue: event.target.value })} />
+            <input aria-label={`事件时点 ${item.proposalId}`} value={String(value(item.proposalId, "storyTime", item.storyTime ?? ""))} placeholder="沿用场景时点" onChange={event => edit(item.proposalId, { storyTime: event.target.value })} />
+          </div>
+          <small>证据：「{item.quote.slice(0, 80)}」</small>
+        </fieldset>;
+      })}
+      <div className="note-composer-actions">
+        <span>已选 {selected.length} / {allIds.length} 项；修改不影响原文证据</span>
+        <button className="button primary small" disabled={busy || !selected.length} onClick={() => void apply()}><Check size={13} />确认入库（{selected.length}）</button>
+      </div>
+    </section>
   );
 }
 

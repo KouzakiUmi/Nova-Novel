@@ -24,7 +24,12 @@ export interface IngestRun {
 /** 导入提取运行器：逐场提取、逐场落盘，支持取消、续跑与统一审阅入库；run 以文件持久化。 */
 export class IngestRunner {
   private active = new Set<string>();
-  constructor(private store: DomainStore, private assist: CreativeAssistService, private dir: string) { mkdirSync(dir, { recursive: true }); }
+  constructor(
+    private store: DomainStore,
+    private assist: CreativeAssistService,
+    private dir: string,
+    private indexRevision: (projectId: string, revisionId: string, forceSceneIds: ReadonlySet<string>) => void,
+  ) { mkdirSync(dir, { recursive: true }); }
   private path(runId: string) { return resolve(this.dir, `${runId}.json`); }
   get(runId: string): IngestRun {
     try { return JSON.parse(readFileSync(this.path(runId), "utf8")) as IngestRun; }
@@ -79,7 +84,14 @@ export class IngestRunner {
     if (run.status !== "review") throw new DomainError(409, "INGEST_NOT_READY", "还有场景未完成提取，可继续运行或重试失败场景");
     const totals = { elements: 0, facts: 0, events: 0 };
     for (const bundle of run.bundles) {
-      const applied = await this.assist.applyExtractedLedger({ projectId: run.projectId, sceneId: bundle.sceneId, acceptanceId: `${acceptanceId}_${bundle.sceneId}`, newElements: bundle.newElements, factProposals: bundle.factProposals, eventProposals: bundle.eventProposals });
+      const applied = await this.assist.applyExtractedLedger({
+        projectId: run.projectId,
+        sceneId: bundle.sceneId,
+        artifactId: bundle.artifactId,
+        selectedProposalIds: [...bundle.newElements, ...bundle.factProposals, ...bundle.eventProposals].map(item => item.proposalId),
+        acceptanceId: `${acceptanceId}_${bundle.sceneId}`,
+      });
+      if (applied.revision) this.indexRevision(run.projectId, applied.revision.revisionId, new Set([bundle.sceneId]));
       totals.elements += applied.entities.length;
       totals.facts += applied.facts.length;
       totals.events += applied.events.length;

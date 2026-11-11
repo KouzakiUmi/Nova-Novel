@@ -229,7 +229,7 @@ function createTestEnv(customReply?: (payload: Record<string, unknown>) => strin
         };
       }
       if (parsed.schema === "nova-novel.extract-ledger/1") {
-        const firstScene = store.listScenes(project.projectId)[0]!;
+        const firstScene = store.listScenes(request.projectId)[0]!;
         const validQuote = firstScene.body.split(/\n{2,}/)[0]!.trim();
         return {
           completeness: "complete",
@@ -280,7 +280,7 @@ function createTestEnv(customReply?: (payload: Record<string, unknown>) => strin
     },
   };
 
-  const server = createApp({ store, knowledge, workflow, pi });
+  const server = createApp({ store, knowledge, workflow, pi, ingestDir: join(directory, "ingest-runs") });
   return {
     store,
     knowledge,
@@ -629,6 +629,8 @@ test("Manuscript Reverse Extraction (extract_ledger): filters out hallucinated q
   try {
     const base = await env.start();
     const firstScene = env.store.listScenes(env.project.projectId)[0]!;
+    // 叙述顺序与故事时点故意不同，入库必须采用故事时点。
+    env.store.saveScene(firstScene.sceneId, { baseRevisionId: firstScene.baseRevisionId, patch: { storyTime: "2" } });
     const extractRes = await fetch(`${base}/api/assist/extract-ledger`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -652,20 +654,21 @@ test("Manuscript Reverse Extraction (extract_ledger): filters out hallucinated q
       body: JSON.stringify({
         projectId: env.project.projectId,
         sceneId: firstScene.sceneId,
-        newElements: bundle.newElements,
-        factProposals: bundle.factProposals,
-        eventProposals: bundle.eventProposals,
+        artifactId: bundle.artifactId,
+        selectedProposalIds: [...bundle.newElements, ...bundle.factProposals, ...bundle.eventProposals].map(item => item.proposalId),
       }),
     });
     assert.equal(applyRes.status, 200);
     const applied = (await applyRes.json()) as {
       entities: Array<{ name: string; sourceKind: string }>;
-      facts: Array<{ predicate: string; evidenceIds: string[] }>;
-      events: Array<{ kind: string; evidenceIds: string[] }>;
+      facts: Array<{ predicate: string; evidenceIds: string[]; validFrom?: string }>;
+      events: Array<{ kind: string; evidenceIds: string[]; storyOrder: number }>;
       revision?: { revisionId: string };
     };
     assert.equal(applied.entities[0]!.name, "铁盒");
     assert.equal(applied.entities[0]!.sourceKind, "manuscript");
+    assert.equal(applied.facts[0]!.validFrom, "2");
+    assert.equal(applied.events[0]!.storyOrder, 2);
     // 入库若推进了分支头，证据必须已重绑到新修订：事实引用不得再指向旧修订的证据 ID。
     const headRevisionId = env.store.getBranch(env.project.activeBranchId).headRevisionId;
     if (applied.revision) {
@@ -688,7 +691,7 @@ test("Manuscript Reverse Extraction (extract_ledger): filters out hallucinated q
         query: "铁盒 位置",
         purpose: "fact_check",
         narrationOrder: headScene.narrationOrder,
-        storyOrder: 1,
+        storyOrder: 2,
       }),
     });
     assert.equal(queryRes.status, 200);
@@ -697,6 +700,93 @@ test("Manuscript Reverse Extraction (extract_ledger): filters out hallucinated q
       queried.facts?.some((f) => f.predicate === "location"),
       "apply 后新事实应出现在上下文检索结果中",
     );
+  } finally {
+    await env.close();
+  }
+});
+
+test("提取提案可按产物分批选择编辑，伪造字段与正文变更被拒绝", async () => {
+  const env = createTestEnv();
+  try {
+    const base = await env.start();
+    const scene = env.store.listScenes(env.project.projectId)[0]!;
+    const extract = await fetch(`${base}/api/assist/extract-ledger`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ projectId: env.project.projectId, sceneId: scene.sceneId }) });
+    const bundle = await extract.json() as ExtractedLedgerBundle;
+    // 只推进修订而不改正文时，仍应按区块与原句重绑当前证据。
+    env.store.nameRevision(env.project.projectId, { name: "提取后的命名版本", baseRevisionId: bundle.revisionId });
+    const apply = async (selectedProposalIds: string[], acceptanceId: string, proposalEdits?: Record<string, unknown>) => fetch(`${base}/api/assist/extract-ledger/apply`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ projectId: env.project.projectId, sceneId: scene.sceneId, artifactId: bundle.artifactId, selectedProposalIds, acceptanceId, ...(proposalEdits ? { proposalEdits } : {}) }),
+    });
+
+    const elementId = bundle.newElements[0]!.proposalId;
+    const first = await apply([elementId], "extract_batch_element", { [elementId]: { name: "修订铁盒", summary: "经作者修改的提取元素" } });
+    assert.equal(first.status, 200);
+    const firstResult = await first.json() as { entities: Array<{ name: string }>; facts: unknown[]; events: unknown[] };
+    assert.equal(firstResult.entities[0]!.name, "修订铁盒");
+    assert.equal(firstResult.facts.length, 0);
+    assert.equal(firstResult.events.length, 0);
+
+    const factId = bundle.factProposals[0]!.proposalId;
+    const eventId = bundle.eventProposals[0]!.proposalId;
+    const second = await apply([factId, eventId], "extract_batch_facts", {
+      [factId]: { subjectName: "修订铁盒", value: "柜台左侧" },
+      [eventId]: { subjectName: "修订铁盒", toValue: "已被取出" },
+    });
+    assert.equal(second.status, 200);
+    const secondResult = await second.json() as { facts: Array<{ value: unknown }>; events: Array<{ toValue?: string }> };
+    assert.equal(secondResult.facts[0]!.value, "柜台左侧");
+    assert.equal(secondResult.events[0]!.toValue, "已被取出");
+
+    const forged = await apply([factId], "extract_forbidden_edit", { [factId]: { quote: "伪造原文" } });
+    assert.equal(forged.status, 400);
+    const unknown = await apply(["not-in-artifact"], "extract_unknown_item");
+    assert.equal(unknown.status, 400);
+
+    const head = env.store.getBranch(env.project.activeBranchId).headRevisionId;
+    const current = env.store.getScene(scene.sceneId, head);
+    env.store.saveScene(scene.sceneId, { baseRevisionId: head, body: `${current.body}\n\n正文已经改变。` });
+    const stale = await apply([eventId], "extract_stale_body");
+    assert.equal(stale.status, 409, "正文变化后不能继续采用旧提取提案");
+  } finally {
+    await env.close();
+  }
+});
+
+test("导入提交后事实引用与当前证据快照同步更新", async () => {
+  const env = createTestEnv();
+  try {
+    const base = await env.start();
+    const imported = await fetch(`${base}/api/import`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: "证据同步导入", chapters: [{ title: "第一章", scenes: [{ title: "铁盒", body: "铁盒最底下还有一张旧收据，已付，待取。" }] }] }),
+    });
+    const importedText = await imported.text();
+    assert.equal(imported.status, 201, importedText);
+    const importedProject = JSON.parse(importedText) as { project: { projectId: string } };
+    const started = await fetch(`${base}/api/ingest/start`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ projectId: importedProject.project.projectId }),
+    });
+    const startedText = await started.text();
+    assert.equal(started.status, 201, startedText);
+    const created = JSON.parse(startedText) as { runId: string; project: { projectId: string } };
+    let run: { status: string; bundles: unknown[]; failed: unknown[] } | undefined;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      run = await (await fetch(`${base}/api/ingest/${created.runId}`)).json() as { status: string; bundles: unknown[]; failed: unknown[] };
+      if (run.status === "review") break;
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.equal(run?.status, "review");
+    assert.ok(run.bundles.length > 0, `导入提取未生成提案：${JSON.stringify(run)}`);
+    const committed = await fetch(`${base}/api/ingest/${created.runId}/commit`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ acceptanceId: "ingest_evidence_sync" }) });
+    const committedText = await committed.text();
+    assert.equal(committed.status, 200, committedText);
+    const result = JSON.parse(committedText) as { snapshot: WorkspaceSnapshot };
+    const evidenceIds = new Set(result.snapshot.evidence.map(item => item.evidenceId));
+    assert.ok(result.snapshot.facts.length > 0);
+    for (const fact of result.snapshot.facts) for (const id of fact.evidenceIds) assert.ok(evidenceIds.has(id), `事实证据 ${id} 必须出现在当前快照`);
+    for (const event of result.snapshot.events) for (const id of event.evidenceIds) assert.ok(evidenceIds.has(id), `事件证据 ${id} 必须出现在当前快照`);
   } finally {
     await env.close();
   }

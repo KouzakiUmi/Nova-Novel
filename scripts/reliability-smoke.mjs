@@ -154,8 +154,10 @@ try {
   const created = await call("/api/projects", "POST", { title: `竞态目标${Date.now()}`, premise: "竞态验收" });
   assert.equal(created.status, 201, "创建作品应成功");
   const targetProjectId = created.body.activeProject.projectId;
-  // 先刷新界面让新作品进入切换器，再切过去
-  await evaluate("fetch('/api/bootstrap').then(r => r.json()).then(() => true)").catch(() => undefined);
+  // 外部 API 创建作品后显式重载权威快照，不依赖其他保存操作附带的后台刷新。
+  await evaluate("location.reload(); true");
+  await wait(1800);
+  await until(() => evaluate("Boolean(document.querySelector('.app-shell') || document.querySelector('.start-view'))"), "作品创建后重新挂载");
   await navigate("创作起步", ".start-view");
   await until(() => evaluate(`(() => { const s = document.querySelector('select[aria-label="切换作品"]'); return Boolean(s && [...s.options].some(o => o.value === ${JSON.stringify(targetProjectId)})); })()`), "新作品出现在切换器", 200);
   const switched = await evaluate(`(() => {

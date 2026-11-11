@@ -699,7 +699,7 @@ test("FTS 写入失败也回滚当前场全部新证据，不留下只有证据�
   assert.equal(kb.getIndexStatus(PROJECT, REVISION).state, "error");
 });
 
-test("修订索引状态只有完整场景清单全部成功才 ready，pending/error 保留旧修订", () => {
+test("修订索引状态只有完整场景清单全部成功才 ready，pending/error 保留旧修订且进度可持久化", () => {
   const db = createDatabase();
   const kb = new SqliteKnowledgeService(db);
   const first = sceneOf({ sceneId: "first", body: "第一场", storyTime: "day 0" });
@@ -723,7 +723,7 @@ test("修订索引状态只有完整场景清单全部成功才 ready，pending/
   assert.equal(failed.indexState.keywordRevisionId, REVISION);
   assert.ok(failed.excluded.some((e) => e.reason === "keyword_index_error"));
   const restarted = new SqliteKnowledgeService(db);
-  assert.equal(restarted.getIndexStatus(PROJECT, REVISION).state, "pending", "重启后没有完整性证明，不沿用进程内 ready");
+  assert.equal(restarted.getIndexStatus(PROJECT, REVISION).state, "ready", "重启后读取持久化进度，并重新核验实际证据与 FTS");
 });
 
 test("外层回滚或 FTS 丢失后不沿用内存中的完整索引声明", () => {
@@ -763,11 +763,106 @@ test("分段索引一次加载实体别名，SQL 数量不随段落乘实体数�
   const reads = statements.filter((sql) => /^\s*SELECT/.test(sql));
   assert.equal(reads.filter((sql) => sql.includes("FROM kw_entities")).length, 1);
   assert.equal(reads.filter((sql) => sql.includes("FROM kw_aliases")).length, 0);
-  assert.equal(reads.length, 3, "只有实体别名 JOIN、场景时间与旧证据三个读取，不按段或实体查询别名");
+  assert.equal(reads.length, 4, "实体别名 JOIN、场景时间、旧证据与一条持久化进度读取，不按段或实体查询别名");
   const rows = db.prepare("SELECT entity_refs, secret_refs FROM kw_evidence WHERE source_revision_id = ?").all(REVISION) as Array<{ entity_refs: string; secret_refs: string }>;
   assert.equal(rows.length, 12);
   for (const row of rows) {
     assert.deepEqual(JSON.parse(row.entity_refs), [character, item, secret], "保留实体插入顺序、别名命中与非空约束，隔离其他路线");
     assert.deepEqual(JSON.parse(row.secret_refs), [secret]);
   }
+});
+
+test("关键词证据召回遵守数量上限且不混入其他场景", () => {
+  const kb = newService();
+  const scenes = Array.from({ length: 4 }, (_, index) => sceneOf({
+    sceneId: `scene_limit_${index}`,
+    body: `共同线索，第 ${index} 段。`,
+    narrationOrder: index + 1,
+    storyTime: "day 0",
+  }));
+  kb.beginRevisionIndex(PROJECT, REVISION, scenes.map(scene => scene.sceneId));
+  for (const scene of scenes) kb.indexScene(scene, REVISION);
+  const limited = kb.queryContext(baseQuery({ query: "共同线索", limit: 2, storyOrder: 1 }));
+  assert.equal(limited.evidence.length, 2);
+  assert.ok(limited.evidence.every(item => item.quote.includes("共同线索")));
+  const clamped = kb.queryContext(baseQuery({ query: "共同线索", limit: 999, storyOrder: 1 }));
+  assert.equal(clamped.evidence.length, 4, "上限只限制额外召回，不应复制或制造证据");
+});
+
+test("新修订复用未变场景证据，正文或时空坐标变化时拒绝复用", () => {
+  const db = createDatabase();
+  const kb = new SqliteKnowledgeService(db);
+  const first = sceneOf({ sceneId: "scene_keep", body: "保留正文。", narrationOrder: 1, storyTime: "1" });
+  const second = sceneOf({ sceneId: "scene_change", body: "旧第二场。", narrationOrder: 2, storyTime: "1" });
+  kb.beginRevisionIndex(PROJECT, REVISION, [first.sceneId, second.sceneId]);
+  kb.indexScene(first, REVISION);
+  kb.indexScene(second, REVISION);
+  assert.equal(kb.getIndexStatus(PROJECT, REVISION).state, "ready");
+  const originalEvidence = kb.queryContext(baseQuery({ query: "保留正文", storyOrder: 1 })).evidence[0]!;
+
+  kb.beginRevisionIndex(PROJECT, OTHER_REVISION, [first.sceneId, second.sceneId]);
+  assert.equal(kb.reuseSceneIndex(first, OTHER_REVISION, REVISION), true);
+  const changedSecond = { ...second, body: "新第二场。" };
+  assert.equal(kb.reuseSceneIndex(changedSecond, OTHER_REVISION, REVISION), false, "正文变化必须重建");
+  kb.indexScene(changedSecond, OTHER_REVISION);
+  assert.equal(kb.getIndexStatus(PROJECT, OTHER_REVISION).state, "ready");
+
+  const inherited = kb.queryContext(baseQuery({ revisionId: OTHER_REVISION, query: "保留正文", storyOrder: 1 })).evidence;
+  assert.equal(inherited.length, 1);
+  assert.equal(inherited[0]!.evidenceId, originalEvidence.evidenceId);
+  assert.equal(inherited[0]!.sourceRevisionId, REVISION, "继承证据保留真实来源修订");
+  assert.equal(kb.queryContext(baseQuery({ revisionId: OTHER_REVISION, query: "旧第二场", storyOrder: 1 })).evidence.length, 0, "旧稿仍留在 FTS 也不能进入新修订");
+  assert.equal(kb.queryContext(baseQuery({ revisionId: OTHER_REVISION, query: "新第二场", storyOrder: 1 })).evidence.length, 1);
+
+  const thirdRevision = "rev_changed_time";
+  kb.beginRevisionIndex(PROJECT, thirdRevision, [first.sceneId]);
+  assert.equal(kb.reuseSceneIndex({ ...first, storyTime: "2" }, thirdRevision, OTHER_REVISION), false, "故事时点变化不得沿用旧时间证据");
+});
+
+test("同一区块同时存在继承与重建证据时只返回当前修订的一份", () => {
+  const kb = newService();
+  const scene = sceneOf({ sceneId: "scene_dedupe", body: "唯一证据。", storyTime: "1" });
+  kb.beginRevisionIndex(PROJECT, REVISION, [scene.sceneId]);
+  kb.indexScene(scene, REVISION);
+  kb.beginRevisionIndex(PROJECT, OTHER_REVISION, [scene.sceneId]);
+  kb.indexScene(scene, OTHER_REVISION);
+  const result = kb.queryContext(baseQuery({ revisionId: OTHER_REVISION, query: "唯一证据", storyOrder: 1 }));
+  assert.equal(result.evidence.length, 1);
+  assert.equal(result.evidence[0]!.sourceRevisionId, OTHER_REVISION);
+});
+
+test("约百万字、500 场景的新修订只重建一个变化场景", (t) => {
+  const kb = newService();
+  const scenes = Array.from({ length: 500 }, (_, index) => sceneOf({
+    sceneId: `scene_scale_${index}`,
+    body: `第${index}场共同正文。${"长".repeat(1980)}`,
+    narrationOrder: index + 1,
+    storyTime: "1",
+  }));
+  kb.beginRevisionIndex(PROJECT, REVISION, scenes.map(scene => scene.sceneId));
+  for (const scene of scenes) kb.indexScene(scene, REVISION);
+  assert.equal(kb.getIndexStatus(PROJECT, REVISION).state, "ready");
+
+  let rebuilt = 0;
+  let reused = 0;
+  const indexScene = kb.indexScene.bind(kb);
+  const reuseSceneIndex = kb.reuseSceneIndex.bind(kb);
+  kb.indexScene = (scene, revisionId) => { rebuilt += 1; indexScene(scene, revisionId); };
+  kb.reuseSceneIndex = (scene, revisionId, sourceRevisionId) => {
+    const result = reuseSceneIndex(scene, revisionId, sourceRevisionId);
+    if (result) reused += 1;
+    return result;
+  };
+  const started = performance.now();
+  kb.beginRevisionIndex(PROJECT, OTHER_REVISION, scenes.map(scene => scene.sceneId));
+  for (const scene of scenes) {
+    const next = scene.sceneId === "scene_scale_499" ? { ...scene, body: `${scene.body}\n\n唯一的新结尾。` } : scene;
+    if (!kb.reuseSceneIndex(next, OTHER_REVISION, REVISION)) kb.indexScene(next, OTHER_REVISION);
+  }
+  const elapsedMs = performance.now() - started;
+  assert.equal(reused, 499);
+  assert.equal(rebuilt, 1);
+  assert.equal(kb.getIndexStatus(PROJECT, OTHER_REVISION).state, "ready");
+  assert.equal(kb.queryContext(baseQuery({ revisionId: OTHER_REVISION, query: "唯一的新结尾", storyOrder: 1 })).evidence.length, 1);
+  t.diagnostic(`500 场景增量索引单次测量：${elapsedMs.toFixed(1)}ms（499 场复用，1 场重建；非 P95 验收）`);
 });

@@ -1220,3 +1220,18 @@ kbd { font-family: inherit; font-size: calc(13px * var(--ui-scale)); color: var(
 .appearance-license-links a { color: var(--green); font-size: calc(13px * var(--ui-scale)); }
 @media (max-width: 900px) { .appearance-layout { grid-template-columns: 1fr; } .appearance-fields { grid-template-columns: 1fr; } .appearance-scale { align-items: flex-start; flex-direction: column; } }
 @media (max-width: 700px) { .settings-section-tabs { padding: 8px 14px; overflow-x: auto; } .appearance-scale .segmented-control { flex-wrap: wrap; } .detected-provider-card { align-items: flex-start; } }
+
+/* 提取审阅与账本纠错 */
+.extraction-proposal { min-width: 0; margin: 0 0 10px; padding: 12px; border: 1px solid var(--line); border-radius: 7px; background: var(--white); }
+.extraction-select { display: flex; align-items: center; gap: 7px; margin-bottom: 8px; color: var(--green); font-size: calc(13px * var(--ui-scale)); font-weight: 600; }
+.extraction-select input { width: 16px; height: 16px; }
+.extraction-fields { display: grid; grid-template-columns: 1fr; gap: 7px; margin-bottom: 7px; }
+.extraction-fields.three { grid-template-columns: 1fr; }
+.extraction-fields input, .extraction-fields textarea, .extraction-proposal select { min-width: 0; width: 100%; font-family: var(--ui-font); font-size: calc(13px * var(--ui-scale)); }
+.extraction-proposal > small { display: block; margin-top: 7px; color: var(--muted); line-height: 1.6; }
+.fact-card-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin-top: 8px; }
+.fact-card-actions .text-button { display: inline-flex; align-items: center; gap: 4px; }
+.fact-card.is-rejected { opacity: .62; background: var(--paper); }
+.index-health { flex-wrap: wrap; }
+.index-health .button { margin-left: 4px; }
+@media (max-width: 700px) { .extraction-fields, .extraction-fields.three { grid-template-columns: 1fr; } }

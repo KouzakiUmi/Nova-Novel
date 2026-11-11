@@ -1,6 +1,7 @@
 import type {
   AgentSettingsView,
   AgentTask,
+  ApplyExtractedLedgerInput,
   GenerationProgress,
   ProviderModelInput,
   ProviderTestResult,
@@ -37,14 +38,11 @@ import type {
   NoteIncubateTarget,
   NoteIncubateResult,
   ExtractedLedgerBundle,
-  ExtractedElementProposal,
-  ExtractedFactProposal,
-  ExtractedEventProposal,
   FactAssertion,
   WorldEvent,
   ImportedChapterDraft,
-  ManuscriptPreview,
   IngestPlan,
+  KeywordIndexStatus,
 } from "@nova-novel/shared";
 
 export interface IngestRunView {
@@ -59,6 +57,15 @@ export interface IngestRunView {
   cancelRequested?: boolean;
 }
 import type { AppearanceSettings } from "./appearance";
+
+export interface SceneSaveResponse {
+  scene: Scene;
+  revisionId: string;
+  revision: Revision;
+  evidence: WorkspaceSnapshot["evidence"];
+  storyGraph: WorkspaceSnapshot["storyGraph"];
+  project: WorkspaceSnapshot["activeProject"];
+}
 
 export class ApiError extends Error {
   constructor(
@@ -149,16 +156,14 @@ export const api = {
       method: "POST",
       body: JSON.stringify(input),
     }),
-  analyzeImport: (input: { text: string; useAi?: boolean }) =>
-    request<ManuscriptPreview>("/api/import/analyze", { method: "POST", body: JSON.stringify(input) }),
-  importProject: (input: { title: string; premise?: string; text?: string; chapters?: ImportedChapterDraft[] }) =>
+  importProject: (input: { title: string; premise?: string; chapters?: ImportedChapterDraft[] }) =>
     request<{ project: WorkspaceSnapshot["activeProject"]; revision: Revision; snapshot: WorkspaceSnapshot }>("/api/import", { method: "POST", body: JSON.stringify(input) }),
   importAppend: (input: { projectId: string; baseRevisionId: string; chapters: ImportedChapterDraft[] }) =>
     request<{ revision: Revision; snapshot: WorkspaceSnapshot }>("/api/import/append", { method: "POST", body: JSON.stringify(input) }),
-  ingestPlan: (input: { text: string; useAi?: boolean }) =>
-    request<{ plan: IngestPlan | null; preview: ManuscriptPreview }>("/api/ingest/plan", { method: "POST", body: JSON.stringify(input) }),
-  ingestStart: (input: { title: string; chapters: ImportedChapterDraft[] }) =>
-    request<{ runId: string; project: WorkspaceSnapshot["activeProject"]; revision: Revision; snapshot: WorkspaceSnapshot }>("/api/ingest/start", { method: "POST", body: JSON.stringify(input) }),
+  ingestPlan: (input: { digest: { chapterCount: number; sceneCount: number; wordCount: number; titles: string[]; head: string; middle: string; tail: string; opening: string }; useAi?: boolean }) =>
+    request<{ plan: IngestPlan | null; warnings: string[] }>("/api/ingest/plan", { method: "POST", body: JSON.stringify(input) }),
+  ingestStart: (input: { projectId: string }) =>
+    request<{ runId: string; project: WorkspaceSnapshot["activeProject"]; snapshot: WorkspaceSnapshot }>("/api/ingest/start", { method: "POST", body: JSON.stringify(input) }),
   ingestRun: (runId: string) => request<IngestRunView>(`/api/ingest/${runId}`),
   ingestAction: (runId: string, action: "cancel" | "resume" | "discard") =>
     request<IngestRunView>(`/api/ingest/${runId}/${action}`, { method: "POST", body: "{}" }),
@@ -194,7 +199,7 @@ export const api = {
   moveScene: (sceneId: string, chapterId: string, narrationOrder: number, baseRevisionId: string) =>
     request<{ revision: Revision; snapshot: WorkspaceSnapshot }>(`/api/scenes/${sceneId}/move`, { method: "POST", body: JSON.stringify({ chapterId, narrationOrder, baseRevisionId }) }),
   saveScene: (scene: Scene) =>
-    request<{ scene: Scene; revisionId: string }>(`/api/scenes/${scene.sceneId}`, {
+    request<SceneSaveResponse>(`/api/scenes/${scene.sceneId}`, {
       method: "PATCH",
       body: JSON.stringify({
         baseRevisionId: scene.baseRevisionId,
@@ -210,7 +215,7 @@ export const api = {
     }),
   /** 只改结构字段（标题、章节、叙述顺序等），不发送正文与摘要，避免结构操作覆盖正文。 */
   saveSceneStructure: (scene: Scene, patch: { title?: string; storyTime?: string; pov?: string }) =>
-    request<{ scene: Scene; revisionId: string }>(`/api/scenes/${scene.sceneId}`, {
+    request<SceneSaveResponse>(`/api/scenes/${scene.sceneId}`, {
       method: "PATCH",
       body: JSON.stringify({ baseRevisionId: scene.baseRevisionId, ...patch }),
     }),
@@ -218,6 +223,13 @@ export const api = {
     request<ContextBundle>("/api/context/query", {
       method: "POST",
       body: JSON.stringify(query),
+    }),
+  knowledgeIndexStatus: (projectId: string, revisionId: string) =>
+    request<KeywordIndexStatus>(`/api/knowledge/index-status?projectId=${encodeURIComponent(projectId)}&revisionId=${encodeURIComponent(revisionId)}`),
+  rebuildKnowledgeIndex: (projectId: string, revisionId: string) =>
+    request<KeywordIndexStatus & { revisionId: string }>("/api/knowledge/rebuild", {
+      method: "POST",
+      body: JSON.stringify({ projectId, revisionId }),
     }),
   generate: (input: GenerationRequest) =>
     request<GenerationReceipt>("/api/generate", {
@@ -273,7 +285,7 @@ export const api = {
       method: "POST",
       body: JSON.stringify(modelId ? { modelId } : {}),
     }),
-  discoverModels: (providerId: string, input: { baseUrl?: string; api?: string; apiKey?: string }) =>
+  discoverModels: (providerId: string, input: { baseUrl?: string; api?: string; apiKey?: string; proxyEnabled?: boolean; proxyUrl?: string }) =>
     request<{ models: ProviderModelInput[] }>(`/api/agent/providers/${encodeURIComponent(providerId)}/discover`, {
       method: "POST",
       body: JSON.stringify(input),
@@ -338,6 +350,24 @@ export const api = {
       method: "POST",
       body: JSON.stringify(input),
     }),
+  updateElementFact: (
+    entityId: string,
+    factId: string,
+    input: {
+      projectId: string;
+      predicate?: string;
+      value?: string;
+      valueEntityId?: string;
+      semanticType?: FactAssertion["semanticType"];
+      validFromOrder?: number | null;
+      validToOrder?: number | null;
+      reviewState?: "confirmed" | "rejected";
+    },
+  ) =>
+    request<{ fact: FactAssertion; snapshot: WorkspaceSnapshot }>(`/api/elements/${encodeURIComponent(entityId)}/facts/${encodeURIComponent(factId)}`, {
+      method: "PATCH",
+      body: JSON.stringify(input),
+    }),
   addElementEvent: (
     entityId: string,
     input: {
@@ -353,6 +383,25 @@ export const api = {
   ) =>
     request<{ event: WorldEvent; snapshot: WorkspaceSnapshot }>(`/api/elements/${encodeURIComponent(entityId)}/events`, {
       method: "POST",
+      body: JSON.stringify(input),
+    }),
+  updateElementEvent: (
+    entityId: string,
+    eventId: string,
+    input: {
+      projectId: string;
+      kind?: string;
+      sceneId?: string | null;
+      storyTime?: string;
+      storyOrder?: number;
+      fromValue?: string;
+      toValue?: string;
+      location?: string;
+      reviewState?: "confirmed" | "rejected";
+    },
+  ) =>
+    request<{ event: WorldEvent; snapshot: WorkspaceSnapshot }>(`/api/elements/${encodeURIComponent(entityId)}/events/${encodeURIComponent(eventId)}`, {
+      method: "PATCH",
       body: JSON.stringify(input),
     }),
   elementDesign: (input: {
@@ -469,14 +518,7 @@ export const api = {
       method: "POST",
       body: JSON.stringify(input),
     }),
-  applyExtractedLedger: (input: {
-    projectId: string;
-    sceneId: string;
-    acceptanceId?: string;
-    newElements?: ExtractedElementProposal[];
-    factProposals?: ExtractedFactProposal[];
-    eventProposals?: ExtractedEventProposal[];
-  }) =>
+  applyExtractedLedger: (input: ApplyExtractedLedgerInput) =>
     request<{ entities: Entity[]; facts: FactAssertion[]; events: WorldEvent[]; snapshot: WorkspaceSnapshot }>("/api/assist/extract-ledger/apply", {
       method: "POST",
       body: JSON.stringify(input),

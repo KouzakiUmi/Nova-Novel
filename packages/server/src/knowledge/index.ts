@@ -273,6 +273,17 @@ CREATE TABLE IF NOT EXISTS kw_plans (
   text TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS kw_plans_lookup_idx ON kw_plans(project_id, route_id, revision_id);
+
+CREATE TABLE IF NOT EXISTS kw_revision_indexes (
+  project_id TEXT NOT NULL,
+  revision_id TEXT NOT NULL,
+  expected_json TEXT NOT NULL,
+  completed_json TEXT NOT NULL,
+  failed_json TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (revision_id)
+);
+CREATE INDEX IF NOT EXISTS kw_revision_indexes_project_idx ON kw_revision_indexes(project_id, updated_at);
 `;
 
 const FTS_SQL = `
@@ -452,9 +463,14 @@ interface MentionEntry {
   secret: boolean;
 }
 
+interface CompletedSceneIndex {
+  bodyHash: string;
+  evidenceIds: string[];
+}
+
 interface RevisionIndexProgress {
   expected: Set<string> | null;
-  completed: Map<string, { bodyHash: string; evidenceIds: string[] }>;
+  completed: Map<string, CompletedSceneIndex>;
   failed: Set<string>;
 }
 
@@ -465,7 +481,6 @@ export interface KeywordIndexStatus {
 
 export class SqliteKnowledgeService implements KnowledgeService {
   private readonly db: SqliteDatabase;
-  private readonly revisionIndexes = new Map<string, Map<string, RevisionIndexProgress>>();
   private readonly lastKeywordRevisions = new Map<string, string>();
 
   constructor(db: SqliteDatabase) {
@@ -490,6 +505,39 @@ export class SqliteKnowledgeService implements KnowledgeService {
 
   private get<T>(sql: string, ...params: unknown[]): T | undefined {
     return this.db.prepare(sql).get(...params.map(toDb)) as unknown as T | undefined;
+  }
+
+  /** 进度与派生索引同事务持久化；不以进程内 Map 代替数据库事实。 */
+  private readRevisionIndex(projectId: string, revisionId: string): RevisionIndexProgress | undefined {
+    const row = this.get<{ expected_json: string; completed_json: string; failed_json: string }>(
+      "SELECT expected_json, completed_json, failed_json FROM kw_revision_indexes WHERE project_id = ? AND revision_id = ?",
+      projectId, revisionId,
+    );
+    if (!row) return undefined;
+    try {
+      const expectedValue = JSON.parse(row.expected_json) as unknown;
+      const completedValue = JSON.parse(row.completed_json) as unknown;
+      const failedValue = JSON.parse(row.failed_json) as unknown;
+      if ((expectedValue !== null && (!Array.isArray(expectedValue) || !expectedValue.every(item => typeof item === "string"))) || !completedValue || typeof completedValue !== "object" || Array.isArray(completedValue) || !Array.isArray(failedValue)) return undefined;
+      const completed = new Map<string, CompletedSceneIndex>();
+      for (const [sceneId, value] of Object.entries(completedValue)) {
+        if (!value || typeof value !== "object") continue;
+        const candidate = value as Partial<CompletedSceneIndex>;
+        if (typeof candidate.bodyHash === "string" && Array.isArray(candidate.evidenceIds) && candidate.evidenceIds.every(id => typeof id === "string")) completed.set(sceneId, { bodyHash: candidate.bodyHash, evidenceIds: [...candidate.evidenceIds] });
+      }
+      return { expected: expectedValue === null ? null : new Set(expectedValue), completed, failed: new Set(failedValue.filter((id): id is string => typeof id === "string")) };
+    } catch {
+      return undefined;
+    }
+  }
+
+  private writeRevisionIndex(projectId: string, revisionId: string, progress: RevisionIndexProgress): void {
+    this.run(
+      `INSERT INTO kw_revision_indexes(project_id,revision_id,expected_json,completed_json,failed_json,updated_at) VALUES(?,?,?,?,?,?)
+       ON CONFLICT(revision_id) DO UPDATE SET expected_json=excluded.expected_json, completed_json=excluded.completed_json, failed_json=excluded.failed_json, updated_at=excluded.updated_at`,
+      projectId, revisionId, JSON.stringify(progress.expected === null ? null : [...progress.expected]),
+      JSON.stringify(Object.fromEntries(progress.completed)), JSON.stringify([...progress.failed]), new Date().toISOString(),
+    );
   }
 
   // ---------- 写入：权威对象 ----------
@@ -639,40 +687,34 @@ export class SqliteKnowledgeService implements KnowledgeService {
 
   /** 调用方须传入权威修订的完整场景清单；未声明清单的逐场索引不能证明修订完整。 */
   beginRevisionIndex(projectId: string, revisionId: string, sceneIds: readonly string[]): void {
-    const indexes = this.revisionIndexes.get(projectId) ?? new Map<string, RevisionIndexProgress>();
-    indexes.set(revisionId, { expected: new Set(sceneIds), completed: new Map(), failed: new Set() });
-    this.revisionIndexes.set(projectId, indexes);
+    this.writeRevisionIndex(projectId, revisionId, { expected: new Set(sceneIds), completed: new Map(), failed: new Set() });
+  }
+
+  private sceneCompletionValid(ref: SceneRefRow, saved: CompletedSceneIndex): boolean {
+    if (ref.body_hash !== saved.bodyHash || saved.evidenceIds.length !== new Set(saved.evidenceIds).size) return false;
+    if (saved.evidenceIds.length === 0) return true;
+    const placeholders = saved.evidenceIds.map(() => "?").join(",");
+    const rows = this.all<EvidenceRow>(`SELECT * FROM kw_evidence WHERE evidence_id IN (${placeholders})`, ...saved.evidenceIds);
+    if (rows.length !== saved.evidenceIds.length) return false;
+    const ftsRows = this.all<{ ref_id: string; route_id: string }>(
+      `SELECT ref_id, route_id FROM kw_fts WHERE ref_type = 'evidence' AND ref_id IN (${placeholders})`,
+      ...saved.evidenceIds,
+    );
+    const routesById = new Map<string, string[]>();
+    for (const row of ftsRows) routesById.set(row.ref_id, [...routesById.get(row.ref_id) ?? [], row.route_id]);
+    return rows.every(row => this.evidenceSourceCompatible(row, ref) && routesById.get(row.evidence_id)?.length === 1 && routesById.get(row.evidence_id)?.[0] === row.route_id);
   }
 
   getIndexStatus(projectId: string, revisionId: string): KeywordIndexStatus {
-    const progress = this.revisionIndexes.get(projectId)?.get(revisionId);
+    const progress = this.readRevisionIndex(projectId, revisionId);
     let state: KeywordIndexStatus["state"] = progress?.failed.size ? "error" : "pending";
     if (progress?.expected !== null && progress?.expected !== undefined && state !== "error") {
       const refs = this.all<SceneRefRow>("SELECT * FROM kw_scene_refs WHERE project_id = ? AND revision_id = ?", projectId, revisionId);
-      const rows = this.all<{ evidence_id: string; scene_id: string; route_id: string }>(
-        "SELECT evidence_id, scene_id, route_id FROM kw_evidence WHERE project_id = ? AND source_revision_id = ? AND source_kind = 'manuscript'", projectId, revisionId,
-      );
-      const indexed = new Map<string, string[]>();
-      for (const row of this.all<{ ref_id: string; route_id: string }>("SELECT ref_id, route_id FROM kw_fts WHERE project_id = ? AND ref_type = 'evidence'", projectId)) {
-        const routes = indexed.get(row.ref_id) ?? [];
-        routes.push(row.route_id);
-        indexed.set(row.ref_id, routes);
-      }
       const refsByScene = new Map(refs.map((ref) => [ref.scene_id, ref]));
-      const rowsByScene = new Map<string, typeof rows>();
-      for (const row of rows) {
-        const sceneRows = rowsByScene.get(row.scene_id) ?? [];
-        sceneRows.push(row);
-        rowsByScene.set(row.scene_id, sceneRows);
-      }
-      const complete = refs.length === progress.expected.size && rows.every((row) => progress.expected?.has(row.scene_id)) && [...progress.expected].every((sceneId) => {
+      const complete = refs.length === progress.expected.size && [...progress.expected].every((sceneId) => {
         const saved = progress.completed.get(sceneId);
-        if (!saved) return false;
         const ref = refsByScene.get(sceneId);
-        if (!ref || ref.body_hash !== saved.bodyHash) return false;
-        const sceneRows = rowsByScene.get(sceneId) ?? [];
-        const ids = new Set(saved.evidenceIds);
-        return sceneRows.length === ids.size && sceneRows.every((row) => row.route_id === ref.route_id && ids.has(row.evidence_id) && indexed.get(row.evidence_id)?.length === 1 && indexed.get(row.evidence_id)?.[0] === row.route_id);
+        return saved !== undefined && ref !== undefined && this.sceneCompletionValid(ref, saved);
       });
       if (complete) state = "ready";
     }
@@ -681,23 +723,53 @@ export class SqliteKnowledgeService implements KnowledgeService {
     return { state, keywordRevisionId: state === "ready" ? revisionId : previous !== revisionId && previous !== undefined ? previous : `${state}:${revisionId}` };
   }
 
+  /**
+   * 复用父修订中已完成且坐标兼容的场景索引。证据仍保留其真实来源修订，
+   * 查询时由 evidenceSourceCompatible 验证它与当前场景清单的正文和坐标完全一致。
+   */
+  reuseSceneIndex(scene: Scene, revisionId: string, sourceRevisionId: string): boolean {
+    if (revisionId === sourceRevisionId) return false;
+    const progress = this.readRevisionIndex(scene.projectId, revisionId);
+    const sourceProgress = this.readRevisionIndex(scene.projectId, sourceRevisionId);
+    const saved = sourceProgress?.completed.get(scene.sceneId);
+    const sourceRef = this.get<SceneRefRow>(
+      "SELECT * FROM kw_scene_refs WHERE project_id = ? AND revision_id = ? AND scene_id = ? AND route_id = ?",
+      scene.projectId, sourceRevisionId, scene.sceneId, scene.routeId,
+    );
+    const storyOrder = parseStoryOrderFromTime(scene.storyTime);
+    const bodyHash = sha256(scene.body);
+    if (!progress || !saved || !sourceRef || sourceProgress?.failed.has(scene.sceneId) || saved.bodyHash !== bodyHash || sourceRef.body_hash !== bodyHash || sourceRef.narration_order !== scene.narrationOrder || sourceRef.story_order !== (storyOrder ?? null)) return false;
+    if (!this.sceneCompletionValid(sourceRef, saved)) return false;
+    const savepoint = newId("kw_reuse");
+    try {
+      this.db.exec(`SAVEPOINT ${savepoint}`);
+      this.registerScene({ projectId: scene.projectId, revisionId, sceneId: scene.sceneId, routeId: scene.routeId, narrationOrder: scene.narrationOrder, storyOrder, pov: scene.pov, title: scene.title, summary: scene.summary, bodyHash });
+      progress.completed.set(scene.sceneId, { bodyHash, evidenceIds: [...saved.evidenceIds] });
+      progress.failed.delete(scene.sceneId);
+      this.writeRevisionIndex(scene.projectId, revisionId, progress);
+      this.db.exec(`RELEASE SAVEPOINT ${savepoint}`);
+      return true;
+    } catch (error) {
+      try { this.db.exec(`ROLLBACK TO SAVEPOINT ${savepoint}; RELEASE SAVEPOINT ${savepoint}`); }
+      catch (rollbackError) { throw new AggregateError([error, rollbackError], "场景索引复用失败，回滚时发生错误"); }
+      throw error;
+    }
+  }
+
   /** 把当前采用正文分块写入派生 FTS 与 manuscript 证据；不改写任何权威事实。幂等：重跑替换旧派生行。 */
   indexScene(scene: Scene, revisionId: string): void {
-    const indexes = this.revisionIndexes.get(scene.projectId) ?? new Map<string, RevisionIndexProgress>();
-    const progress = indexes.get(revisionId) ?? { expected: null, completed: new Map<string, { bodyHash: string; evidenceIds: string[] }>(), failed: new Set<string>() };
-    indexes.set(revisionId, progress);
-    this.revisionIndexes.set(scene.projectId, indexes);
+    const progress = this.readRevisionIndex(scene.projectId, revisionId) ?? { expected: null, completed: new Map<string, CompletedSceneIndex>(), failed: new Set<string>() };
     const savepoint = newId("kw_scene");
     let opened = false;
     try {
       this.db.exec(`SAVEPOINT ${savepoint}`);
       opened = true;
       const evidenceIds = this.writeSceneIndex(scene, revisionId);
-      this.db.exec(`RELEASE SAVEPOINT ${savepoint}`);
       progress.completed.set(scene.sceneId, { bodyHash: sha256(scene.body), evidenceIds });
       progress.failed.delete(scene.sceneId);
+      this.writeRevisionIndex(scene.projectId, revisionId, progress);
+      this.db.exec(`RELEASE SAVEPOINT ${savepoint}`);
     } catch (error) {
-      progress.failed.add(scene.sceneId);
       if (opened) {
         try {
           this.db.exec(`ROLLBACK TO SAVEPOINT ${savepoint}`);
@@ -706,6 +778,8 @@ export class SqliteKnowledgeService implements KnowledgeService {
           throw new AggregateError([error, rollbackError], "场景索引失败，回滚时发生错误");
         }
       }
+      progress.failed.add(scene.sceneId);
+      this.writeRevisionIndex(scene.projectId, revisionId, progress);
       throw error;
     }
   }
@@ -905,6 +979,25 @@ export class SqliteKnowledgeService implements KnowledgeService {
     return base;
   }
 
+  listSceneEvidence(projectId: string, sceneId: string, revisionId: string): Evidence[] {
+    const ref = this.get<SceneRefRow>(
+      "SELECT * FROM kw_scene_refs WHERE project_id = ? AND revision_id = ? AND scene_id = ?",
+      projectId, revisionId, sceneId,
+    );
+    if (!ref) return [];
+    const rows = this.all<EvidenceRow>(
+      "SELECT * FROM kw_evidence WHERE project_id = ? AND scene_id = ? AND source_kind = 'manuscript' ORDER BY source_revision_id, evidence_id",
+      projectId, sceneId,
+    ).filter(row => this.evidenceSourceCompatible(row, ref));
+    // 同一区块可能同时存在继承证据与本修订重建证据；当前修订优先，区块只展示一次。
+    const byBlock = new Map<string, EvidenceRow>();
+    for (const row of rows) {
+      const key = row.block_id ?? row.content_hash;
+      if (!byBlock.has(key) || row.source_revision_id === revisionId) byBlock.set(key, row);
+    }
+    return [...byBlock.values()].map(row => this.toEvidence(row));
+  }
+
   // ---------- 提及解析与知识边界 ----------
 
   private loadMentions(projectId: string, routeId: string): MentionEntry[] {
@@ -935,12 +1028,23 @@ export class SqliteKnowledgeService implements KnowledgeService {
       (row.valid_to_order === null || storyOrder < row.valid_to_order);
   }
 
+  /** 未变场景可继承历史证据，但正文哈希、路线、叙述顺序和故事时点必须一致。 */
+  private evidenceSourceCompatible(row: EvidenceRow, ref: SceneRefRow): boolean {
+    if (row.project_id !== ref.project_id || row.route_id !== ref.route_id || row.source_kind !== "manuscript" || row.scene_id !== ref.scene_id || sha256(row.quote) !== row.content_hash) return false;
+    if (row.source_revision_id === ref.revision_id) return true;
+    const sourceRef = this.get<SceneRefRow>(
+      "SELECT * FROM kw_scene_refs WHERE project_id = ? AND route_id = ? AND revision_id = ? AND scene_id = ?",
+      ref.project_id, ref.route_id, row.source_revision_id, ref.scene_id,
+    );
+    return sourceRef !== undefined && sourceRef.body_hash === ref.body_hash && sourceRef.narration_order === ref.narration_order && sourceRef.story_order === ref.story_order;
+  }
+
   private evidenceSourceCheck(row: EvidenceRow, projectId: string, routeId: string, revisionId: string | undefined, storyOrder: number | null, narrationOrder: number | null = null): EvidenceCheck {
-    if (row.project_id !== projectId || row.route_id !== routeId || row.source_kind !== "manuscript" || revisionId === undefined || row.source_revision_id !== revisionId || row.scene_id === null) return "source_missing";
+    if (row.project_id !== projectId || row.route_id !== routeId || row.source_kind !== "manuscript" || revisionId === undefined || row.scene_id === null) return "source_missing";
     const ref = this.get<SceneRefRow>(
       "SELECT * FROM kw_scene_refs WHERE project_id = ? AND route_id = ? AND revision_id = ? AND scene_id = ?", projectId, routeId, revisionId, row.scene_id,
     );
-    if (!ref || sha256(row.quote) !== row.content_hash) return "source_missing";
+    if (!ref || !this.evidenceSourceCompatible(row, ref)) return "source_missing";
     if (row.story_order !== null && storyOrder === null) return "story_order_unknown";
     if (row.story_order !== null && storyOrder !== null && row.story_order > storyOrder) return "out_of_story_order";
     if (narrationOrder !== null && row.narration_order !== null && row.narration_order > narrationOrder) return "out_of_narration_order";
@@ -1305,15 +1409,24 @@ export class SqliteKnowledgeService implements KnowledgeService {
 
     const ftsQuery = buildFtsQuery(query.query);
     if (ftsQuery.length > 0) {
+      const requestedLimit = query.limit ?? 40;
+      const limit = Number.isFinite(requestedLimit) ? Math.max(1, Math.min(100, Math.trunc(requestedLimit))) : 40;
+      // 事实自身引用的证据不受关键词 Top-K 影响；这里只限制额外的正文召回。
       const hits = this.all<{ ref_id: string }>(
-        "SELECT ref_id FROM kw_fts WHERE kw_fts MATCH ? AND project_id = ? AND route_id = ? AND ref_type = 'evidence'",
-        ftsQuery, query.projectId, query.routeId,
+        "SELECT ref_id FROM kw_fts WHERE kw_fts MATCH ? AND project_id = ? AND route_id = ? AND ref_type = 'evidence' ORDER BY ref_id LIMIT ?",
+        ftsQuery, query.projectId, query.routeId, limit,
       );
       for (const hit of hits) {
         collectEvidence(hit.ref_id);
       }
     }
-    const evidence = [...evidenceById.values()].sort((a, b) =>
+    const byBlock = new Map<string, Evidence>();
+    const currentFirst = [...evidenceById.values()].sort((a, b) => Number(b.sourceRevisionId === query.revisionId) - Number(a.sourceRevisionId === query.revisionId));
+    for (const item of currentFirst) {
+      const key = `${item.sceneId ?? ""}:${item.blockId ?? item.contentHash}`;
+      if (!byBlock.has(key)) byBlock.set(key, item);
+    }
+    const evidence = [...byBlock.values()].sort((a, b) =>
       (a.storyOrder ?? Number.MAX_SAFE_INTEGER) - (b.storyOrder ?? Number.MAX_SAFE_INTEGER) ||
       (a.narrationOrder ?? Number.MAX_SAFE_INTEGER) - (b.narrationOrder ?? Number.MAX_SAFE_INTEGER));
 

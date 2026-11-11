@@ -1,13 +1,14 @@
 import { mkdirSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
-import { createAgentSession, createExtensionRuntime, SessionManager, SettingsManager, VERSION, type AgentSession, type ResourceLoader } from "@earendil-works/pi-coding-agent";
-import type { GenerationProgress, ImportedChapterDraft, IngestPlan, PiConnection, ProviderApi, ProviderTestResult } from "@nova-novel/shared";
+import { createAgentSession, createExtensionRuntime, SessionManager, SettingsManager, VERSION, type AgentSession, type ModelRuntime, type ResourceLoader } from "@earendil-works/pi-coding-agent";
+import type { GenerationProgress, IngestPlan, PiConnection, ProviderApi, ProviderTestResult } from "@nova-novel/shared";
 import type { KnowledgeService, PiGenerationInput, PiGenerationResult, PiHost } from "../contracts.js";
 import type { DomainStore } from "../store.js";
 import { DomainError } from "../domain.js";
-import { AgentSettings, secretOf } from "./settings.js";
+import { AgentSettings, secretOf, validateProxy } from "./settings.js";
+import { providerFetch } from "./proxy.js";
 import { AgentUsageService } from "./usage.js";
-import { assistManuscript } from "./import-assist.js";
 import { planManuscriptIngest } from "./ingest-planner.js";
 import type { VolcengineService } from "./volcengine/service.js";
 import { checkPromptBudget, NOVEL_SYSTEM_PROMPT, parseOutput } from "./prompts.js";
@@ -17,6 +18,26 @@ export function novelResourceLoader(): ResourceLoader {
   return { getExtensions: () => ({ extensions: [], errors: [], runtime: createExtensionRuntime() }), getSkills: () => ({ skills: [], diagnostics: [] }), getPrompts: () => ({ prompts: [], diagnostics: [] }), getThemes: () => ({ themes: [], diagnostics: [] }), getAgentsFiles: () => ({ agentsFiles: [] }), getSystemPrompt: () => NOVEL_SYSTEM_PROMPT, getSystemPromptSource: () => undefined, getAppendSystemPrompt: () => [], getAppendSystemPromptSources: () => [], extendResources: () => {}, reload: async () => {} };
 }
 interface Run { progress: GenerationProgress; cancelled: boolean; session?: AgentSession; done: Promise<void>; finish(): void }
+type ProxyConfig = { proxyEnabled?: boolean; proxyUrl?: string; authProviderId?: string };
+function requestOptions(provider: ProxyConfig, api: string): { fetch?: typeof fetch; transport?: "sse" } {
+  if (!provider.proxyEnabled) return {};
+  if (provider.authProviderId) throw new DomainError(400, "PROXY_UNSUPPORTED", "OAuth 服务的凭据刷新不支持代理，请关闭代理或改用 API Key");
+  if (!["openai-completions", "openai-responses", "anthropic-messages", "openai-codex-responses", "mistral-conversations", "azure-openai-responses", "pi-messages"].includes(api)) {
+    throw new DomainError(400, "PROXY_UNSUPPORTED", "该模型协议不支持代理，请关闭代理或选择其他模型");
+  }
+  return { fetch: providerFetch(provider), ...(api === "openai-codex-responses" ? { transport: "sse" as const } : {}) };
+}
+/** 每个任务使用独立包装器，不修改共享 runtime 或进程全局 fetch。 */
+function runtimeWithProxy(runtime: ModelRuntime, options: ReturnType<typeof requestOptions>): ModelRuntime {
+  if (!options.fetch) return runtime;
+  return new Proxy(runtime, {
+    get(target, key) {
+      if (key === "streamSimple") return (model: Parameters<ModelRuntime["streamSimple"]>[0], context: Parameters<ModelRuntime["streamSimple"]>[1], current?: Parameters<ModelRuntime["streamSimple"]>[2]) => target.streamSimple(model, context, { ...current, ...options });
+      const value: unknown = Reflect.get(target, key, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
 export class EmbeddedAgentHost implements PiHost {
   private runs = new Map<string, Run>();
   private cancelled = new Set<string>();
@@ -82,7 +103,8 @@ export class EmbeddedAgentHost implements PiHost {
       mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
       const manager = SessionManager.create(cwd, sessionDir);
       sessionId = manager.getSessionId();
-      const { session } = await createAgentSession({ cwd, agentDir: this.settings.agentDir, model, thinkingLevel: route.thinkingLevel, modelRuntime: runtime, resourceLoader: novelResourceLoader(), noTools: "builtin", tools: ["novel_*"], customTools: tools, sessionManager: manager, settingsManager: SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: true, maxRetries: 1 } }) });
+      const requestRuntime = runtimeWithProxy(runtime, requestOptions(this.settings.providerForModel(model.provider), model.api));
+      const { session } = await createAgentSession({ cwd, agentDir: this.settings.agentDir, model, thinkingLevel: route.thinkingLevel, modelRuntime: requestRuntime, resourceLoader: novelResourceLoader(), noTools: "builtin", tools: ["novel_*"], customTools: tools, sessionManager: manager, settingsManager: SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: true, maxRetries: 1 } }) });
       run.session = session;
       if (run.cancelled) return partial("cancelled", "作者已取消生成，可重新发起任务", "");
       let settled = false;
@@ -142,39 +164,21 @@ export class EmbeddedAgentHost implements PiHost {
     if (run.session) await run.session.abort();
     await run.done;
   }
-  /** 导入协助：复用 guide 路由的模型做标题边界判断，不创建作品任务，正文不经过模型改写。 */
-  async assistImport(text: string): Promise<ImportedChapterDraft[] | null> {
+  /** 导入预处理总控：依据客户端本地分章后的结构摘要判定处理方案与标题模式，复用 guide 路由。 */
+  async planIngest(digest: { chapterCount: number; sceneCount: number; wordCount: number; titles: string[]; head: string; middle: string; tail: string; opening: string }): Promise<IngestPlan | null> {
     if (this.closed) return null;
     const route = this.settings.route("guide");
     if (!route.model) return null;
-    const model = this.settings.runtime.getModel(route.model.provider, route.model.modelId);
-    if (!model) return null;
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 120_000);
-    try {
-      return await assistManuscript(text, {
-        complete: async (prompt) => {
-          const response = await this.settings.runtime.completeSimple(model, { messages: [{ role: "user", content: prompt, timestamp: Date.now() }] }, { signal: controller.signal, maxTokens: 4096 });
-          if (["error", "aborted"].includes(response.stopReason)) throw new Error("import assist failed");
-          return response.content.filter(block => block.type === "text").map(block => block.text).join("");
-        },
-      });
-    } catch { return null; }
-    finally { clearTimeout(timer); }
-  }
-  /** 导入预处理总控：判定结构并给出处理方案与标题模式，复用 guide 路由。 */
-  async planIngest(text: string, chapters: ImportedChapterDraft[]): Promise<IngestPlan | null> {
-    if (this.closed) return null;
-    const route = this.settings.route("guide");
-    if (!route.model) return null;
-    const model = this.settings.runtime.getModel(route.model.provider, route.model.modelId);
+    const runtime = this.settings.runtime;
+    const model = runtime.getModel(route.model.provider, route.model.modelId);
     if (!model) return null;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 90_000);
     try {
-      return await planManuscriptIngest(text, chapters, {
+      const options = requestOptions(this.settings.providerForModel(model.provider), model.api);
+      return await planManuscriptIngest(digest, {
         complete: async (prompt) => {
-          const response = await this.settings.runtime.completeSimple(model, { messages: [{ role: "user", content: prompt, timestamp: Date.now() }] }, { signal: controller.signal, maxTokens: 4096 });
+          const response = await runtime.completeSimple(model, { messages: [{ role: "user", content: prompt, timestamp: Date.now() }] }, { signal: controller.signal, maxTokens: 4096, sessionId: randomUUID(), ...options });
           if (["error", "aborted"].includes(response.stopReason)) throw new Error("ingest plan failed");
           return response.content.filter(block => block.type === "text").map(block => block.text).join("");
         },
@@ -186,21 +190,21 @@ export class EmbeddedAgentHost implements PiHost {
   async testProvider(id: string, modelId?: string): Promise<ProviderTestResult> {
     const provider = this.settings.provider(id);
     const runtime = this.settings.runtime;
-    const model = runtime.getModel(id, modelId ?? provider.models[0]!.id);
+    const model = runtime.getModel(provider.authProviderId ?? id, modelId ?? provider.models[0]!.id);
     if (!model) throw new DomainError(400, "MODEL_NOT_FOUND", "模型不存在");
     const start = Date.now();
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 15000);
     try {
-      const response = await runtime.completeSimple(model, { messages: [{ role: "user", content: "只回复：连接成功", timestamp: Date.now() }] }, { signal: controller.signal, maxTokens: 32 });
+      const response = await runtime.completeSimple(model, { messages: [{ role: "user", content: "只回复：连接成功", timestamp: Date.now() }] }, { signal: controller.signal, maxTokens: 32, sessionId: randomUUID(), ...requestOptions(provider, model.api) });
       if (["error", "aborted"].includes(response.stopReason)) return { ok: false, latencyMs: Date.now() - start, message: "连接失败，请检查地址、模型和 API Key" };
       return { ok: true, latencyMs: Date.now() - start, message: "连接成功", sample: this.settings.redact(response.content.filter(block => block.type === "text").map(block => block.text).join("").slice(0, 160)) };
-    } catch { return { ok: false, latencyMs: Date.now() - start, message: controller.signal.aborted ? "连接超时（15 秒）" : "连接失败，请检查地址、模型和 API Key" }; }
+    } catch (error) { return { ok: false, latencyMs: Date.now() - start, message: error instanceof DomainError ? error.message : controller.signal.aborted ? "连接超时（15 秒）" : "连接失败，请检查地址、模型和 API Key" }; }
     finally { clearTimeout(timer); }
   }
   async discoverProvider(id: string, input: Record<string, unknown>) {
     // 添加表单中尚未保存的 provider 只使用本次请求提供的地址与密钥。
-    const provider: { api?: unknown; baseUrl?: unknown; apiKey?: unknown; keySource?: "manual" | "environment"; apiKeyEnv?: string } = this.settings.hasProvider(id) ? this.settings.provider(id) : {};
+    const provider: { api?: unknown; baseUrl?: unknown; apiKey?: unknown; keySource?: "manual" | "environment"; apiKeyEnv?: string; proxyEnabled?: boolean; proxyUrl?: string } = this.settings.hasProvider(id) ? this.settings.provider(id) : {};
     const api = input.api ?? provider.api;
     if (!["openai-completions", "openai-responses"].includes(api as ProviderApi)) throw new DomainError(400, "DISCOVERY_UNSUPPORTED", "仅 OpenAI 兼容服务支持读取模型列表");
     let url: URL;
@@ -208,8 +212,10 @@ export class EmbeddedAgentHost implements PiHost {
     if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw new DomainError(400, "INVALID_BASE_URL", "服务地址无效");
     const key = input.apiKey ?? secretOf({ apiKey: typeof provider.apiKey === "string" ? provider.apiKey : "", ...(provider.keySource ? { keySource: provider.keySource } : {}), ...(provider.apiKeyEnv ? { apiKeyEnv: provider.apiKeyEnv } : {}) });
     if (typeof key !== "string" || /[\r\n]/.test(key)) throw new DomainError(400, "INVALID_API_KEY", "API Key 格式无效");
+    const proxy = validateProxy({ proxyEnabled: input.proxyEnabled ?? provider.proxyEnabled, proxyUrl: input.proxyUrl ?? provider.proxyUrl });
     try {
-      const response = await fetch(`${url.href.replace(/\/$/, "")}/models`, { headers: key ? { Authorization: `Bearer ${key}` } : {}, signal: AbortSignal.timeout(15000), redirect: "error" });
+      const requestFetch = proxy.proxyEnabled ? providerFetch(proxy) : fetch;
+      const response = await requestFetch(`${url.href.replace(/\/$/, "")}/models`, { headers: key ? { Authorization: `Bearer ${key}` } : {}, signal: AbortSignal.timeout(15000), redirect: "error" });
       if (!response.ok) throw new Error("discovery failed");
       const text = await response.text();
       if (text.length > 2_000_000) throw new Error("discovery too large");

@@ -1,3 +1,4 @@
+export * from "./manuscript.js";
 export * from "./next-action.js";
 export * from "./revision-insights.js";
 export * from "./notion-copilot.js";
@@ -200,6 +201,8 @@ export interface ContextQuery {
   branchId: Id;
   routeId: RouteId;
   revisionId: Id;
+  /** 提供场景时由宿主统一解析路线、叙述顺序、故事时点与 POV，避免各视图重复推导。 */
+  sceneId?: Id;
   query: string;
   purpose: "planning" | "scene_writing" | "fact_check" | "reader_check";
   povEntityId?: Id;
@@ -426,6 +429,8 @@ export interface ProviderConfigView {
   name: string;
   api: ProviderApi;
   baseUrl: string;
+  proxyEnabled?: boolean;
+  proxyUrl?: string;
   compat?: ProviderCompat;
   hasApiKey: boolean;
   keySource?: "manual" | "environment";
@@ -443,6 +448,8 @@ export interface ProviderUpsert {
   name: string;
   api: ProviderApi;
   baseUrl: string;
+  proxyEnabled?: boolean;
+  proxyUrl?: string;
   compat?: ProviderCompat;
   keySource?: "manual" | "environment";
   apiKeyEnv?: string;
@@ -806,6 +813,36 @@ export interface ExtractedLedgerBundle {
   factProposals: ExtractedFactProposal[];
   eventProposals: ExtractedEventProposal[];
   filteredOutCount: number;
+}
+
+/** 审阅时允许修改的字段；proposalId、quote 与 evidenceId 始终来自服务端冻结产物。 */
+export interface ExtractedProposalEdit {
+  name?: string;
+  aliases?: string[];
+  summary?: string;
+  type?: Entity["type"];
+  subjectName?: string;
+  predicate?: string;
+  value?: string;
+  semanticType?: FactAssertion["semanticType"];
+  kind?: string;
+  fromValue?: string;
+  toValue?: string;
+  storyTime?: string;
+}
+
+export interface ApplyExtractedLedgerInput {
+  projectId: Id;
+  sceneId: Id;
+  artifactId: Id;
+  selectedProposalIds: Id[];
+  proposalEdits?: Record<Id, ExtractedProposalEdit>;
+  acceptanceId?: Id;
+}
+
+export interface KeywordIndexStatus {
+  state: "pending" | "error" | "ready";
+  keywordRevisionId: Id;
 }
 
 export interface WorkflowGuideSession {

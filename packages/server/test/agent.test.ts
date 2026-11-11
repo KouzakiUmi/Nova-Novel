@@ -118,6 +118,75 @@ test("provider HTTP CRUD, secret retention, models.json, routes and discovery", 
   } finally { await f.close(); }
 });
 
+test("provider proxy covers connection test and generation", async () => {
+  const f = await fixture();
+  let requests = 0;
+  const proxy = createServer((request, response) => {
+    requests++;
+    request.resume();
+    if (request.url?.endsWith("/models")) { response.writeHead(200, { "Content-Type": "application/json" }); response.end(JSON.stringify({ data: [{ id: "proxy-model" }] })); return; }
+    response.writeHead(200, { "Content-Type": "text/event-stream" });
+    response.end('data: {"id":"test","object":"chat.completion.chunk","created":1,"model":"writer","choices":[{"index":0,"delta":{"content":"代理返回的正文"},"finish_reason":null}]}\n\ndata: {"id":"test","object":"chat.completion.chunk","created":1,"model":"writer","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n');
+  });
+  proxy.listen(0, "127.0.0.1");
+  await once(proxy, "listening");
+  try {
+    const address = proxy.address();
+    assert.ok(address && typeof address === "object");
+    await f.configure();
+    assert.equal((await f.call("/api/agent/providers/local-test", "PATCH", { proxyEnabled: true, proxyUrl: `http://127.0.0.1:${address.port}` })).status, 200);
+    assert.deepEqual((await f.call("/api/agent/providers/local-test/discover", "POST", {})).value.models, [{ id: "proxy-model" }]);
+    assert.equal((await f.call("/api/agent/providers/local-test/test", "POST", {})).value.ok, true);
+    const generated = (await f.call("/api/generate", "POST", f.request("scene", "proxy-generation"))).value;
+    assert.equal(generated.task.state, "succeeded");
+    assert.equal(generated.task.result.text, "代理返回的正文");
+    assert.equal(requests, 3);
+    assert.equal(f.requests.length, 0);
+    assert.equal((await f.call("/api/agent/providers/local-test", "PATCH", { proxyEnabled: false })).status, 200);
+    assert.equal((await f.call("/api/agent/providers/local-test/test", "POST", {})).value.ok, true);
+    assert.equal(f.requests.length, 1);
+    assert.equal(requests, 3);
+    assert.equal((await f.call("/api/agent/providers/local-test", "PATCH", { proxyUrl: "http://user:password@localhost:1234" })).status, 400);
+  } finally {
+    proxy.closeAllConnections();
+    await new Promise<void>(resolve => proxy.close(() => resolve()));
+    await f.close();
+  }
+});
+
+test("Pi adds the OpenCode session header for direct requests", async () => {
+  const f = await fixture();
+  try {
+    await f.configure();
+    const runtime = f.host.settings.runtime;
+    const model = runtime.getModel("local-test", "writer");
+    assert.ok(model);
+    let header: string | null = null;
+    const fakeFetch: typeof fetch = async (input, init) => {
+      header = new Request(input, init).headers.get("x-opencode-session");
+      return new Response('data: {"id":"test","object":"chat.completion.chunk","created":1,"model":"writer","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}]}\n\ndata: {"id":"test","object":"chat.completion.chunk","created":1,"model":"writer","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n', { headers: { "Content-Type": "text/event-stream" } });
+    };
+    await runtime.completeSimple({ ...model, baseUrl: "https://opencode.ai/inference/go/v1" }, { messages: [{ role: "user", content: "test", timestamp: Date.now() }] }, { sessionId: "test-session", fetch: fakeFetch });
+    assert.equal(header, "test-session");
+  } finally { await f.close(); }
+});
+
+test("connection test passes a session ID to Pi", async () => {
+  const f = await fixture();
+  try {
+    await f.configure();
+    const runtime = f.host.settings.runtime;
+    const complete = runtime.completeSimple.bind(runtime);
+    let sessionId: string | undefined;
+    runtime.completeSimple = ((model, context, options) => {
+      sessionId = options?.sessionId;
+      return complete(model, context, options);
+    }) as typeof runtime.completeSimple;
+    assert.equal((await f.host.testProvider("local-test")).ok, true);
+    assert.match(sessionId ?? "", /^[0-9a-f-]{36}$/);
+  } finally { await f.close(); }
+});
+
 test("provider rejects invalid URL, reserved ID, shell key and malformed routes", async () => {
   const f = await fixture();
   try {

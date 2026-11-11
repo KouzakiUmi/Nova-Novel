@@ -47,6 +47,9 @@ Pi 目录给出 provider/model 元数据，Nova 另为每个可单 API Key 使�
 - 修改后重新生成 `models.json` 并重建 `ModelRuntime`；正在运行的任务继续使用旧实例。
 - 模型列表 `models` 只包含未禁用的显式配置；环境候选不会隐式变成可用模型。自定义模型可选 `thinkingLevelMap` 显式映射思考档位，`null` 表示不支持。内置目录的 `maxTokens` 按 `contextWindow` 归一化，避免上游输出上限大于上下文而阻止启用。OAuth 成功后创建 `my-*` 配置并写入 `authProviderId`，该自定义 ID 不进入 `models.json`，运行时沿用内置 OAuth 身份与模型；禁用配置会同时关闭其用量。
 - “测试连接”：用该 provider 的指定模型（或第一个模型）发一条不含作品内容的极短请求，15 秒超时，返回耗时和截短的回复。失败时返回脱敏后的错误。
+- 测试连接与导入协助的直接模型请求分别生成会话 ID；Pi 对 OpenCode 地址据此添加 `x-opencode-session`。常规生成使用任务会话的 ID。
+- 服务商可独立开启代理并填写无凭据的 HTTP(S) 代理地址；留空读取服务进程的 `http_proxy` / `HTTP_PROXY`、`https_proxy` / `HTTPS_PROXY` 和 `no_proxy` / `NO_PROXY`。显式地址优先且不受环境 `NO_PROXY` 影响；环境代理未配置时请求失败，不静默直连。代理传输要求 Node.js 24.5 或更高版本，按请求隔离，不修改全局代理。
+- 代理作用于模型推理、连接测试、模型发现和受支持的额度查询。Pi 的 Google、Vertex、Bedrock 适配器不支持注入传输，OAuth 凭据刷新也不受注入传输控制，因此这些模型开启代理时明确拒绝调用；ArkCli 额度查询在代理开启时拒绝执行。OAuth 登录本身不受此设置控制。关闭服务商代理时沿用进程默认网络行为；若进程另启用了全局代理，关闭开关不保证直连。
 - “读取模型列表”：仅限 OpenAI 兼容类型，`GET {baseUrl}/models`，返回模型 ID 供用户勾选，不自动保存。
 
 ### 火山方舟双套餐
@@ -234,4 +237,4 @@ JSON 解析失败时，任务失败并保留原始产物，不把原文硬塞进
 
 - `POST /api/assist/extract-ledger`：针对指定 `sceneId`（或章节内已采用正文），扫描并输出 JSON `{ newElements[], factProposals[], eventProposals[] }`，每项必须携带正文原句 `quote`。
 - **宿主防幻觉校验**：宿主在目标场景当前修订的正文段落中精确核对 `quote`，计算确定性 `evidenceId`；若 `quote` 在正文中不存在，则拒绝作为有效证据入库。
-- `POST /api/assist/extract-ledger/apply`：作者在审阅单中确认后，元素、事实（`manuscript` 来源 + `evidenceId`）与状态事件在同一 SQLite 事务中写入；为关联元素推进修订时，证据与事实/事件引用同步重绑到新修订，并重建该修订索引，保证入库事实立即进入检索与一致性检查。
+- `POST /api/assist/extract-ledger/apply`：请求必须携带 `{ projectId, sceneId, artifactId, selectedProposalIds, proposalEdits?, acceptanceId }`。宿主从冻结 `extracted_ledger` 产物取回提案，按选中项和允许字段编辑合并；`proposalId`、`quote`、`evidenceId` 不可由客户端改写。可分批采用同一产物，acceptanceId 与选集和修改内容绑定。元素、事实（`manuscript` 来源 + `evidenceId`）与状态事件在同一 SQLite 事务中写入；为关联元素推进修订时，证据与事实/事件引用同步重绑到新修订，并重建该修订索引，保证入库事实立即进入检索与一致性检查。仅换修订但正文未变时按区块与原句重绑，正文变化后拒绝旧提案。

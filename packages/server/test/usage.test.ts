@@ -5,9 +5,71 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { AgentSettings } from "../src/agent/settings.js";
 import { AgentUsageService } from "../src/agent/usage.js";
+import type { ProviderConfigView } from "@nova-novel/shared";
 
 const secret = "usage-secret-never-return";
 const json = (body: unknown) => new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
+
+type TestProvider = ProviderConfigView & { apiKey: string };
+function fakeSettings(providers: TestProvider[]): AgentSettings {
+  return { dataProviders: () => providers, redact: (message: string) => message, runtime: { getAuth: async () => { throw new Error("OAuth must not be accessed"); } } } as unknown as AgentSettings;
+}
+function fakeProvider(providerId: string, baseUrl: string, proxyEnabled = false): TestProvider {
+  return { providerId, name: providerId, api: "openai-completions", baseUrl, proxyEnabled, apiKey: secret, hasApiKey: true, models: [{ id: "writer" }], createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z" };
+}
+
+test("usage selects provider-scoped fetch independently during concurrent requests", async () => {
+  const providers = [fakeProvider("one", "https://openrouter.ai/api/v1", true), fakeProvider("two", "https://openrouter.ai/api/v1")];
+  const calls: Record<string, string[]> = { one: [], two: [] };
+  const service = new AgentUsageService(fakeSettings(providers), undefined, provider => async input => {
+    const id = provider.providerId;
+    await Promise.resolve();
+    calls[id]!.push(String(input));
+    return String(input).endsWith("/key") ? json({ data: { limit: 10, limit_remaining: id === "one" ? 5 : 8 } }) : json({ data: { total_credits: 10, total_usage: 1 } });
+  });
+  const reports = await service.list();
+  assert.equal(reports.find(report => report.providerId === "one")?.windows[0]?.percentUsed, 50);
+  assert.equal(reports.find(report => report.providerId === "two")?.windows[0]?.percentUsed, 20);
+  assert.equal(calls.one!.length, 2);
+  assert.equal(calls.two!.length, 2);
+});
+
+test("usage preserves explicit fetch injection for proxy-enabled providers", async () => {
+  const provider = fakeProvider("deepseek-proxy", "https://api.deepseek.com/v1", true);
+  let calls = 0;
+  const service = new AgentUsageService(fakeSettings([provider]), async () => {
+    calls++;
+    return json({ balance_infos: [{ currency: "CNY", total_balance: "12" }] });
+  }, () => { throw new Error("injected fetch must take precedence"); });
+  assert.equal((await service.list())[0]?.balance?.value, 12);
+  assert.equal(calls, 1);
+});
+
+test("usage selects provider fetch for IAM quota and rejects proxy ArkCli and OAuth", async () => {
+  const access = "NOVA_TEST_USAGE_AK", secretEnv = "NOVA_TEST_USAGE_SK";
+  const oldAccess = process.env[access], oldSecret = process.env[secretEnv];
+  process.env[access] = "test-access"; process.env[secretEnv] = "test-secret";
+  try {
+    const iam = { ...fakeProvider("volcengine-coding-plan", "https://ark.cn-beijing.volces.com/api/coding", true), quotaAccessKeyEnv: access, quotaSecretKeyEnv: secretEnv };
+    const ark = fakeProvider("ark-bound", "https://ark.cn-beijing.volces.com/api/coding", true);
+    const oauth = { ...fakeProvider("oauth-bound", "https://chatgpt.com/backend-api", true), authProviderId: "openai-codex" };
+    const calls: string[] = [];
+    const service = new AgentUsageService(fakeSettings([iam, ark, oauth]), undefined, provider => async input => {
+      calls.push(`${provider.providerId}:${String(input)}`);
+      return json({ Result: { QuotaUsage: [{ Level: "week", Percent: 25 }] } });
+    });
+    service.setVolcBackend({ hasBinding: id => id === "ark-bound", usageFor: async () => { throw new Error("ArkCli must not run"); } });
+    const reports = await service.list();
+    assert.equal(reports.find(report => report.providerId === iam.providerId)?.windows[0]?.percentUsed, 25);
+    assert.match(reports.find(report => report.providerId === ark.providerId)?.error ?? "", /代理.*ArkCli/);
+    assert.match(reports.find(report => report.providerId === oauth.providerId)?.error ?? "", /代理.*OAuth/);
+    assert.equal(calls.length, 1);
+    assert.match(calls[0]!, /^volcengine-coding-plan:https:\/\/open\.volcengineapi\.com\//);
+  } finally {
+    if (oldAccess === undefined) delete process.env[access]; else process.env[access] = oldAccess;
+    if (oldSecret === undefined) delete process.env[secretEnv]; else process.env[secretEnv] = oldSecret;
+  }
+});
 
 test("usage reports normalize provider windows and balances without exposing credentials", async () => {
   const directory = mkdtempSync(join(tmpdir(), "nova-usage-"));

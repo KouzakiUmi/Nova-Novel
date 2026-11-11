@@ -52,7 +52,7 @@ export interface ArtifactRecord<T = unknown> {
   completeness: "complete" | "partial";
 }
 
-const INTERACTION_KINDS = new Set(["suggestion-open", "candidate-presented", "candidate-dismiss", "candidate-accept", "candidate-revise", "candidate-reject", "review-open", "review-dismiss", "review-decided", "note-promoted", "scene-structure-saved", "scene-plan-saved", "element-created", "element-updated", "element-fact-added", "element-event-added", "assist-applied"]);
+const INTERACTION_KINDS = new Set(["suggestion-open", "candidate-presented", "candidate-dismiss", "candidate-accept", "candidate-revise", "candidate-reject", "review-open", "review-dismiss", "review-decided", "note-promoted", "scene-structure-saved", "scene-plan-saved", "element-created", "element-updated", "element-fact-added", "element-event-added", "element-fact-updated", "element-event-updated", "assist-applied"]);
 
 /** Owns the single writable connection; callers must not open competing writers. */
 export class DomainStore {

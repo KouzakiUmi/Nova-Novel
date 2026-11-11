@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { ImportedChapterDraft, IngestPlan, IngestPlanOption, ManuscriptPreview } from "@nova-novel/shared";
+import { chunkImportUnits, flattenImportChapters, manuscriptAsText, parseManuscript, sliceByChapterPattern, summarizeManuscript, type ImportUnit } from "@nova-novel/shared";
 import { ArrowRight, CircleAlert, FileUp, LoaderCircle, ShieldCheck, Sparkles, X } from "lucide-react";
 import { useDialogKeyboard } from "./useDialogKeyboard";
 import { api, type IngestRunView } from "../lib/api";
@@ -17,9 +18,8 @@ interface ImportDialogProps {
 
 const ABNORMAL_CHAPTER_WORDS = 20_000;
 const wordsOf = (chapter: ImportedChapterDraft) => chapter.scenes.reduce((sum, scene) => sum + scene.body.replace(/\s/g, "").length, 0);
-const asText = (chapters: ImportedChapterDraft[]) => chapters.map(chapter => `${chapter.title}\n\n${chapter.scenes.map(scene => scene.body).join("\n\n")}`).join("\n\n");
 
-/** 导入整本小说：AI 或本地规则给出分章预览；异常堆积章可以先落盘正常章节，剩余文本继续分并追加到同一作品。 */
+/** 导入整本小说：本地预处理完成分章与预览，服务只接收摘要与分批章节；异常堆积章可以先落盘正常章节，剩余文本继续分并追加到同一作品。 */
 export function ImportDialog({ aiReady, busy, onCancel, onImport, onAppend, onProjectCreated, onRefresh }: ImportDialogProps) {
   const [title, setTitle] = useState("");
   const [text, setText] = useState("");
@@ -37,6 +37,11 @@ export function ImportDialog({ aiReady, busy, onCancel, onImport, onAppend, onPr
   const [working, setWorking] = useState<"analyze" | "import" | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const dialogRef = useRef<HTMLElement>(null);
+  const targetRef = useRef<ImportTarget | null>(null);
+  /** 部分失败时的续跑游标：保存未落盘的“章标题+场”单元，重试从断点继续，不重复追加。 */
+  const queueRef = useRef<ImportUnit[] | null>(null);
+  /** 全文已完整落盘、等待启动提取时置位，重试跳过分批直接调 /ingest/start。 */
+  const ingestReadyRef = useRef(false);
   const pending = busy || working !== null;
   useDialogKeyboard(dialogRef, () => { if (!pending) requestClose(); }, true);
 
@@ -62,27 +67,72 @@ export function ImportDialog({ aiReady, busy, onCancel, onImport, onAppend, onPr
     finally { if (fileRef.current) fileRef.current.value = ""; }
   };
 
+  /** 本地预处理：切章、摘要、可选 AI 判定（只发结构摘要，正文不出请求）。 */
   const analyze = async (input: string) => {
     if (!input.trim() || pending) return;
     setWorking("analyze");
     setError("");
+    queueRef.current = null;
+    ingestReadyRef.current = false;
     try {
-      const result = await api.ingestPlan({ text: input, useAi: useAi && aiReady });
-      setPlan(result.plan);
-      setPreview(result.preview);
+      let chapters = parseManuscript(input).chapters;
+      const warnings: string[] = [];
+      let plan: IngestPlan | null = null;
+      if (useAi && aiReady) {
+        const all = chapters.flatMap(chapter => chapter.scenes.map(scene => scene.body)).join("\n\n");
+        const digest = {
+          chapterCount: chapters.length,
+          sceneCount: chapters.reduce((sum, chapter) => sum + chapter.scenes.length, 0),
+          wordCount: all.replace(/\s/g, "").length,
+          titles: chapters.map(chapter => chapter.title).slice(0, 120),
+          head: all.slice(0, 1200),
+          middle: all.slice(Math.max(0, Math.floor(all.length / 2) - 200), Math.floor(all.length / 2) + 200),
+          tail: all.slice(-400),
+          opening: input.slice(0, 1200),
+        };
+        try {
+          const result = await api.ingestPlan({ digest, useAi: true });
+          plan = result.plan;
+          warnings.push(...result.warnings);
+        } catch { plan = null; warnings.push("连接分析服务失败，已按本地规则给出处理方案。"); }
+        if (plan?.chapterPattern) {
+          const sliced = sliceByChapterPattern(input, plan.chapterPattern);
+          if (sliced) chapters = sliced;
+        }
+      }
+      setPlan(plan);
+      setPreview(summarizeManuscript(chapters, false, warnings));
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "分析未完成，请重试");
     } finally { setWorking(null); }
   };
 
-  /** Agent 方案：进入逐场知识提取运行器。 */
+  /** 分批落盘：按展平后的“章标题+场”单元游标推进；部分失败时保留未落盘单元，重试从断点续。 */
+  const persistAll = async (chapters: ImportedChapterDraft[]): Promise<ImportTarget | null> => {
+    const units = queueRef.current ?? flattenImportChapters(chapters);
+    const batches = chunkImportUnits(units);
+    if (!batches.length) { setError("没有可入库的章节"); return null; }
+    let consumedUnits = 0;
+    for (const batch of batches) {
+      const latest = await persist(batch);
+      if (!latest) { queueRef.current = units.slice(consumedUnits); return null; }
+      consumedUnits += batch.reduce((sum, chapter) => sum + chapter.scenes.length, 0);
+    }
+    queueRef.current = null;
+    return targetRef.current;
+  };
+
+  /** Agent 方案：先分批落盘正文，再启动逐场知识提取运行器；启动失败重试不再重复入库。 */
   const startIngest = async () => {
     if (!preview || pending) return;
     setWorking("import");
     setError("");
     try {
-      const result = await api.ingestStart({ title: title.trim() || "导入的作品", chapters: preview.chapters });
-      await onProjectCreated(result.project.projectId);
+      const current = ingestReadyRef.current ? targetRef.current : await persistAll(preview.chapters);
+      if (!current) return;
+      ingestReadyRef.current = true;
+      const result = await api.ingestStart({ projectId: current.projectId });
+      await onProjectCreated(current.projectId);
       setRunId(result.runId);
       setPreview(null);
     } catch (cause) {
@@ -131,48 +181,56 @@ export function ImportDialog({ aiReady, busy, onCancel, onImport, onAppend, onPr
     { id: "standard", title: "分章 + 知识提取", detail: "逐场提取人物/设定、人物关系与状态事件，统一审阅后入库。", steps: [], estimatedCalls: preview?.sceneCount ?? 0, recommended: true, extract: true },
   ];
 
-  /** 落盘一批章节；返回是否成功。 */
-  const persist = async (chapters: ImportedChapterDraft[]): Promise<boolean> => {
+  /** 单批落盘；批次拆分由 persistAll 统一处理。返回最新入库目标。 */
+  const persist = async (chapters: ImportedChapterDraft[]): Promise<ImportTarget | null> => {
     setWorking("import");
     setError("");
     try {
-      if (!target) {
+      const base = targetRef.current;
+      let next: ImportTarget;
+      if (!base) {
         const created = await onImport({ title: title.trim() || "导入的作品", chapters });
-        if (!created) return false;
-        setTarget(created);
+        if (!created) return null;
+        next = created;
       } else {
-        const result = await onAppend({ projectId: target.projectId, baseRevisionId: target.headRevisionId, chapters });
-        if (!result) return false;
-        setTarget({ ...target, headRevisionId: result.headRevisionId });
+        const result = await onAppend({ projectId: base.projectId, baseRevisionId: base.headRevisionId, chapters });
+        if (!result) return null;
+        next = { ...base, headRevisionId: result.headRevisionId };
       }
+      targetRef.current = next;
+      setTarget(next);
       setImportedCount(count => count + chapters.length);
-      return true;
+      return next;
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "入库失败，请重试");
-      return false;
+      return null;
     } finally { setWorking(null); }
   };
 
-  /** 全部章节一次入库，顺序保持原样。 */
+  /** 全部章节一次入库，顺序保持原样；正文已完整落盘（提取启动失败场景）直接结束。 */
   const confirmAll = async () => {
     if (!preview || pending) return;
-    if (await persist(preview.chapters)) onCancel();
+    if (ingestReadyRef.current) { onCancel(); return; }
+    if (await persistAll(preview.chapters)) onCancel();
   };
 
   /** 先落盘正常章节，剩余异常章文本留待继续分。 */
   const confirmNormal = async () => {
     if (!preview || pending || !normal.length) return;
-    if (await persist(normal)) {
-      setRemainingText(asText(abnormal));
+    if (await persistAll(normal)) {
+      setRemainingText(manuscriptAsText(abnormal));
       setPreview(null);
     }
   };
 
   const importRemaining = async () => {
     if (!remainingText.trim() || pending) return;
+    queueRef.current = null;
+    // 剩余文本可能远超单场景上限：交给同一分批管线按场预拆后分批追加。
     const chapter: ImportedChapterDraft = { title: "未分章正文", scenes: [{ title: "第一场", body: remainingText.trim() }] };
-    if (await persist([chapter])) { setRemainingText(""); onCancel(); }
+    if (await persistAll([chapter])) { setRemainingText(""); onCancel(); }
   };
+
 
   const renameChapter = (index: number, value: string) => {
     setPreview(current => current ? { ...current, chapters: current.chapters.map((chapter, i) => i === index ? { ...chapter, title: value } : chapter) } : current);
@@ -259,7 +317,7 @@ export function ImportDialog({ aiReady, busy, onCancel, onImport, onAppend, onPr
 
         {!runId && preview && (
           <div className="new-project-body import-preview">
-            {plan?.analysis && <p className="ingest-analysis"><Sparkles size={15} />{plan.analysis}</p>}
+            {plan?.analysis && <p className="ingest-analysis"><Sparkles size={14} />{plan.analysis}</p>}
             <div className="ingest-options" role="group" aria-label="选择处理方案">
               {options.map(option => (
                 <button key={option.id} className={`ingest-option ${option.recommended ? "recommended" : ""}`} disabled={pending} onClick={() => void (option.extract ? startIngest() : confirmAll())}>

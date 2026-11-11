@@ -35,7 +35,7 @@ try {
   await waitBody("创作起步");
   await clickText("修订");
   await waitBody("导入 Markdown/TXT");
-  const imported = await fetch(`${serverUrl}/api/import`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title: "import-fixture", premise: "从本地 Markdown/TXT 导入", text: await readFile(fixture, "utf8") }) });
+  const imported = await fetch(`${serverUrl}/api/import`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title: "import-fixture", premise: "从本地 Markdown/TXT 导入", chapters: [{ title: "第一章", scenes: [{ title: "第一场", body: "正文甲" }, { title: "第二场", body: "正文乙" }] }] }) });
   assert.equal(imported.status, 201);
   await send("Page.reload", { ignoreCache: true });
   await waitBody("第一场");

@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import type {
   ArcAssistProposal,
   ArcDiagnosisReport,
+  ApplyExtractedLedgerInput,
   AuthorNote,
   CharacterArcProfile,
   ElementDesignCard,
@@ -1248,52 +1249,83 @@ export class CreativeAssistService {
     return { artifactId: artifact.artifactId, ...bundleBase };
   }
 
-  /** 审阅确认并入库正文反向抽取的元素、事实与状态变化事件 */
-  applyExtractedLedger(input: {
-    projectId: string;
-    sceneId: string;
-    acceptanceId: string;
-    newElements?: ExtractedElementProposal[];
-    factProposals?: ExtractedFactProposal[];
-    eventProposals?: ExtractedEventProposal[];
-  }): { entities: Entity[]; facts: FactAssertion[]; events: WorldEvent[]; revision?: Revision } {
+  /** 审阅确认并入库正文反向抽取的元素、事实与状态变化事件；提案正文来自服务端冻结产物。 */
+  applyExtractedLedger(input: ApplyExtractedLedgerInput & { acceptanceId: string }): { entities: Entity[]; facts: FactAssertion[]; events: WorldEvent[]; revision?: Revision } {
     const project = this.store.getProject(input.projectId);
     const branch = this.store.getBranch(project.activeBranchId);
     const scene = this.store.getScene(input.sceneId, branch.headRevisionId);
     if (scene.projectId !== project.projectId) throw new DomainError(400, "SCOPE_MISMATCH", "场景不属于此作品");
     requiredString(input.acceptanceId, "acceptanceId", 200);
-
-    const payloadHash = stableHash({
-      projectId: project.projectId,
-      sceneId: scene.sceneId,
-      newElements: input.newElements ?? [],
-      factProposals: input.factProposals ?? [],
-      eventProposals: input.eventProposals ?? [],
+    const artifact = this.store.getArtifact<ExtractedLedgerBundle & { projectId: string }>(requiredString(input.artifactId, "artifactId", 200));
+    if (artifact.kind !== "extracted_ledger" || artifact.value.projectId !== project.projectId || artifact.value.sceneId !== scene.sceneId) throw new DomainError(400, "SCOPE_MISMATCH", "提取产物不属于此作品场景");
+    const selectedIds = input.selectedProposalIds;
+    if (!Array.isArray(selectedIds) || selectedIds.length === 0 || new Set(selectedIds).size !== selectedIds.length) throw new DomainError(400, "EMPTY_EXTRACTION_SELECTION", "请至少选择一项提取提案，且不能重复选择");
+    const originalProposals = [...artifact.value.newElements, ...artifact.value.factProposals, ...artifact.value.eventProposals];
+    const originalIds = new Set(originalProposals.map(item => item.proposalId));
+    if (selectedIds.some(id => !originalIds.has(id))) throw new DomainError(400, "INVALID_EXTRACTION_SELECTION", "选中项不属于此提取产物");
+    const edits = input.proposalEdits ?? {};
+    for (const [proposalId, edit] of Object.entries(edits)) {
+      if (!originalIds.has(proposalId) || !selectedIds.includes(proposalId) || !edit || typeof edit !== "object") throw new DomainError(400, "INVALID_EXTRACTION_EDIT", "修改内容不属于当前选中提案");
+      if (["proposalId", "quote", "evidenceId"].some(key => key in edit)) throw new DomainError(400, "IMMUTABLE_EXTRACTION_EVIDENCE", "提案 ID、原文引文和证据不可修改");
+    }
+    const selected = <T extends { proposalId: string }>(items: T[]): T[] => items.filter(item => selectedIds.includes(item.proposalId));
+    const newElements = selected(artifact.value.newElements).map(item => {
+      const edit = edits[item.proposalId];
+      return { ...item,
+        ...(edit?.name !== undefined ? { name: edit.name } : {}),
+        ...(edit?.aliases !== undefined ? { aliases: edit.aliases } : {}),
+        ...(edit?.summary !== undefined ? { summary: edit.summary } : {}),
+        ...(edit?.type !== undefined ? { type: edit.type } : {}),
+      };
     });
+    const factProposals = selected(artifact.value.factProposals).map(item => {
+      const edit = edits[item.proposalId];
+      return { ...item,
+        ...(edit?.subjectName !== undefined ? { subjectName: edit.subjectName } : {}),
+        ...(edit?.predicate !== undefined ? { predicate: edit.predicate } : {}),
+        ...(edit?.value !== undefined ? { value: edit.value } : {}),
+        ...(edit?.semanticType !== undefined ? { semanticType: edit.semanticType } : {}),
+      };
+    });
+    const eventProposals = selected(artifact.value.eventProposals).map(item => {
+      const edit = edits[item.proposalId];
+      return { ...item,
+        ...(edit?.subjectName !== undefined ? { subjectName: edit.subjectName } : {}),
+        ...(edit?.kind !== undefined ? { kind: edit.kind } : {}),
+        ...(edit?.fromValue !== undefined ? { fromValue: edit.fromValue } : {}),
+        ...(edit?.toValue !== undefined ? { toValue: edit.toValue } : {}),
+        ...(edit?.storyTime !== undefined ? { storyTime: edit.storyTime } : {}),
+      };
+    });
+    const payloadHash = stableHash({ projectId: project.projectId, sceneId: scene.sceneId, artifactId: artifact.artifactId, selectedProposalIds: selectedIds, proposalEdits: edits });
     const cached = this.appliedAcceptances.get(input.acceptanceId);
     if (cached) {
       if (cached.payloadHash !== payloadHash) throw new DomainError(409, "IDEMPOTENCY_CONFLICT", "acceptanceId 已绑定其他提取采用内容");
       return cached.result as { entities: Entity[]; facts: FactAssertion[]; events: WorldEvent[]; revision?: Revision };
     }
 
+    const sourceScene = this.store.getScene(scene.sceneId, artifact.value.revisionId);
+    if (sourceScene.body !== scene.body) throw new DomainError(409, "SCENE_CHANGED", "正文在提取后已修改，请重新执行「从本场提取设定」后再确认入库");
     this.knowledge.indexScene(scene, branch.headRevisionId);
-    const validEvidenceIds = new Set(
-      this.store
-        .listKnowledgeEvidence(project.projectId)
-        .filter((ev) => ev.sceneId === scene.sceneId && ev.sourceRevisionId === branch.headRevisionId)
-        .map((ev) => ev.evidenceId),
-    );
+    const currentEvidence = this.knowledge.listSceneEvidence?.(project.projectId, scene.sceneId, branch.headRevisionId)
+      ?? this.store.listKnowledgeEvidence(project.projectId).filter(ev => ev.sceneId === scene.sceneId && ev.sourceRevisionId === branch.headRevisionId);
+    const originalEvidence = this.store.listKnowledgeEvidence(project.projectId).filter(ev => ev.sourceRevisionId === artifact.value.revisionId);
+    const rebind = <T extends { evidenceId: string; quote: string }>(proposal: T): T => {
+      const original = originalEvidence.find(item => item.evidenceId === proposal.evidenceId);
+      const matches = currentEvidence.filter(item => item.quote === proposal.quote && (!original?.blockId || item.blockId === original.blockId));
+      if (matches.length !== 1) throw new DomainError(400, "INVALID_EVIDENCE", "提案在当前场景中缺少唯一有效的段落证据");
+      return { ...proposal, evidenceId: matches[0]!.evidenceId };
+    };
+    const reviewedElements = newElements.map(rebind);
+    const reviewedFacts = factProposals.map(rebind);
+    const reviewedEvents = eventProposals.map(rebind);
+    const validEvidenceIds = new Set(currentEvidence.map(item => item.evidenceId));
 
     const createdEntities: Entity[] = [];
     const createdFacts: FactAssertion[] = [];
     const createdEvents: WorldEvent[] = [];
+    const storyOrder = parseStoryOrderFromTime(scene.storyTime);
     let revision: Revision | undefined;
-    // 提取与入库之间正文可能已自动保存换头：旧 bundle 的证据属于旧修订。
-    // 正文已变则明确要求重新提取，避免误用失效证据。
-    const headScene = this.store.getScene(input.sceneId, branch.headRevisionId);
-    if (headScene.body !== scene.body) {
-      throw new DomainError(409, "SCENE_CHANGED", "正文在提取后已修改，请重新执行「从本场提取设定」后再确认入库");
-    }
     // 元素、事实、事件与场景关联同事务写入：任一步失败整体回滚，不留半成品。
     const applyAll = this.db.transaction(() => {
       const nameToEntityId = new Map<string, string>();
@@ -1302,7 +1334,7 @@ export class CreativeAssistService {
         for (const alias of existing.aliases) nameToEntityId.set(alias, existing.entityId);
       }
 
-      for (const elem of input.newElements ?? []) {
+      for (const elem of reviewedElements) {
         if (!validEvidenceIds.has(elem.evidenceId)) {
           throw new DomainError(400, "INVALID_EVIDENCE", `提取元素「${elem.name}」缺少当前场景正文的有效证据`);
         }
@@ -1329,7 +1361,7 @@ export class CreativeAssistService {
         if (saved && !createdEntities.some((e) => e.entityId === entityId)) createdEntities.push(saved);
       }
 
-      for (const fact of input.factProposals ?? []) {
+      for (const fact of reviewedFacts) {
         if (!validEvidenceIds.has(fact.evidenceId)) {
           throw new DomainError(400, "INVALID_EVIDENCE", `提取事实「${fact.subjectName} · ${fact.predicate}」缺少当前场景正文的有效证据`);
         }
@@ -1348,15 +1380,14 @@ export class CreativeAssistService {
           reviewState: "confirmed",
           sourceKind: "manuscript",
           routeId: scene.routeId,
-          validFromOrder: scene.narrationOrder,
+          ...(storyOrder !== undefined ? { validFromOrder: storyOrder } : {}),
           evidenceIds: [fact.evidenceId],
         });
         const saved = this.knowledge.listFacts(project.projectId).find((f) => f.factId === factId);
         if (saved) createdFacts.push(saved);
       }
 
-      const storyOrder = parseStoryOrderFromTime(scene.storyTime) ?? scene.narrationOrder;
-      for (const ev of input.eventProposals ?? []) {
+      for (const ev of reviewedEvents) {
         if (!validEvidenceIds.has(ev.evidenceId)) {
           throw new DomainError(400, "INVALID_EVIDENCE", `提取事件「${ev.subjectName} · ${ev.kind}」缺少当前场景正文的有效证据`);
         }
@@ -1371,7 +1402,7 @@ export class CreativeAssistService {
           sceneId: scene.sceneId,
           routeId: scene.routeId,
           ...(resolvedStoryTime ? { storyTime: resolvedStoryTime } : {}),
-          storyOrder,
+          ...(storyOrder !== undefined ? { storyOrder } : {}),
           subjectId,
           ...(ev.fromValue ? { fromValue: ev.fromValue } : {}),
           toValue: requiredString(ev.toValue, "toValue", 500),

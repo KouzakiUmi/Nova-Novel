@@ -26,6 +26,15 @@ await mkdir(stage, { recursive: true });
 await runPnpm( ["-r", "build"]);
 await run(process.execPath, ["scripts/test-packed-runtime.mjs"]);
 await runPnpm( ["--filter", "@nova-novel/server", "--prod", "deploy", stage]);
+// pnpm deploy 会把 workspace:* 改写为“别名@file:///绝对路径”形态，后续 install
+// 重新解析时会产生非法的双重别名 spec（ERR_PNPM_SPEC_NOT_SUPPORTED_BY_ANY_RESOLVER）。
+// 规范化为相对 file: 路径，保留 stage 根目录对仓库工作区的相对引用。
+const stageManifestForSpec = join(stage, "package.json");
+const stageDeps = JSON.parse(await readFile(stageManifestForSpec, "utf8"));
+if (typeof stageDeps.dependencies?.["@nova-novel/shared"] === "string" && stageDeps.dependencies["@nova-novel/shared"].includes("file:")) {
+  stageDeps.dependencies["@nova-novel/shared"] = "file:../../packages/shared";
+  await writeFile(stageManifestForSpec, `${JSON.stringify(stageDeps, null, 2)}\n`);
+}
 await cp(join(root, "packages/server/dist"), join(stage, "packages/server/dist"), { recursive: true });
 await cp(join(root, "packages/shared/dist"), join(stage, "node_modules/@nova-novel/shared/dist"), { recursive: true });
 await cp(join(root, "electron"), join(stage, "electron"), { recursive: true });
@@ -39,16 +48,23 @@ await copyFile(join(root, "build/icon.ico"), join(stage, "build/icon.ico"));
 await access(join(stage, "node_modules/better-sqlite3/build/Release/better_sqlite3.node"));
 const packageFile = join(stage, "package.json");
 const manifest = JSON.parse(await readFile(packageFile, "utf8"));
+const rootDevDeps = JSON.parse(await readFile(join(root, "package.json"), "utf8")).devDependencies;
+const electronVersion = rootDevDeps.electron;
 manifest.name = "nova-novel";
 manifest.productName = "Nova Novel";
 manifest.description = "本机小说创作编辑室";
 manifest.author = "KouzakiUmi";
 manifest.main = "electron/main.cjs";
 manifest.private = true;
-manifest.devDependencies = { electron: "44.7.2" };
+// stage 内的 electron-rebuild / electron-builder 需由本包提供，否则 pnpm exec 找不到可执行文件
+manifest.devDependencies = {
+  electron: electronVersion,
+  "@electron/rebuild": rootDevDeps["@electron/rebuild"],
+  "electron-builder": rootDevDeps["electron-builder"],
+};
 await writeFile(packageFile, `${JSON.stringify(manifest, null, 2)}\n`);
-await runPnpm( ["install"], stage);
-await runPnpm( ["exec", "electron-rebuild", "-f", "-w", "better-sqlite3", "--version", "44.7.2"], stage);
+await runPnpm( ["install", "--no-frozen-lockfile"], stage);
+await runPnpm( ["exec", "electron-rebuild", "-f", "-w", "better-sqlite3", "--version", electronVersion], stage);
 await runPnpm( ["exec", "electron-builder", "--config", "electron-builder.yml", ...(unpacked ? ["--dir"] : ["--win", "--x64"])], stage);
 await run(process.execPath, ["scripts/test-electron-lifecycle.mjs", join(stage, "release-packaged", "win-unpacked", "Nova Novel.exe")]);
 console.log(`打包完成：${join(stage, "release-packaged")}`);

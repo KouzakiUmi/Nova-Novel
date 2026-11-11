@@ -40,7 +40,11 @@ export interface KnowledgeService {
   indexScene(scene: Scene, revisionId: string): void;
   /** 由宿主声明某修订的完整场景清单，只有全部索引成功该修订才算可检索。 */
   beginRevisionIndex?(projectId: string, revisionId: string, sceneIds: readonly string[]): void;
+  /** 复用来源修订中正文与时空坐标兼容的已完成场景；不能复用时返回 false。 */
+  reuseSceneIndex?(scene: Scene, revisionId: string, sourceRevisionId: string): boolean;
   getIndexStatus?(projectId: string, revisionId: string): { state: "pending" | "error" | "ready"; keywordRevisionId: string };
+  /** 保存后只读取当前场景在该修订中有效的证据，避免重拉整部作品。 */
+  listSceneEvidence?(projectId: string, sceneId: string, revisionId: string): import("@nova-novel/shared").Evidence[];
   /** 从权威修订正文重建派生证据与 FTS，用于索引损坏后的恢复。 */
   rebuildRevisionIndex?(projectId: string, revisionId: string, scenes: readonly Scene[]): { state: "pending" | "error" | "ready"; keywordRevisionId: string };
   /** 作者录入元素与别名；entityId 已存在时按 upsert 更新。 */
@@ -114,8 +118,8 @@ export interface PiHost {
   generate(input: PiGenerationInput): Promise<PiGenerationResult>;
   cancel(taskId: string): Promise<void>;
   progress?(key: string): GenerationProgress;
-  assistImport?(text: string): Promise<import("@nova-novel/shared").ImportedChapterDraft[] | null>;
-  planIngest?(text: string, chapters: import("@nova-novel/shared").ImportedChapterDraft[]): Promise<import("@nova-novel/shared").IngestPlan | null>;
+  /** 预处理摘要驱动方案判定：客户端本地分章后只提交结构与抽样，不提交正文。 */
+  planIngest?(digest: { chapterCount: number; sceneCount: number; wordCount: number; titles: string[]; head: string; middle: string; tail: string; opening: string }): Promise<import("@nova-novel/shared").IngestPlan | null>;
   usage?: { list(force?: boolean): Promise<UsageReportView[]> };
   volcengine?: {
     loginStatus(): OAuthStatusView;

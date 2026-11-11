@@ -37,6 +37,8 @@ interface Draft {
   name: string;
   api: ProviderApi;
   baseUrl: string;
+  proxyEnabled: boolean;
+  proxyUrl: string;
   compat?: ProviderCompat;
   keySource: "manual" | "environment";
   apiKey: string;
@@ -47,10 +49,18 @@ interface Draft {
   models: ProviderModelInput[];
 }
 
-const emptyDraft = (): Draft => ({ providerId: "", name: "", api: "openai-completions", baseUrl: "", keySource: "manual", apiKey: "", apiKeyEnv: "", quotaAccessKeyEnv: "", quotaSecretKeyEnv: "", keepKey: false, models: [{ id: "" }] });
+const emptyDraft = (): Draft => ({ providerId: "", name: "", api: "openai-completions", baseUrl: "", proxyEnabled: false, proxyUrl: "", keySource: "manual", apiKey: "", apiKeyEnv: "", quotaAccessKeyEnv: "", quotaSecretKeyEnv: "", keepKey: false, models: [{ id: "" }] });
 
 function draftFrom(provider: ProviderConfigView): Draft {
-  return { providerId: provider.providerId, name: provider.name, api: provider.api, baseUrl: provider.baseUrl, ...(provider.compat ? { compat: provider.compat } : {}), keySource: provider.keySource ?? "manual", apiKey: "", apiKeyEnv: provider.apiKeyEnv ?? "", quotaAccessKeyEnv: provider.quotaAccessKeyEnv ?? "", quotaSecretKeyEnv: provider.quotaSecretKeyEnv ?? "", keepKey: provider.hasApiKey, models: provider.models.length ? provider.models.map((model) => ({ ...model })) : [{ id: "" }] };
+  return { providerId: provider.providerId, name: provider.name, api: provider.api, baseUrl: provider.baseUrl, proxyEnabled: provider.proxyEnabled ?? false, proxyUrl: provider.proxyUrl ?? "", ...(provider.compat ? { compat: provider.compat } : {}), keySource: provider.keySource ?? "manual", apiKey: "", apiKeyEnv: provider.apiKeyEnv ?? "", quotaAccessKeyEnv: provider.quotaAccessKeyEnv ?? "", quotaSecretKeyEnv: provider.quotaSecretKeyEnv ?? "", keepKey: provider.hasApiKey, models: provider.models.length ? provider.models.map((model) => ({ ...model })) : [{ id: "" }] };
+}
+
+function validProxyUrl(value: string): boolean {
+  if (!value.trim()) return true;
+  try {
+    const url = new URL(value.trim());
+    return ["http:", "https:"].includes(url.protocol) && !url.username && !url.password && !url.search && !url.hash && (url.pathname === "/" || url.pathname === "");
+  } catch { return false; }
 }
 
 function slug(text: string): string {
@@ -376,13 +386,14 @@ function ProviderEditor({ mode, initial, existingIds, builtinProviders, onPreset
   const models = draft.models.filter((model) => model.id.trim());
   const idValid = /^[a-z0-9][a-z0-9-]{1,40}$/.test(draft.providerId);
   const idTaken = mode === "create" && existingIds.includes(draft.providerId);
-  const canSave = idValid && !idTaken && draft.name.trim() && /^https?:\/\//.test(draft.baseUrl.trim()) && models.length > 0 && (draft.keySource === "manual" || /^[A-Z][A-Z0-9_]{1,80}$/.test(draft.apiKeyEnv)) && !saving;
+  const proxyValid = validProxyUrl(draft.proxyUrl);
+  const canSave = idValid && !idTaken && draft.name.trim() && /^https?:\/\//.test(draft.baseUrl.trim()) && models.length > 0 && (!draft.proxyEnabled || proxyValid) && (draft.keySource === "manual" || /^[A-Z][A-Z0-9_]{1,80}$/.test(draft.apiKeyEnv)) && !saving;
 
   const discover = async () => {
     setDiscovering(true);
     setError("");
     try {
-      const result = await api.discoverModels(draft.providerId || "new", { baseUrl: draft.baseUrl.trim(), api: draft.api, ...(draft.apiKey ? { apiKey: draft.apiKey } : {}) });
+      const result = await api.discoverModels(draft.providerId || "new", { baseUrl: draft.baseUrl.trim(), api: draft.api, proxyEnabled: draft.proxyEnabled, proxyUrl: draft.proxyUrl.trim(), ...(draft.apiKey ? { apiKey: draft.apiKey } : {}) });
       setDiscovered(result.models);
       if (!result.models.length) setError("服务没有返回模型列表，请手动填写模型 ID。");
     } catch (cause) {
@@ -404,6 +415,8 @@ function ProviderEditor({ mode, initial, existingIds, builtinProviders, onPreset
       name: draft.name.trim(),
       api: draft.api,
       baseUrl: draft.baseUrl.trim().replace(/\/+$/, ""),
+      proxyEnabled: draft.proxyEnabled,
+      proxyUrl: proxyValid ? draft.proxyUrl.trim() : "",
       ...(draft.compat ? { compat: draft.compat } : {}),
       keySource: draft.keySource,
       ...(draft.keySource === "environment" ? { apiKeyEnv: draft.apiKeyEnv } : {}),
@@ -431,6 +444,9 @@ function ProviderEditor({ mode, initial, existingIds, builtinProviders, onPreset
         <label className="field-label">标识（ID）<input value={draft.providerId} disabled={mode === "edit"} onChange={(event) => set({ providerId: event.target.value.toLowerCase() })} placeholder="my-provider" />{draft.providerId && !idValid && <small className="field-error">只能用小写字母、数字和短横线，2–41 个字符</small>}{idTaken && <small className="field-error">这个标识已被使用</small>}</label>
         <label className="field-label span-2">接口类型<select value={draft.api} onChange={(event) => set({ api: event.target.value as ProviderApi })}>{API_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select><small>{apiOption.hint}</small></label>
         <label className="field-label span-2">服务地址（Base URL）<input value={draft.baseUrl} onChange={(event) => set({ baseUrl: event.target.value })} placeholder={apiOption.placeholder} spellCheck={false} /></label>
+        <label className="checkbox-line span-2"><input type="checkbox" checked={draft.proxyEnabled} onChange={(event) => set({ proxyEnabled: event.target.checked })} />此服务使用代理</label>
+        {draft.proxyEnabled && <label className="field-label span-2">代理地址（可选）<input value={draft.proxyUrl} onChange={(event) => set({ proxyUrl: event.target.value })} placeholder="http://127.0.0.1:7890" spellCheck={false} aria-invalid={!proxyValid} /><small>留空时使用运行环境中的代理变量；仅支持不含凭据的 HTTP(S) 代理地址。</small>{!proxyValid && <small className="field-error">请输入不含凭据、路径或查询参数的 HTTP(S) 代理地址</small>}</label>}
+        {draft.proxyEnabled && <p className="field-hint span-2">Google、Vertex、Bedrock 和 OAuth 模型暂不支持此代理；OAuth 登录不受此设置控制。</p>}
         <label className="field-label span-2">密钥来源<select value={draft.keySource} onChange={(event) => set({ keySource: event.target.value as Draft["keySource"] })}><option value="manual">手动填写 API Key</option><option value="environment">读取环境变量</option></select></label>
         {draft.keySource === "environment" ? (
           <label className="field-label span-2">环境变量名<input id="api-key-env" value={draft.apiKeyEnv} onChange={(event) => set({ apiKeyEnv: event.target.value.toUpperCase().replace(/[^A-Z0-9_]/g, "") })} placeholder="例如 DEEPSEEK_API_KEY" spellCheck={false} /><small>应用只保存变量名；启动 Nova 前，请先在系统或终端中设置该变量。</small></label>

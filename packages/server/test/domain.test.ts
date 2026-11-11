@@ -292,9 +292,13 @@ test("HTTP bootstrap, empty example ideas, saving, JSON errors and same-origin p
     assert.ok(generated.draft.cards.length >= 3);
     const patch = await fetch(`${base}/api/scenes/${snapshot.scenes[0]!.sceneId}`, { method: "PATCH", headers: { "Content-Type": "application/json", Origin: base }, body: JSON.stringify({ baseRevisionId: f.branch.headRevisionId, body: "浏览器确认保存的正文。" }) });
     assert.equal(patch.status, 200);
-    const saved = await patch.json() as { scene: { body: string }; revisionId: string };
+    const saved = await patch.json() as { scene: { body: string }; revisionId: string; revision: { revisionId: string }; evidence: unknown[]; storyGraph: { revisionId: string }; project: { projectId: string } };
     assert.equal(saved.scene.body, "浏览器确认保存的正文。");
     assert.ok(saved.revisionId);
+    assert.equal(saved.revision.revisionId, saved.revisionId);
+    assert.equal(saved.storyGraph.revisionId, saved.revisionId);
+    assert.equal(saved.project.projectId, f.project.projectId);
+    assert.ok(Array.isArray(saved.evidence));
     const stale = await fetch(`${base}/api/scenes/${snapshot.scenes[0]!.sceneId}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ baseRevisionId: f.branch.headRevisionId, body: "过时的文本" }) });
     assert.equal(stale.status, 409);
     assert.equal((await stale.json() as { error: { currentRevisionId: string } }).error.currentRevisionId, saved.revisionId);

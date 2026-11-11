@@ -1,6 +1,6 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { ElementDesignCard, ElementGuideSession, Entity, Evidence, FactAssertion, Scene, WorkspaceSnapshot, WorldEvent } from "@nova-novel/shared";
-import { ArrowLeft, ArrowRight, Box, Check, CheckCircle2, ChevronDown, Clock3, Compass, FileText, History, KeyRound, LoaderCircle, MapPin, Network, PenLine, Plus, Search, Shield, Sparkles, UserRound } from "lucide-react";
+import { ArrowLeft, ArrowRight, Box, Check, CheckCircle2, ChevronDown, Clock3, Compass, FileText, History, KeyRound, LoaderCircle, MapPin, Network, PenLine, Plus, RotateCcw, Search, Shield, Sparkles, UserRound, X } from "lucide-react";
 import { Badge, EmptyState } from "./UI";
 import { CharacterArcPanel } from "./CharacterArcPanel";
 import { api } from "../lib/api";
@@ -75,11 +75,21 @@ export function ElementsView({
   const [factValue, setFactValue] = useState("");
   const [factEntityId, setFactEntityId] = useState("");
   const [factSemantic, setFactSemantic] = useState<FactAssertion["semanticType"]>("world_fact");
+  const [factValidFrom, setFactValidFrom] = useState("");
+  const [factValidTo, setFactValidTo] = useState("");
+  const [editingFactId, setEditingFactId] = useState("");
+  const [editingEventId, setEditingEventId] = useState("");
   const [eventKind, setEventKind] = useState("status.change");
   const [eventFrom, setEventFrom] = useState("");
   const [eventTo, setEventTo] = useState("");
   const [eventTime, setEventTime] = useState("");
   const [eventSceneId, setEventSceneId] = useState("");
+
+  useEffect(() => {
+    setEditingFactId("");
+    setEditingEventId("");
+    setError("");
+  }, [selectedElementId]);
 
   const elements = useMemo(
     () =>
@@ -325,19 +335,53 @@ export function ElementsView({
     setError("");
     setNote("");
     try {
-      await api.addElementFact(selected.entityId, {
+      const input = {
         projectId: snapshot.activeProject.projectId,
         predicate: factPredicate.trim(),
         ...(factEntityId ? { valueEntityId: factEntityId } : { value: factValue.trim() }),
         semanticType: factSemantic,
-      });
+        ...(factValidFrom.trim() ? { validFromOrder: Number(factValidFrom) } : {}),
+        ...(factValidTo.trim() ? { validToOrder: Number(factValidTo) } : {}),
+      };
+      if (editingFactId) await api.updateElementFact(selected.entityId, editingFactId, input);
+      else await api.addElementFact(selected.entityId, input);
       await onChanged();
+      setEditingFactId("");
       setFactPredicate("");
       setFactValue("");
       setFactEntityId("");
-      setNote("已添加属性/关系设定");
+      setFactValidFrom("");
+      setFactValidTo("");
+      setNote(editingFactId ? "事实修改已保存" : "已添加属性/关系设定");
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "添加属性/关系失败");
+      setError(cause instanceof Error ? cause.message : "属性/关系尚未保存，请重试");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const startFactEdit = (fact: FactAssertion) => {
+    setEditingFactId(fact.factId);
+    setFactPredicate(fact.predicate);
+    setFactEntityId(typeof fact.value === "object" && fact.value !== null && "entityId" in fact.value ? fact.value.entityId : "");
+    setFactValue(typeof fact.value === "object" && fact.value !== null ? "" : String(fact.value ?? ""));
+    setFactSemantic(fact.semanticType);
+    setFactValidFrom(fact.validFrom ?? "");
+    setFactValidTo(fact.validTo ?? "");
+    setTab("overview");
+    setError("");
+  };
+
+  const toggleFact = async (fact: FactAssertion) => {
+    if (!selected || busy) return;
+    setBusy(true);
+    setError("");
+    try {
+      await api.updateElementFact(selected.entityId, fact.factId, { projectId: snapshot.activeProject.projectId, reviewState: fact.reviewState === "rejected" ? "confirmed" : "rejected" });
+      await onChanged();
+      setNote(fact.reviewState === "rejected" ? "事实已恢复为已确认" : "事实已作废，历史记录仍保留");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "事实状态修改失败");
     } finally {
       setBusy(false);
     }
@@ -349,20 +393,51 @@ export function ElementsView({
     setError("");
     setNote("");
     try {
-      await api.addElementEvent(selected.entityId, {
+      const input = {
         projectId: snapshot.activeProject.projectId,
         kind: eventKind,
         ...(eventSceneId ? { sceneId: eventSceneId } : {}),
         ...(eventTime.trim() ? { storyTime: eventTime.trim() } : {}),
         ...(eventFrom.trim() ? { fromValue: eventFrom.trim() } : {}),
         toValue: eventTo.trim(),
-      });
+      };
+      if (editingEventId) await api.updateElementEvent(selected.entityId, editingEventId, input);
+      else await api.addElementEvent(selected.entityId, input);
       await onChanged();
+      setEditingEventId("");
       setEventFrom("");
       setEventTo("");
-      setNote("已记录状态变化/知情区间事件");
+      setEventTime("");
+      setEventSceneId("");
+      setNote(editingEventId ? "事件修改已保存，关联知识边界已同步" : "已记录状态变化/知情区间事件");
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "记录事件失败");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const startEventEdit = (event: WorldEvent) => {
+    setEditingEventId(event.eventId);
+    setEventKind(event.kind);
+    setEventFrom(event.fromValue ?? "");
+    setEventTo(event.toValue ?? event.location ?? "");
+    setEventTime(event.storyTime ?? String(event.storyOrder));
+    setEventSceneId(event.sceneId ?? "");
+    setTab("timeline");
+    setError("");
+  };
+
+  const toggleEvent = async (event: WorldEvent) => {
+    if (!selected || busy) return;
+    setBusy(true);
+    setError("");
+    try {
+      await api.updateElementEvent(selected.entityId, event.eventId, { projectId: snapshot.activeProject.projectId, reviewState: event.reviewState === "rejected" ? "confirmed" : "rejected" });
+      await onChanged();
+      setNote(event.reviewState === "rejected" ? "事件已恢复，关联知识边界已同步" : "事件已作废，关联知识边界已同步");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "事件状态修改失败");
     } finally {
       setBusy(false);
     }
@@ -936,6 +1011,9 @@ export function ElementsView({
                     facts={facts}
                     events={events}
                     elements={snapshot.elements}
+                    onEditFact={startFactEdit}
+                    onToggleFact={toggleFact}
+                    busy={busy}
                     {...(timeScene?.storyTime ? { storyTime: timeScene.storyTime } : {})}
                   />
                 )}
@@ -981,16 +1059,19 @@ export function ElementsView({
                           </option>
                         ))}
                       </select>
+                      <input aria-label="事实生效时点" type="number" value={factValidFrom} onChange={event => setFactValidFrom(event.target.value)} placeholder="生效时点（可留空）" />
+                      <input aria-label="事实结束时点" type="number" value={factValidTo} onChange={event => setFactValidTo(event.target.value)} placeholder="结束时点（可留空）" />
                     </div>
                     <div className="note-composer-actions" style={{ marginTop: 8 }}>
-                      <span>录入后作为已确认设定直接参与检索与一致性检查</span>
+                      <span>{editingFactId ? "修改正文抽取内容后会转为作者设定，原证据保留供追溯" : "录入后作为已确认设定直接参与检索与一致性检查"}</span>
+                      {editingFactId && <button type="button" className="button ghost small" disabled={busy} onClick={() => setEditingFactId("")}>取消修改</button>}
                       <button
                         className="button primary small"
                         disabled={busy || !factPredicate.trim() || (!factValue.trim() && !factEntityId)}
                         onClick={() => void addFactToSelected()}
                       >
-                        <Plus size={13} />
-                        添加事实
+                        {editingFactId ? <Check size={13} /> : <Plus size={13} />}
+                        {editingFactId ? "保存事实修改" : "添加事实"}
                       </button>
                     </div>
                   </section>
@@ -1022,6 +1103,9 @@ export function ElementsView({
                           value={eventKind}
                           onChange={(e) => setEventKind(e.target.value)}
                         >
+                          {![
+                            "status.change", "item.transfer", "item.transfer_possession", "item.discover", "item.lost", "item.recover_possession", "item.move_location", "known_by", "revealed",
+                          ].includes(eventKind) && <option value={eventKind}>{eventKind}</option>}
                           {selected.type === "secret" ? (
                             <>
                               <option value="known_by">known_by（某角色获知此秘密）</option>
@@ -1069,18 +1153,19 @@ export function ElementsView({
                         </select>
                       </div>
                       <div className="note-composer-actions" style={{ marginTop: 8 }}>
-                        <span>秘密知情边界按查询时点生效：未到获知时点不会进入对应视角上下文</span>
+                        <span>秘密知情边界按查询时点生效；修改或作废事件会同步更正边界</span>
+                        {editingEventId && <button type="button" className="button ghost small" disabled={busy} onClick={() => setEditingEventId("")}>取消修改</button>}
                         <button
                           className="button primary small"
                           disabled={busy || !eventTo.trim()}
                           onClick={() => void addEventToSelected()}
                         >
-                          <Plus size={13} />
-                          记录事件
+                          {editingEventId ? <Check size={13} /> : <Plus size={13} />}
+                          {editingEventId ? "保存事件修改" : "记录事件"}
                         </button>
                       </div>
                     </section>
-                    <EntityTimeline events={events} scenes={snapshot.scenes} onOpenScene={onOpenScene} />
+                    <EntityTimeline events={events} scenes={snapshot.scenes} onOpenScene={onOpenScene} onEdit={startEventEdit} onToggle={toggleEvent} busy={busy} />
                   </>
                 )}
                 {tab === "evidence" && (
@@ -1143,14 +1228,21 @@ function Overview({
   events,
   elements,
   storyTime,
+  onEditFact,
+  onToggleFact,
+  busy,
 }: {
   entity: Entity;
   facts: FactAssertion[];
   events: WorldEvent[];
   elements: Entity[];
   storyTime?: string;
+  onEditFact: (fact: FactAssertion) => void;
+  onToggleFact: (fact: FactAssertion) => void;
+  busy: boolean;
 }) {
-  const latest = events.at(-1);
+  const activeEvents = events.filter(event => event.reviewState === "confirmed");
+  const latest = activeEvents.at(-1);
   return (
     <div className="element-overview">
       <section className="current-state-card">
@@ -1168,13 +1260,21 @@ function Overview({
         {facts.length ? (
           <div className="fact-grid">
             {facts.map((fact) => (
-              <div key={fact.factId} className="fact-card">
+              <div key={fact.factId} className={`fact-card ${fact.reviewState === "rejected" ? "is-rejected" : ""}`}>
                 <span>{fact.predicate}</span>
                 <strong>{formatValue(fact.value, elements)}</strong>
                 <small>
                   {semanticTypeLabels[fact.semanticType] ?? fact.semanticType} ·{" "}
-                  {fact.reviewState === "confirmed" ? "已确认" : "待确认"}
+                  {fact.reviewState === "confirmed" ? "已确认" : fact.reviewState === "rejected" ? "已作废" : "待确认"}
+                  {fact.sourceKind === "author_setting" ? " · 作者设定" : " · 正文来源"}
                 </small>
+                <div className="fact-card-actions">
+                  <button className="text-button" disabled={busy} onClick={() => onEditFact(fact)}><PenLine size={12} />修改</button>
+                  <button className="text-button" disabled={busy} onClick={() => void onToggleFact(fact)}>
+                    {fact.reviewState === "rejected" ? <RotateCcw size={12} /> : <X size={12} />}
+                    {fact.reviewState === "rejected" ? "恢复" : "作废"}
+                  </button>
+                </div>
               </div>
             ))}
           </div>
@@ -1184,7 +1284,7 @@ function Overview({
       </section>
       <section>
         <h3 className="content-section-title">最近变化</h3>
-        {events
+        {activeEvents
           .slice(-3)
           .reverse()
           .map((event) => (
@@ -1216,7 +1316,7 @@ function Relations({
   elements: Entity[];
   onSelect: (id: string) => void;
 }) {
-  const relations = facts.filter((fact) => typeof fact.value === "object" && fact.value !== null && "entityId" in fact.value);
+  const relations = facts.filter((fact) => fact.reviewState === "confirmed" && typeof fact.value === "object" && fact.value !== null && "entityId" in fact.value);
   return (
     <div>
       <h3 className="content-section-title">
@@ -1248,10 +1348,16 @@ function EntityTimeline({
   events,
   scenes,
   onOpenScene,
+  onEdit,
+  onToggle,
+  busy,
 }: {
   events: WorldEvent[];
   scenes: Scene[];
   onOpenScene: (id: string) => void;
+  onEdit: (event: WorldEvent) => void;
+  onToggle: (event: WorldEvent) => void;
+  busy: boolean;
 }) {
   return (
     <div className="entity-timeline">
@@ -1271,6 +1377,14 @@ function EntityTimeline({
                 <ArrowRight size={13} />
               </button>
             )}
+            <div className="fact-card-actions">
+              <button className="text-button" disabled={busy} onClick={() => onEdit(event)}><PenLine size={12} />修改</button>
+              <button className="text-button" disabled={busy} onClick={() => void onToggle(event)}>
+                {event.reviewState === "rejected" ? <RotateCcw size={12} /> : <X size={12} />}
+                {event.reviewState === "rejected" ? "恢复" : "作废"}
+              </button>
+              {event.reviewState === "rejected" && <small>已作废 · 不参与当前状态投影</small>}
+            </div>
           </div>
         </article>
       ))}

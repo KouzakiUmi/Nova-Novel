@@ -47,6 +47,17 @@ export function secretOf(provider: { apiKey: string; keySource?: "manual" | "env
   return provider.keySource === "environment" && provider.apiKeyEnv ? process.env[provider.apiKeyEnv] ?? "" : provider.apiKey;
 }
 function invalid(message: string): never { throw new DomainError(400, "INVALID_AGENT_SETTINGS", message); }
+export function validateProxy(input: { proxyEnabled?: unknown; proxyUrl?: unknown }): { proxyEnabled: boolean; proxyUrl: string } {
+  if (input.proxyEnabled !== undefined && typeof input.proxyEnabled !== "boolean") invalid("代理状态必须是布尔值");
+  if (input.proxyUrl !== undefined && (typeof input.proxyUrl !== "string" || input.proxyUrl.length > 2048)) invalid("代理地址无效");
+  const proxyUrl = typeof input.proxyUrl === "string" ? input.proxyUrl.trim() : "";
+  if (proxyUrl) {
+    let url: URL;
+    try { url = new URL(proxyUrl); } catch { return invalid("代理地址必须是 HTTP(S) 地址"); }
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash || (url.pathname !== '/' && url.pathname !== '')) invalid("代理地址必须是无凭据的 HTTP(S) 地址");
+  }
+  return { proxyEnabled: input.proxyEnabled === true, proxyUrl };
+}
 function validateCompat(input: ProviderCompat | undefined): ProviderCompat | undefined {
   if (input === undefined) return undefined;
   if (!input || typeof input !== "object" || Array.isArray(input)) invalid("兼容参数格式无效");
@@ -133,7 +144,7 @@ export class AgentSettings {
       return { id: modelId, name: model.name === undefined ? modelId : requiredString(model.name, "模型名称", 200), reasoning: model.reasoning ?? false, contextWindow, maxTokens, input: model.input ?? ["text" as const], ...(model.thinkingLevelMap ? { thinkingLevelMap: { ...model.thinkingLevelMap } } : {}), ...(compat ? { compat } : {}) };
     });
     const compat = validateCompat(input.compat);
-    return { name: requiredString(input.name, "服务名称", 200), api: input.api, baseUrl: url.href.replace(/\/$/, ""), ...(compat ? { compat } : {}), disabled: input.disabled ?? false, keySource, ...(keySource === "environment" ? { apiKeyEnv: apiKeyEnv!, apiKey: "" } : apiKey !== undefined ? { apiKey } : {}), ...(input.authProviderId ? { authProviderId: input.authProviderId } : {}), ...(input.quotaAccessKeyEnv !== undefined ? { quotaAccessKeyEnv: input.quotaAccessKeyEnv } : {}), ...(input.quotaSecretKeyEnv !== undefined ? { quotaSecretKeyEnv: input.quotaSecretKeyEnv } : {}), models };
+    return { name: requiredString(input.name, "服务名称", 200), api: input.api, baseUrl: url.href.replace(/\/$/, ""), ...(compat ? { compat } : {}), ...validateProxy(input), disabled: input.disabled ?? false, keySource, ...(keySource === "environment" ? { apiKeyEnv: apiKeyEnv!, apiKey: "" } : apiKey !== undefined ? { apiKey } : {}), ...(input.authProviderId ? { authProviderId: input.authProviderId } : {}), ...(input.quotaAccessKeyEnv !== undefined ? { quotaAccessKeyEnv: input.quotaAccessKeyEnv } : {}), ...(input.quotaSecretKeyEnv !== undefined ? { quotaSecretKeyEnv: input.quotaSecretKeyEnv } : {}), models };
   }
   private async reload(): Promise<void> {
     // 无密钥的服务（Ollama、LM Studio 等本机模型）写入占位值，Pi 才会把它视为可用；占位值不会回显给页面。
@@ -185,7 +196,7 @@ export class AgentSettings {
           const clean = this.validate(providerId, { name: preset.name, api: preset.api, baseUrl: preset.baseUrl, keySource: "manual", ...(preset.compat ? { compat: preset.compat } : {}), models: preset.models });
           const current = this.data.providers.find(item => item.providerId === providerId);
           const date = new Date().toISOString();
-          const configured: Provider = { providerId, ...clean, authProviderId: id, apiKey: "", hasApiKey: true, createdAt: current?.createdAt ?? date, updatedAt: date };
+          const configured: Provider = { providerId, ...clean, proxyEnabled: current?.proxyEnabled ?? false, proxyUrl: current?.proxyUrl ?? "", authProviderId: id, apiKey: "", hasApiKey: true, createdAt: current?.createdAt ?? date, updatedAt: date };
           this.data.providers = [...this.data.providers.filter(item => item.providerId !== providerId), configured];
           atomic(this.settingsPath, this.data);
         }
@@ -238,6 +249,7 @@ export class AgentSettings {
   route(kind: TaskKind) { const model = this.resolveModel(kind); return { model, thinkingLevel: model ? clampThinking(this.data.routes.find(item => item.kind === kind)?.thinkingLevel ?? defaults[kind], model.thinkingLevels) : "off" as const }; }
   hasProvider(id: string): boolean { return this.data.providers.some(item => item.providerId === id); }
   provider(id: string): Provider { const provider = this.data.providers.find(item => item.providerId === id); if (!provider) throw new DomainError(404, "PROVIDER_NOT_FOUND", "服务不存在"); return structuredClone(provider); }
+  providerForModel(id: string): Provider { const provider = this.data.providers.find(item => !item.disabled && (item.providerId === id || item.authProviderId === id)); if (!provider) throw new DomainError(404, "PROVIDER_NOT_FOUND", "服务不存在"); return structuredClone(provider); }
   dataProviders(): Provider[] { return this.data.providers; }
   redact(text: string): string {
     for (const provider of this.data.providers) {

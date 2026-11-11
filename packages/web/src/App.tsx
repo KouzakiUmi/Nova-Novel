@@ -78,7 +78,6 @@ export function App() {
   const headRef = useRef<string>("");
   const headsRef = useRef(new Map<string, string>());
   const flushEditorRef = useRef<(() => Promise<void>) | null>(null);
-  const saveSeq = useRef(0);
   const projectIdRef = useRef("");
   const projectSeq = useRef(0);
   const refreshSeq = useRef(0);
@@ -184,7 +183,6 @@ export function App() {
     if (seq !== projectSeq.current) return;
     projectIdRef.current = projectId;
     const token = beginSnapshot(projectId);
-    saveSeq.current += 1;
     let next: WorkspaceSnapshot;
     try { next = await api.bootstrap(projectId); }
     catch (cause) {
@@ -202,7 +200,6 @@ export function App() {
     await flushPending();
     const seq = ++projectSeq.current;
     const token = beginSnapshot("");
-    saveSeq.current += 1;
     const next = await api.createProject({ title: input.title, premise: input.premise, ...(input.body ? { body: input.body } : {}) });
     if (seq !== projectSeq.current || !commitSnapshot(next, token)) return;
     const projectId = next.activeProject.projectId;
@@ -221,9 +218,9 @@ export function App() {
     if (previous?.state === "error" && !explicitRetry) throw new Error(previous.message);
     draftsRef.current.set(key, { scene, state: "saving", message: "" });
     publishDrafts();
-    saveSeq.current += 1;
     const activation = projectSeq.current;
-    const token = scene.projectId === projectIdRef.current ? beginSnapshot(scene.projectId) : { projectId: scene.projectId, activation, request: refreshSeq.current };
+    // 保存本身已串行；队列内逐项合并，不让后续保存使前一个修订从历史列表消失。
+    const token = { projectId: scene.projectId, activation, request: refreshSeq.current };
     const task = pendingSave.current.then(() => undefined, () => undefined).then(async () => {
       const blocked = draftsRef.current.get(key);
       if (blocked?.state === "error") throw new Error(blocked.message);
@@ -240,10 +237,17 @@ export function App() {
       const current = snapshotRef.current;
       if (activation === projectSeq.current && current?.activeProject.projectId === scene.projectId && projectIdRef.current === scene.projectId) {
         const branchId = current.activeProject.activeBranchId;
+        const previousRevisionId = result.revision.parentRevisionIds[0];
+        const evidenceById = new Map(current.evidence.filter(item => item.sceneId !== result.scene.sceneId || item.sourceRevisionId !== previousRevisionId).map(item => [item.evidenceId, item]));
+        for (const item of result.evidence) evidenceById.set(item.evidenceId, item);
         commitSnapshot({
           ...current,
+          activeProject: result.project,
           scenes: current.scenes.map((item) => item.sceneId === result.scene.sceneId ? result.scene : { ...item, baseRevisionId: result.revisionId }),
           branches: current.branches.map((branch) => branch.branchId === branchId ? { ...branch, headRevisionId: result.revisionId } : branch),
+          revisions: [result.revision, ...current.revisions.filter(item => item.revisionId !== result.revisionId)],
+          evidence: [...evidenceById.values()],
+          storyGraph: result.storyGraph,
         }, token);
       }
       if (draftsRef.current.get(key)?.scene === scene) draftsRef.current.delete(key);
@@ -259,13 +263,7 @@ export function App() {
     });
     pendingSave.current = task;
     await task;
-    // 版本列表等派生信息后台刷新；期间若又有保存，丢弃这份较旧的快照。
-    const seq = saveSeq.current;
-    if (activation === projectSeq.current && projectIdRef.current === scene.projectId) {
-      const token = beginSnapshot(scene.projectId);
-      void api.bootstrap(scene.projectId).then((next) => { if (seq === saveSeq.current) commitSnapshot(next, token); }).catch(cause => notify(cause instanceof Error ? `正文已保存，作品信息暂未刷新：${cause.message}` : "正文已保存，作品信息暂未刷新", "error"));
-    }
-  }, [beginSnapshot, commitSnapshot, publishDrafts, notify]);
+  }, [commitSnapshot, publishDrafts]);
 
   const retryDraft = async (key: string) => {
     const draft = draftsRef.current.get(key);
@@ -550,22 +548,30 @@ export function App() {
           onCancel={() => setImportOpen(false)}
           onImport={async (input) => {
             let created: { projectId: string; title: string; headRevisionId: string } | null = null;
-            await run(async () => {
+            // 持久化失败（api 抛错）才视为失败；入库成功后的界面刷新失败不重复入库。
+            try {
               await flushPending();
               const result = await api.importProject({ title: input.title, premise: "导入已有小说", chapters: input.chapters });
-              await activateProject(result.project.projectId);
-              setView("write");
               created = { projectId: result.project.projectId, title: result.project.title, headRevisionId: result.revision.revisionId };
-            }, `已按 ${input.chapters.length} 个章节导入新作品`);
+            } catch (cause) {
+              notify(cause instanceof Error ? cause.message : "入库失败，请重试", "error");
+              return null;
+            }
+            notify(`已按 ${input.chapters.length} 个章节导入新作品`);
+            void activateProject(created.projectId).then(() => setView("write")).catch(() => undefined);
             return created;
           }}
           onAppend={async (input) => {
             let appended: { headRevisionId: string } | null = null;
-            await run(async () => {
+            try {
               const result = await api.importAppend(input);
-              await refresh(input.projectId);
               appended = { headRevisionId: result.revision.revisionId };
-            }, `已追加 ${input.chapters.length} 个章节`);
+            } catch (cause) {
+              notify(cause instanceof Error ? cause.message : "追加失败，请重试", "error");
+              return null;
+            }
+            notify(`已追加 ${input.chapters.length} 个章节`);
+            void refresh(input.projectId).catch(() => undefined);
             return appended;
           }}
           onProjectCreated={async (projectId) => { await activateProject(projectId); setView("write"); }}

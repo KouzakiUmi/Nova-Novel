@@ -4,7 +4,7 @@ import Database from "better-sqlite3";
 import type { WorkspaceSnapshot } from "@nova-novel/shared";
 import { DomainStore } from "../src/store.js";
 import { exportBackup, exportMarkdown, parseManuscript, summarizeManuscript, sliceManuscript, sliceByChapterPattern, headingCandidates } from "../src/transfer.js";
-import { assistManuscript } from "../src/agent/import-assist.js";
+import { chunkImportUnits, flattenImportChapters } from "@nova-novel/shared";
 import { planManuscriptIngest } from "../src/agent/ingest-planner.js";
 
 test("markdown manuscript import creates chapters and scenes with one initial revision", () => {
@@ -129,18 +129,31 @@ test("AI decisions slice original text and ignore hallucinated line numbers", as
   assert.equal(chapters?.[0]?.title, "第一章 雨夜");
   assert.equal(chapters?.[0]?.scenes[0]?.body, "阿禾收铺。");
   assert.equal(chapters?.[1]?.scenes[0]?.body, "柜台底下卡着一张收据。");
-  const assisted = await assistManuscript(text, { complete: async () => JSON.stringify([{ line: 0, level: "chapter", title: "第一章 雨夜" }, { line: 4, level: "chapter", title: "第二章 旧收据" }]) });
-  assert.equal(assisted?.length, 2);
-  const fallback = await assistManuscript(text, { complete: async () => "不是 JSON" });
-  assert.equal(fallback, null);
 });
 
 test("ingest planner returns analysis and validated options with local fallback", async () => {
-  const chapters = parseManuscript("第1章 A\n\n正文一").chapters;
-  const plan = await planManuscriptIngest("第1章 A\n\n正文一", chapters, { complete: async () => JSON.stringify({ analysis: "单章短篇", chapterPattern: "^第\d+章", options: [{ id: "standard", title: "分章 + 知识提取", detail: "逐场提取", steps: ["分章"], estimatedCalls: 1, recommended: true, extract: true }] }) });
+  const digest = { chapterCount: 1, sceneCount: 1, wordCount: 3, titles: ["第1章 A"], head: "正文一", middle: "正文一", tail: "正文一", opening: "第1章 A\n\n正文一" };
+  const plan = await planManuscriptIngest(digest, { complete: async () => JSON.stringify({ analysis: "单章短篇", chapterPattern: "^第\d+章", options: [{ id: "standard", title: "分章 + 知识提取", detail: "逐场提取", steps: ["分章"], estimatedCalls: 1, recommended: true, extract: true }] }) });
   assert.equal(plan?.analysis, "单章短篇");
   assert.equal(plan?.chapterPattern, "^第\d+章");
   assert.equal(plan?.options[0]?.extract, true);
-  const fallback = await planManuscriptIngest("第1章 A\n\n正文一", chapters, { complete: async () => "无法判定" });
+  const fallback = await planManuscriptIngest(digest, { complete: async () => "无法判定" });
   assert.equal(fallback, null);
+});
+
+test("import chunking splits oversized scenes and respects UTF-8 byte batches", () => {
+  const big = "段落一\n\n" + "字".repeat(4_200_000);
+  const units = flattenImportChapters([{ title: "第一章", scenes: [{ title: "场1", body: big }] }]);
+  assert.ok(units.length >= 2, "单场景超限应按字符预拆");
+  const batches = chunkImportUnits(units);
+  const encoder = new TextEncoder();
+  for (const batch of batches) assert.ok(encoder.encode(JSON.stringify(batch)).length <= 4 * 1024 * 1024 + 4096, "每批应在字节上限附近");
+  const flat = batches.flat();
+  assert.equal(flat.reduce((sum, chapter) => sum + chapter.scenes.length, 0), units.length);
+  assert.equal(flat[0]?.title, "第一章");
+  assert.ok(flat.some(chapter => chapter.title.includes("（续）")), "跨批的章应标记续");
+  const small = flattenImportChapters([{ title: "第一章", scenes: [{ title: "场1", body: "甲" }, { title: "场2", body: "乙" }] }, { title: "第二章", scenes: [{ title: "场1", body: "丙" }] }]);
+  const merged = chunkImportUnits(small);
+  assert.equal(merged.length, 1);
+  assert.deepEqual(merged[0]?.map(chapter => chapter.scenes.length), [2, 1], "小章节应保持场分组");
 });

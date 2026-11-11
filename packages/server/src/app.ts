@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 import { readAppearanceSettings, writeAppearanceSettings } from "./appearance.js";
 import { timingSafeEqual } from "node:crypto";
 import type {
-  ContextQuery, Entity, FactAssertion, GenerationRequest, IdeaCardFields, SelectionAction, WorkspaceSnapshot, ProviderUpsert, TaskRoute, WorkflowDefinition, SceneAnnotation, AuthoringEvent, ElementDesignCard, PlotIdeateMode, SceneProposalCard, NoteIncubateTarget, ExtractedElementProposal, ExtractedFactProposal, ExtractedEventProposal, ImportedChapterDraft, IngestPlan,
+  ContextQuery, Entity, FactAssertion, GenerationRequest, IdeaCardFields, SelectionAction, WorkspaceSnapshot, ProviderUpsert, TaskRoute, WorkflowDefinition, SceneAnnotation, AuthoringEvent, ElementDesignCard, PlotIdeateMode, SceneProposalCard, NoteIncubateTarget, ApplyExtractedLedgerInput, ImportedChapterDraft, IngestPlan, WorldEvent,
 } from "@nova-novel/shared";
 import type { KnowledgeService, PiHost, WorkflowService } from "./contracts.js";
 import { DomainError, EXAMPLE_IDEAS, requiredString, versionNumber } from "./domain.js";
@@ -14,18 +14,19 @@ import type { GuidedOutlineService } from "./guide.js";
 import type { GuidedWorkflowService } from "./workflow-guide.js";
 import { CreativeAssistService, ElementGuideService } from "./assist.js";
 import { IngestRunner } from "./ingest.js";
-import { exportBackup, exportMarkdown, parseBackup, parseManuscript, sliceByChapterPattern, summarizeManuscript } from "./transfer.js";
+import { exportBackup, exportMarkdown, parseBackup } from "./transfer.js";
 import { NotionCopilotError, NotionCopilotPlugin } from "./integrations/notion-copilot.js";
 
-export interface AppServices { store: DomainStore; knowledge: KnowledgeService; workflow: WorkflowService; pi: PiHost; guide?: GuidedOutlineService; workflowGuide?: GuidedWorkflowService; elementGuide?: ElementGuideService; assist?: CreativeAssistService; notion?: NotionCopilotPlugin }
+export interface AppServices { store: DomainStore; knowledge: KnowledgeService; workflow: WorkflowService; pi: PiHost; guide?: GuidedOutlineService; workflowGuide?: GuidedWorkflowService; elementGuide?: ElementGuideService; assist?: CreativeAssistService; notion?: NotionCopilotPlugin; ingestDir?: string }
 const MAX_BODY_BYTES = 1_048_576;
 type Body = Record<string, unknown>;
 
 // 纵深防御：即便未来渲染层出现 XSS 疏漏，也挡住脚本执行、 framing 与跨源读取。
 // 前端模板无内联脚本（仅 type=module），故 script-src 可收紧为 'self'；
-// style-src-attr 放行 React 内联 style 属性，style-src 仍只限 'self'。
+// style-src-attr 放行 React 内联 style 属性；编辑器注入的 <style> 由 style-src-elem 单独处理。
+// 不设置 style-src-elem 时会回退到 style-src，从而误阻止编辑器运行所需样式。
 export const SECURITY_HEADERS = {
-  "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'",
+  "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self'; style-src-elem 'self' 'unsafe-inline'; style-src-attr 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'",
   "X-Frame-Options": "DENY",
   "Cross-Origin-Opener-Policy": "same-origin",
   "Cross-Origin-Resource-Policy": "same-origin",
@@ -59,7 +60,7 @@ function parseImportChapters(value: unknown): ImportedChapterDraft[] {
     title: requiredString(chapter?.title, "章节标题", 200),
     scenes: Array.isArray(chapter?.scenes) ? chapter.scenes.map(scene => ({
       title: requiredString(scene?.title || "未命名场景", "场景标题", 200),
-      body: requiredString(scene?.body ?? "", "场景正文", 1_000_000),
+      body: requiredString(scene?.body ?? "", "场景正文", 4_000_000),
       ...(typeof scene?.summary === "string" ? { summary: scene.summary } : {}),
     })) : [],
   }));
@@ -106,11 +107,11 @@ function piIdeas(text: string): IdeaCardFields[] {
   });
 }
 
-export function createApp({ store, knowledge, workflow, pi, guide, workflowGuide, elementGuide: providedElementGuide, assist: providedAssist, notion: providedNotion }: AppServices) {
+export function createApp({ store, knowledge, workflow, pi, guide, workflowGuide, elementGuide: providedElementGuide, assist: providedAssist, notion: providedNotion, ingestDir }: AppServices) {
   const assist = providedAssist ?? new CreativeAssistService(store.db, store, knowledge, pi);
   const elementGuide = providedElementGuide ?? new ElementGuideService(store.db, store, knowledge, pi, assist);
   const appearanceDir = pi.settings?.view().dataDir ?? process.env.NOVA_NOVEL_DATA_DIR ?? resolve(process.cwd(), "data");
-  const ingest = new IngestRunner(store, assist, resolve(appearanceDir, "ingest", "runs"));
+  const ingest = new IngestRunner(store, assist, ingestDir ?? resolve(appearanceDir, "ingest", "runs"), indexRevision);
   const notion = providedNotion ?? new NotionCopilotPlugin(appearanceDir);
   function snapshot(projectId?: string): WorkspaceSnapshot {
     const project = store.getProject(projectId);
@@ -138,14 +139,18 @@ export function createApp({ store, knowledge, workflow, pi, guide, workflowGuide
     const povEntityId = scene?.pov ? knowledge.listEntities(project.projectId).find(entity => entity.entityId === scene.pov || entity.name === scene.pov || entity.aliases.includes(scene.pov!))?.entityId : undefined;
     return { projectId: project.projectId, branchId: branch.branchId, routeId: scene?.routeId ?? project.activeRouteId, revisionId: branch.headRevisionId, query: request.input, purpose: request.kind === "consistency" ? "fact_check" : request.kind === "ideas" ? "planning" : "scene_writing", ...(scene ? { narrationOrder: scene.narrationOrder, ...(povEntityId ? { povEntityId } : {}) } : {}), ...(storyOrder !== undefined ? { storyOrder } : {}) };
   }
-  function indexRevision(projectId: string, revisionId: string): void {
+  function indexRevision(projectId: string, revisionId: string, forceSceneIds: ReadonlySet<string> = new Set()): void {
     // Indexing is derived: a failed rebuild must not undo a durable author save.
     const scenes = store.listScenes(projectId, revisionId);
     // 先声明完整清单，索引状态只有在全部场景成功后才会变成 ready。
     try { knowledge.beginRevisionIndex?.(projectId, revisionId, scenes.map(scene => scene.sceneId)); }
     catch (error) { console.warn("Nova Novel index begin failed", error instanceof Error ? error.name : "IndexError"); }
+    const parentRevisionId = store.getRevision(revisionId).parentRevisionIds[0];
     for (const scene of scenes) {
-      try { knowledge.indexScene(scene, revisionId); }
+      try {
+        const reused = parentRevisionId && !forceSceneIds.has(scene.sceneId) ? knowledge.reuseSceneIndex?.(scene, revisionId, parentRevisionId) ?? false : false;
+        if (!reused) knowledge.indexScene(scene, revisionId);
+      }
       catch (error) { console.warn("Nova Novel index pending", error instanceof Error ? error.name : "IndexError"); }
     }
   }
@@ -266,21 +271,13 @@ export function createApp({ store, knowledge, workflow, pi, guide, workflowGuide
     if (ingestStatus && method === "GET") { json(response, 200, ingest.get(ingestStatus[1]!)); return; }
     if (!["POST", "PATCH", "DELETE", "PUT"].includes(method)) throw new DomainError(404, "NOT_FOUND", "接口不存在");
     if (path === "/api/import/backup" && method === "POST") { const backupInput = await body(request, 20 * 1024 * 1024); const restored = store.restoreBackup(parseBackup(backupInput.backup)); indexRevision(restored.project.projectId, restored.revision.revisionId); json(response, 201, { ...restored, snapshot: snapshot(restored.project.projectId) }); return; }
-    const input = await body(request, path.startsWith("/api/import") ? 20 * 1024 * 1024 : MAX_BODY_BYTES);
+    const input = await body(request, path.startsWith("/api/import") || path.startsWith("/api/ingest") ? 20 * 1024 * 1024 : MAX_BODY_BYTES);
     if (path === "/api/appearance" && method === "PUT") { json(response, 200, writeAppearanceSettings(appearanceDir, input)); return; }
     if (path === "/api/events" && method === "POST") { const seq = store.recordInteraction({ projectId: requiredString(input.projectId, "projectId"), kind: requiredString(input.kind, "kind", 100), ...(typeof input.sceneId === "string" ? { sceneId: input.sceneId } : {}), ...(input.actor === "system" || input.actor === "author" ? { actor: input.actor } : {}), ...(input.meta && typeof input.meta === "object" && !Array.isArray(input.meta) ? { meta: input.meta as AuthoringEvent["meta"] } : {}) }); json(response, 201, { seq }); return; }
-    if (path === "/api/import/analyze" && method === "POST") {
-      const text = requiredString(input.text, "text", 1_000_000);
-      const useAi = input.useAi !== false && typeof pi.assistImport === "function";
-      let chapters: ImportedChapterDraft[] | null = null;
-      if (useAi) chapters = await pi.assistImport!(text);
-      const aiUsed = Boolean(chapters);
-      const fallback = aiUsed ? chapters! : parseManuscript(text).chapters;
-      const warnings = useAi && !aiUsed ? ["AI 未能确定章节结构，已按本地标题规则切分；可在预览中核对。"] : [];
-      json(response, 200, summarizeManuscript(fallback, aiUsed, warnings)); return;
-    }
+    if (path === "/api/import/analyze" && method === "POST") throw new DomainError(410, "IMPORT_ANALYZE_REMOVED", "全文分析已改为客户端本地分章，请使用新版导入流程");
     if (path === "/api/import" && method === "POST") {
-      const chapters = Array.isArray(input.chapters) ? parseImportChapters(input.chapters) : parseManuscript(requiredString(input.text, "text", 1_000_000)).chapters;
+      if (!Array.isArray(input.chapters)) throw new DomainError(400, "INVALID_INPUT", "chapters 必须是数组；全文分章请在客户端本地预处理后分批提交");
+      const chapters = parseImportChapters(input.chapters);
       const imported = store.importProject({ ...(typeof input.title === "string" ? { title: input.title } : {}), ...(typeof input.premise === "string" ? { premise: input.premise } : {}), chapters });
       indexRevision(imported.project.projectId, imported.revision.revisionId);
       json(response, 201, { ...imported, snapshot: snapshot(imported.project.projectId) }); return;
@@ -293,25 +290,25 @@ export function createApp({ store, knowledge, workflow, pi, guide, workflowGuide
       json(response, 201, { ...result, snapshot: snapshot(projectId) }); return;
     }
     if (path === "/api/ingest/plan" && method === "POST") {
-      const text = requiredString(input.text, "text", 1_000_000);
-      const local = parseManuscript(text).chapters;
-      let chapters = local;
+      // 预处理后的结构摘要：客户端已完成本地分章，只提交章节结构、字数与抽样摘录，正文不随请求上传。
+      const digestInput = input.digest;
+      if (!digestInput || typeof digestInput !== "object" || Array.isArray(digestInput)) throw new DomainError(400, "INVALID_INPUT", "digest 必须是对象");
+      const digest = digestInput as { chapterCount?: unknown; sceneCount?: unknown; wordCount?: unknown; titles?: unknown; head?: unknown; middle?: unknown; tail?: unknown; opening?: unknown };
+      const chapterCount = Number(digest.chapterCount), sceneCount = Number(digest.sceneCount), wordCount = Number(digest.wordCount);
+      if (!Number.isInteger(chapterCount) || chapterCount < 1 || !Number.isInteger(sceneCount) || sceneCount < 1 || !Number.isFinite(wordCount) || wordCount < 0) throw new DomainError(400, "INVALID_INPUT", "digest 的章节、场景与字数无效");
+      const titles = Array.isArray(digest.titles) ? digest.titles.slice(0, 200).map(item => requiredString(item, "titles[]", 200)) : [];
+      const excerpt = (value: unknown) => typeof value === "string" ? value.slice(0, 4000) : "";
+      const summary = { chapterCount, sceneCount, wordCount, titles, head: excerpt(digest.head), middle: excerpt(digest.middle), tail: excerpt(digest.tail), opening: excerpt(digest.opening) };
       let plan: IngestPlan | null = null;
-      if (input.useAi !== false && typeof pi.planIngest === "function") {
-        plan = await pi.planIngest(text, local);
-        if (plan?.chapterPattern) {
-          const sliced = sliceByChapterPattern(text, plan.chapterPattern);
-          if (sliced) chapters = sliced;
-        }
-      }
-      json(response, 200, { plan, preview: summarizeManuscript(chapters, false, plan ? [] : ["未接入模型或判定失败，已按本地规则给出处理方案。"]) }); return;
+      if (input.useAi !== false && typeof pi.planIngest === "function") plan = await pi.planIngest(summary);
+      json(response, 200, { plan, warnings: plan ? [] : ["未接入模型或判定失败，已按本地规则给出处理方案。"] }); return;
     }
     if (path === "/api/ingest/start" && method === "POST") {
-      const chapters = parseImportChapters(input.chapters);
-      const imported = store.importProject({ ...(typeof input.title === "string" ? { title: input.title } : {}), premise: "导入已有小说", chapters });
-      indexRevision(imported.project.projectId, imported.revision.revisionId);
-      const run = ingest.start(imported.project.projectId, imported.project.title);
-      json(response, 201, { runId: run.runId, project: imported.project, revision: imported.revision, snapshot: snapshot(imported.project.projectId) }); return;
+      // 分批入库后的启动入口：正文已经由 /api/import + /api/import/append 落盘，这里只为既有作品启动提取运行器。
+      const projectId = requiredString(input.projectId, "projectId");
+      const project = store.getProject(projectId);
+      const run = ingest.start(projectId, project.title);
+      json(response, 201, { runId: run.runId, project, snapshot: snapshot(projectId) }); return;
     }
     const ingestRun = path.match(/^\/api\/ingest\/([0-9a-f-]+)(?:\/(cancel|resume|commit|discard))?$/);
     if (ingestRun) {
@@ -416,6 +413,52 @@ export function createApp({ store, knowledge, workflow, pi, guide, workflowGuide
       store.recordInteraction({ projectId, kind: "element-fact-added", actor: "author", meta: { entityId, factId, predicate } });
       json(response, 201, { fact: knowledge.listFacts(projectId).find(f => f.factId === factId), snapshot: snapshot(projectId) }); return;
     }
+    const elementFactRoute = path.match(/^\/api\/elements\/([^/]+)\/facts\/([^/]+)$/);
+    if (elementFactRoute && method === "PATCH") {
+      const projectId = requiredString(input.projectId, "projectId");
+      const entityId = decodeURIComponent(elementFactRoute[1]!);
+      const factId = decodeURIComponent(elementFactRoute[2]!);
+      const current = knowledge.listFacts(projectId).find(item => item.factId === factId && item.subjectId === entityId);
+      if (!current) throw new DomainError(404, "NOT_FOUND", "事实不存在或不属于此元素");
+      if (!knowledge.addFact) throw new DomainError(503, "ELEMENTS_UNAVAILABLE", "当前知识服务不支持事实修改");
+      const reviewState = input.reviewState === undefined ? current.reviewState : input.reviewState;
+      if (!["confirmed", "rejected"].includes(String(reviewState))) throw new DomainError(400, "INVALID_INPUT", "事实确认状态无效");
+      let value = current.value;
+      if (typeof input.valueEntityId === "string" && input.valueEntityId.trim()) {
+        const target = knowledge.listEntities(projectId).find(item => item.entityId === input.valueEntityId && item.routeId === current.routeId);
+        if (!target) throw new DomainError(404, "NOT_FOUND", "关联元素不存在或路线不一致");
+        value = { entityId: target.entityId };
+      } else if (input.value !== undefined) {
+        value = requiredString(String(input.value), "value", 2000);
+      }
+      const predicate = input.predicate === undefined ? current.predicate : requiredString(input.predicate, "predicate", 100);
+      const semanticType = input.semanticType === undefined ? current.semanticType : input.semanticType;
+      if (!["world_fact", "belief", "rumor", "deception", "plan", "hypothesis"].includes(String(semanticType))) throw new DomainError(400, "INVALID_INPUT", "语义类型无效");
+      const order = (raw: unknown, existing: string | undefined): number | undefined => {
+        if (raw === undefined) return existing === undefined ? undefined : Number(existing);
+        if (raw === null || raw === "") return undefined;
+        if (!Number.isFinite(Number(raw))) throw new DomainError(400, "INVALID_INPUT", "事实有效时点无效");
+        return Number(raw);
+      };
+      const validFromOrder = order(input.validFromOrder, current.validFrom);
+      const validToOrder = order(input.validToOrder, current.validTo);
+      if (validFromOrder !== undefined && validToOrder !== undefined && validFromOrder >= validToOrder) throw new DomainError(400, "INVALID_INPUT", "事实生效起点必须早于终点");
+      const contentChanged = predicate !== current.predicate || semanticType !== current.semanticType || JSON.stringify(value) !== JSON.stringify(current.value) || validFromOrder !== (current.validFrom === undefined ? undefined : Number(current.validFrom)) || validToOrder !== (current.validTo === undefined ? undefined : Number(current.validTo));
+      knowledge.addFact({
+        factId, projectId, subjectId: entityId, predicate, value,
+        semanticType: semanticType as FactAssertion["semanticType"],
+        reviewState: reviewState as FactAssertion["reviewState"],
+        // 人工改正文抽取内容后，它成为作者设定；原证据保留供追溯，不再冒充原文证明新值。
+        sourceKind: contentChanged ? "author_setting" : current.sourceKind,
+        routeId: current.routeId,
+        ...(validFromOrder !== undefined ? { validFromOrder } : {}),
+        ...(validToOrder !== undefined ? { validToOrder } : {}),
+        ...(current.holderId ? { holderId: current.holderId } : {}),
+        evidenceIds: current.evidenceIds,
+      });
+      store.recordInteraction({ projectId, kind: "element-fact-updated", actor: "author", meta: { entityId, factId, reviewState: String(reviewState) } });
+      json(response, 200, { fact: knowledge.listFacts(projectId).find(item => item.factId === factId), snapshot: snapshot(projectId) }); return;
+    }
     const elementEventsRoute = path.match(/^\/api\/elements\/([^/]+)\/events$/);
     if (elementEventsRoute && method === "POST") {
       const projectId = requiredString(input.projectId, "projectId");
@@ -473,6 +516,85 @@ export function createApp({ store, knowledge, workflow, pi, guide, workflowGuide
       const eventId = writeEventAndBoundary();
       store.recordInteraction({ projectId, kind: "element-event-added", actor: "author", meta: { entityId, eventId, kind } });
       json(response, 201, { event: knowledge.listEvents(projectId).find(ev => ev.eventId === eventId), snapshot: snapshot(projectId) }); return;
+    }
+    const elementEventRoute = path.match(/^\/api\/elements\/([^/]+)\/events\/([^/]+)$/);
+    if (elementEventRoute && method === "PATCH") {
+      const projectId = requiredString(input.projectId, "projectId");
+      const entityId = decodeURIComponent(elementEventRoute[1]!);
+      const eventId = decodeURIComponent(elementEventRoute[2]!);
+      const current = knowledge.listEvents(projectId).find(item => item.eventId === eventId && item.subjectId === entityId);
+      const entity = knowledge.listEntities(projectId).find(item => item.entityId === entityId);
+      if (!current || !entity) throw new DomainError(404, "NOT_FOUND", "事件不存在或不属于此元素");
+      if (!knowledge.addEvent || !knowledge.addFact) throw new DomainError(503, "ELEMENTS_UNAVAILABLE", "当前知识服务不支持事件修改");
+      const reviewState = input.reviewState === undefined ? current.reviewState : input.reviewState;
+      if (!["confirmed", "rejected"].includes(String(reviewState))) throw new DomainError(400, "INVALID_INPUT", "事件确认状态无效");
+      const kind = input.kind === undefined ? current.kind : requiredString(input.kind, "kind", 100);
+      const fromValue = input.fromValue === undefined ? current.fromValue : typeof input.fromValue === "string" && input.fromValue.trim() ? input.fromValue.trim().slice(0, 1000) : undefined;
+      const toValue = input.toValue === undefined ? current.toValue : requiredString(input.toValue, "toValue", 1000);
+      const location = input.location === undefined ? current.location : typeof input.location === "string" && input.location.trim() ? input.location.trim().slice(0, 200) : undefined;
+      let storyTime = current.storyTime;
+      if (input.storyTime !== undefined) storyTime = typeof input.storyTime === "string" && input.storyTime.trim() ? input.storyTime.trim().slice(0, 200) : undefined;
+      let storyOrder = current.storyOrder;
+      if (input.storyOrder !== undefined) {
+        if (!Number.isFinite(Number(input.storyOrder))) throw new DomainError(400, "INVALID_INPUT", "事件故事时点无效");
+        storyOrder = Number(input.storyOrder);
+      } else if (input.storyTime !== undefined) {
+        storyOrder = parseStoryOrderFromTime(storyTime) ?? 0;
+      }
+      let sceneId = current.sceneId;
+      if (input.sceneId !== undefined) {
+        if (typeof input.sceneId === "string" && input.sceneId.trim()) {
+          const linked = store.getScene(input.sceneId.trim());
+          if (linked.projectId !== projectId) throw new DomainError(400, "SCOPE_MISMATCH", "事件来源场景不属于此作品");
+          sceneId = linked.sceneId;
+        } else sceneId = undefined;
+      }
+      const entityByName = (ref: string) => knowledge.listEntities(projectId).find(item => item.entityId === ref || item.name === ref || item.aliases.includes(ref));
+      const boundaryValue = (raw: string): FactAssertion["value"] => {
+        if (kind === "known_by") {
+          const holder = entityByName(raw);
+          if (holder) return { entityId: holder.entityId };
+        }
+        return raw;
+      };
+      const boundaryMatches = (fact: FactAssertion, targetKind: string, targetOrder: number, targetValue: string) => {
+        if (fact.subjectId !== entityId || fact.predicate !== targetKind || fact.validFrom !== String(targetOrder)) return false;
+        if (typeof fact.value === "object" && fact.value !== null && "entityId" in fact.value) return entityByName(targetValue)?.entityId === fact.value.entityId;
+        return fact.value === targetValue;
+      };
+      const write = store.db.transaction(() => {
+        knowledge.addEvent!({
+          eventId, projectId, kind, ...(sceneId ? { sceneId } : {}), routeId: current.routeId,
+          ...(storyTime ? { storyTime } : {}), storyOrder, subjectId: entityId,
+          ...(fromValue ? { fromValue } : {}), ...(toValue !== undefined ? { toValue } : {}), ...(location ? { location } : {}),
+          reviewState: reviewState as WorldEvent["reviewState"], evidenceIds: current.evidenceIds,
+        });
+        if (entity.type === "secret") {
+          const existingBoundaries = knowledge.listFacts(projectId).filter(fact => boundaryMatches(fact, current.kind, current.storyOrder, current.toValue ?? ""));
+          for (const fact of existingBoundaries) {
+            knowledge.addFact!({
+              factId: fact.factId, projectId, subjectId: fact.subjectId, predicate: fact.predicate, value: fact.value,
+              semanticType: fact.semanticType, reviewState: "rejected", sourceKind: fact.sourceKind, routeId: fact.routeId,
+              ...(fact.validFrom !== undefined ? { validFromOrder: Number(fact.validFrom) } : {}),
+              ...(fact.validTo !== undefined ? { validToOrder: Number(fact.validTo) } : {}),
+              ...(fact.holderId ? { holderId: fact.holderId } : {}), evidenceIds: fact.evidenceIds,
+            });
+          }
+          if (reviewState === "confirmed" && (kind === "known_by" || kind === "revealed") && toValue) {
+            const value = boundaryValue(toValue);
+            const existing = knowledge.listFacts(projectId).find(fact => boundaryMatches(fact, kind, storyOrder, toValue));
+            knowledge.addFact!({
+              ...(existing ? { factId: existing.factId } : {}), projectId, subjectId: entityId, predicate: kind, value,
+              semanticType: "world_fact", reviewState: "confirmed", sourceKind: "author_setting", routeId: current.routeId,
+              validFromOrder: storyOrder, ...(existing?.validTo !== undefined ? { validToOrder: Number(existing.validTo) } : {}),
+              ...(existing?.holderId ? { holderId: existing.holderId } : {}), evidenceIds: existing?.evidenceIds ?? current.evidenceIds,
+            });
+          }
+        }
+      });
+      write();
+      store.recordInteraction({ projectId, kind: "element-event-updated", actor: "author", meta: { entityId, eventId, reviewState: String(reviewState) } });
+      json(response, 200, { event: knowledge.listEvents(projectId).find(item => item.eventId === eventId), snapshot: snapshot(projectId) }); return;
     }
     if (path === "/api/assist/element-design" && method === "POST") {
       const result = await assist.generateElementDesign({
@@ -595,15 +717,18 @@ export function createApp({ store, knowledge, workflow, pi, guide, workflowGuide
     }
     if (path === "/api/assist/extract-ledger/apply" && method === "POST") {
       const projectId = requiredString(input.projectId, "projectId");
+      const selectedProposalIds = Array.isArray(input.selectedProposalIds) ? input.selectedProposalIds.map(id => requiredString(id, "proposalId", 200)) : [];
+      const proposalEdits = input.proposalEdits && typeof input.proposalEdits === "object" && !Array.isArray(input.proposalEdits) ? input.proposalEdits as ApplyExtractedLedgerInput["proposalEdits"] : undefined;
       const applied = assist.applyExtractedLedger({
         projectId,
         sceneId: requiredString(input.sceneId, "sceneId"),
+        artifactId: requiredString(input.artifactId, "artifactId"),
+        selectedProposalIds,
+        ...(proposalEdits ? { proposalEdits } : {}),
         acceptanceId: typeof input.acceptanceId === "string" ? requiredString(input.acceptanceId, "acceptanceId", 200) : newId("extract_apply"),
-        ...(Array.isArray(input.newElements) ? { newElements: input.newElements as ExtractedElementProposal[] } : {}),
-        ...(Array.isArray(input.factProposals) ? { factProposals: input.factProposals as ExtractedFactProposal[] } : {}),
-        ...(Array.isArray(input.eventProposals) ? { eventProposals: input.eventProposals as ExtractedEventProposal[] } : {}),
       });
-      if (applied.revision) indexRevision(projectId, applied.revision.revisionId);
+      // 提取入库会先把事实/事件引用重绑到新修订；该场必须生成新证据，不能继承旧 ID。
+      if (applied.revision) indexRevision(projectId, applied.revision.revisionId, new Set([requiredString(input.sceneId, "sceneId")]));
       json(response, 200, { ...applied, snapshot: snapshot(projectId) }); return;
     }
     if (path === "/api/notes" && method === "POST") { const created = store.createNote({ projectId: requiredString(input.projectId, "projectId"), title: requiredString(input.title, "title", 200), body: typeof input.body === "string" ? input.body : "", ...(typeof input.sceneId === "string" ? { sceneId: input.sceneId } : {}), ...(typeof input.elementId === "string" ? { elementId: input.elementId } : {}), ...(Array.isArray(input.tags) ? { tags: input.tags.map((tag: unknown) => requiredString(tag, "tag", 40)) } : {}) }); json(response, 201, { note: created }); return; }
@@ -735,7 +860,11 @@ export function createApp({ store, knowledge, workflow, pi, guide, workflowGuide
       const { baseRevisionId, branchId, acceptanceId, ...patch } = input;
       const result = store.saveScene(scene[1]!, { baseRevisionId: requiredString(baseRevisionId, "baseRevisionId"), ...(branchId ? { branchId: requiredString(branchId, "branchId") } : {}), ...(acceptanceId ? { acceptanceId: requiredString(acceptanceId, "acceptanceId", 200) } : {}), patch });
       indexRevision(result.revision.projectId, result.revision.revisionId);
-      json(response, 200, { scene: result.scene, revisionId: result.revision.revisionId }); return;
+      const revisionId = result.revision.revisionId;
+      const evidence = knowledge.listSceneEvidence?.(result.revision.projectId, result.scene.sceneId, revisionId)
+        ?? store.listKnowledgeEvidence(result.revision.projectId).filter(item => item.sceneId === result.scene.sceneId && item.sourceRevisionId === revisionId);
+      // 自动保存所需的派生状态随响应局部返回，前端无需再下载整部作品快照。
+      json(response, 200, { scene: result.scene, revisionId, revision: result.revision, evidence, storyGraph: store.getStoryGraph(result.revision.projectId, revisionId), project: store.getProject(result.revision.projectId) }); return;
     }
 
     const revisions = path.match(/^\/api\/projects\/([^/]+)\/revisions$/);
@@ -765,7 +894,22 @@ export function createApp({ store, knowledge, workflow, pi, guide, workflowGuide
       if (branch.projectId !== projectId || store.getRevision(revisionId).projectId !== projectId || !store.listRoutes(projectId).some(route => route.routeId === routeId)) throw new DomainError(400, "SCOPE_MISMATCH", "检索范围不属于此作品");
       store.assertRevisionOnBranch(projectId, branch.branchId, revisionId);
       if (!["planning", "scene_writing", "fact_check", "reader_check"].includes(String(input.purpose)) || typeof input.query !== "string") throw new DomainError(400, "INVALID_INPUT", "检索用途或文字无效");
-      json(response, 200, knowledge.queryContext(input as unknown as ContextQuery)); return;
+      let contextQuery = input as unknown as ContextQuery;
+      if (input.sceneId !== undefined) {
+        const scene = store.getScene(requiredString(input.sceneId, "sceneId"), revisionId);
+        if (scene.projectId !== projectId || scene.routeId !== routeId) throw new DomainError(400, "SCOPE_MISMATCH", "场景不属于此检索范围");
+        const povEntityId = scene.pov ? knowledge.listEntities(projectId).find(entity => entity.entityId === scene.pov || entity.name === scene.pov || entity.aliases.includes(scene.pov!))?.entityId : undefined;
+        const storyOrder = parseStoryOrderFromTime(scene.storyTime);
+        // 场景是上下文坐标的唯一来源；客户端不能再以叙述顺序或自报 POV 覆盖知识边界。
+        contextQuery = {
+          ...contextQuery, sceneId: scene.sceneId, narrationOrder: scene.narrationOrder,
+          ...(storyOrder !== undefined ? { storyOrder } : {}),
+          ...(povEntityId !== undefined ? { povEntityId } : {}),
+        };
+        if (storyOrder === undefined) delete contextQuery.storyOrder;
+        if (povEntityId === undefined) delete contextQuery.povEntityId;
+      }
+      json(response, 200, knowledge.queryContext(contextQuery)); return;
     }
     if (path === "/api/generate" && method === "POST") {
       requiredString(input.projectId, "projectId"); requiredString(input.idempotencyKey, "idempotencyKey", 200);

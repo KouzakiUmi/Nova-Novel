@@ -54,7 +54,11 @@ function prepareProject(projectId: string): void {
   const headScenes = store.listScenes(projectId, headRevisionId);
   // 启动时同样声明完整清单，否则索引状态会永远停在 pending。
   knowledge.beginRevisionIndex(projectId, headRevisionId, headScenes.map(scene => scene.sceneId));
-  for (const scene of headScenes) knowledge.indexScene(scene, headRevisionId);
+  const parentRevisionId = store.getRevision(headRevisionId).parentRevisionIds[0];
+  for (const scene of headScenes) {
+    const reused = parentRevisionId ? knowledge.reuseSceneIndex(scene, headRevisionId, parentRevisionId) : false;
+    if (!reused) knowledge.indexScene(scene, headRevisionId);
+  }
 }
 
 for (const project of store.listProjects()) prepareProject(project.projectId);
