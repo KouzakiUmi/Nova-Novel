@@ -1,5 +1,13 @@
 packages:
   - "packages/*"
+overrides:
+  # 仅把 Pi SDK/openai 子树的 undici 提到修复版；不全局覆盖，避免 node-gyp/@electron/get 被拖到 8.x。
+  "@earendil-works/pi-coding-agent@1.4.0>undici": "8.12.3"
+  "openai@7>undici": "8.12.3"
+  "@earendil-works/pi-coding-agent@1.4.0>minimatch": "11.0.1"
+  "app-builder-lib@26>minimatch": "11.0.1"
+  "dmg-builder@26>minimatch": "11.0.1"
+  "@electron/universal>minimatch": "11.0.1"
 allowBuilds:
   better-sqlite3: true
   esbuild: true
